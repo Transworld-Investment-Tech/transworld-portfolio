@@ -6,9 +6,9 @@ export async function POST(req: NextRequest) {
   try {
     const { portfolioId, reportType, dateFrom, dateTo } = await req.json() as {
       portfolioId: string
-      reportType:  ReportType
-      dateFrom?:   string
-      dateTo?:     string
+      reportType: ReportType
+      dateFrom?: string
+      dateTo?: string
     }
 
     if (!portfolioId || !reportType)
@@ -18,7 +18,7 @@ export async function POST(req: NextRequest) {
 
     const db = supabaseAdmin()
 
-    const [portRes, holdRes, sleeveRes, pricesRes, txRes, navRes, fxRes, watchlistRes] = await Promise.all([
+    const [portRes, holdRes, sleeveRes, pricesRes, txRes, navRes, fxRes] = await Promise.all([
       db.from('portfolios').select('*, client:clients(name,code)').eq('id', portfolioId).single(),
       db.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId),
       db.from('sleeve_targets').select('*').eq('portfolio_id', portfolioId).order('sort_order'),
@@ -26,7 +26,6 @@ export async function POST(req: NextRequest) {
       db.from('transactions').select('*').eq('portfolio_id', portfolioId).order('trade_date', { ascending: false }).limit(50),
       db.from('nav_log').select('*').eq('portfolio_id', portfolioId).order('nav_date', { ascending: true }),
       fetch('https://api.exchangerate-api.com/v4/latest/USD').then(r => r.json()).catch(() => null),
-      db.from('watchlist').select('ticker, name, section, sub_type, rank, rationale').eq('active', true).order('rank').order('name'),
     ])
 
     if (!portRes.data) return NextResponse.json({ error: 'Portfolio not found' }, { status: 404 })
@@ -37,7 +36,7 @@ export async function POST(req: NextRequest) {
         priceMap[p.instrument_id] = { price: p.price, day_change: p.day_change ?? 0 }
     })
 
-    const holdings = (holdRes.data ?? []).map((h: any) => ({
+    const holdings = (holdRes.data || []).map((h: any) => ({
       ...h,
       latest_price: priceMap[h.instrument_id]?.price ?? h.avg_cost,
       day_change:   priceMap[h.instrument_id]?.day_change ?? 0,
@@ -46,14 +45,13 @@ export async function POST(req: NextRequest) {
     const report = await generateAIReport({
       portfolio:    portRes.data,
       holdings,
-      sleeveDefs:   sleeveRes.data ?? [],
+      sleeveDefs:   sleeveRes.data || [],
       reportType,
       dateFrom,
       dateTo,
       fxRate:       fxRes?.rates?.NGN,
-      transactions: txRes.data ?? [],
-      navHistory:   navRes.data ?? [],
-      watchlist:    watchlistRes.data ?? [],  // ← watchlist now passed in
+      transactions: txRes.data || [],
+      navHistory:   navRes.data || [],
     })
 
     await db.from('reports').insert({

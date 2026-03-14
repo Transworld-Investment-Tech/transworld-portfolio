@@ -3,16 +3,26 @@ import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } 
 
 export type ReportType = 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'annual'
 
+export interface WatchlistItem {
+  ticker:    string
+  name:      string
+  section:   string
+  sub_type:  string | null
+  rank:      number
+  rationale: string | null
+}
+
 export interface ReportInput {
-  portfolio: Portfolio
-  holdings: Holding[]
-  sleeveDefs: SleeveTarget[]
-  reportType: ReportType
-  dateFrom?: string
-  dateTo?: string
-  fxRate?: number
+  portfolio:    Portfolio
+  holdings:     Holding[]
+  sleeveDefs:   SleeveTarget[]
+  reportType:   ReportType
+  dateFrom?:    string
+  dateTo?:      string
+  fxRate?:      number
   transactions?: any[]
-  navHistory?: any[]
+  navHistory?:   any[]
+  watchlist?:    WatchlistItem[]   // ← NEW
 }
 
 function periodLabel(type: ReportType, from?: string, to?: string): string {
@@ -27,14 +37,82 @@ function periodLabel(type: ReportType, from?: string, to?: string): string {
   return today.toLocaleDateString('en-GB')
 }
 
+function buildWatchlistContext(
+  holdings: Holding[],
+  watchlist: WatchlistItem[],
+  tot: number
+): string {
+  if (!watchlist || watchlist.length === 0) return ''
+
+  const heldTickers = new Set(holdings.map(h => h.instrument_id))
+
+  const watchEquities = watchlist.filter(w => w.section === 'equity')
+  const watchFI       = watchlist.filter(w => w.section === 'fixed_income')
+  const watchOther    = watchlist.filter(w => w.section === 'other')
+  const watchEagle    = watchlist.filter(w => w.section === 'watch')
+
+  // Which watchlist equities are NOT in the portfolio?
+  const notHeld = watchEquities.filter(w => w.ticker && !heldTickers.has(w.ticker))
+  // Which portfolio holdings ARE on the watchlist?
+  const heldAndWatched = watchEquities.filter(w => w.ticker && heldTickers.has(w.ticker))
+  // Which portfolio holdings are NOT on the watchlist? (potential concern)
+  const heldNotOnWatchlist = holdings
+    .filter(h => h.instrument?.type === 'Stock' && !watchEquities.find(w => w.ticker === h.instrument_id))
+    .map(h => h.instrument_id)
+
+  const lines: string[] = [
+    '',
+    '═══════════════════════════════════════════════════════',
+    'TRANSWORLD NGX MASTER WATCHLIST CONTEXT',
+    '(Use this for opportunity identification and portfolio gap analysis)',
+    '═══════════════════════════════════════════════════════',
+    '',
+    `WATCHLIST UNIVERSE: ${watchEquities.length} equities | ${watchFI.length} fixed income | ${watchOther.length} other`,
+    '',
+    '── TOP 20 WATCHLIST EQUITIES (by rank) ─────────────────',
+    ...watchEquities.slice(0, 20).map(w =>
+      `  #${w.rank} ${w.ticker || '—'} — ${w.name}${heldTickers.has(w.ticker) ? ' [IN PORTFOLIO]' : ''}${w.sub_type ? ' (' + w.sub_type + ')' : ''}`
+    ),
+    '',
+    '── PORTFOLIO vs WATCHLIST ANALYSIS ─────────────────────',
+    `Portfolio holdings CONFIRMED on watchlist (${heldAndWatched.length}):`,
+    ...heldAndWatched.map(w => `  ✓ ${w.ticker} (#${w.rank} on watchlist) — ${w.rationale?.slice(0, 80) ?? ''}`),
+    '',
+    `Top watchlist equities NOT yet in portfolio (${Math.min(notHeld.length, 10)} of ${notHeld.length}):`,
+    ...notHeld.slice(0, 10).map(w => `  → #${w.rank} ${w.ticker} — ${w.name}: ${w.rationale?.slice(0, 100) ?? ''}`),
+    '',
+    heldNotOnWatchlist.length > 0
+      ? `Portfolio positions NOT on master watchlist (review warranted): ${heldNotOnWatchlist.join(', ')}`
+      : 'All portfolio equity holdings are on the master watchlist.',
+    '',
+    '── TOP 10 FIXED INCOME ON WATCHLIST ────────────────────',
+    ...watchFI.slice(0, 10).map(w =>
+      `  #${w.rank} ${w.ticker || '—'} — ${w.name} [${w.sub_type ?? ''}]: ${w.rationale?.slice(0, 80) ?? ''}`
+    ),
+    '',
+    '── EAGLE-EYE WATCH ITEMS ───────────────────────────────',
+    ...watchEagle.map(w => `  ⚡ ${w.name}: ${w.rationale?.slice(0, 120) ?? ''}`),
+    '',
+    'INSTRUCTIONS FOR AI REPORT:',
+    '1. In your equity analysis, for each holding confirm its watchlist rank and whether the rationale still holds.',
+    '2. In your opportunity section, identify the TOP 3 watchlist names not in the portfolio most relevant to this portfolio\'s mandate.',
+    '3. Flag any portfolio holding not on the watchlist and explain why it may or may not be concerning.',
+    '4. Reference the eagle-eye items in your macro/forward guidance section.',
+    '5. For fixed income: cross-reference the FI watchlist with any fixed income gaps in the portfolio.',
+    '═══════════════════════════════════════════════════════',
+  ]
+
+  return lines.join('\n')
+}
+
 export async function generateAIReport(input: ReportInput): Promise<string> {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  const { portfolio, holdings, sleeveDefs, reportType, dateFrom, dateTo, fxRate, transactions, navHistory } = input
+  const { portfolio, holdings, sleeveDefs, reportType, dateFrom, dateTo, fxRate, transactions, navHistory, watchlist } = input
 
-  const tot   = computeNAV(holdings)
-  const pl    = tot - portfolio.starting_nav
-  const ret   = pl / portfolio.starting_nav
-  const sv    = computeSleeveData(holdings, sleeveDefs, tot)
+  const tot    = computeNAV(holdings)
+  const pl     = tot - portfolio.starting_nav
+  const ret    = pl / portfolio.starting_nav
+  const sv     = computeSleeveData(holdings, sleeveDefs, tot)
   const period = periodLabel(reportType, dateFrom, dateTo)
   const today  = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
 
@@ -42,38 +120,20 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
   const fixedInc = holdings.filter(h => h.instrument?.type !== 'Stock')
   const tickers  = equities.map(h => h.instrument_id).join(', ')
 
-  // Build rich portfolio context
-  const holdingLines = equities.map(h => {
-    const p   = h.latest_price ?? h.avg_cost
-    const v   = h.quantity * p
-    const pnl = v - (h.quantity * h.avg_cost)
-    const pnlPct = ((p - h.avg_cost) / h.avg_cost) * 100
-    return `  ${h.instrument_id} (${h.instrument?.name ?? ''}):
-    Shares: ${Math.round(h.quantity).toLocaleString()} | Avg cost: ₦${h.avg_cost.toFixed(2)} | Current: ₦${p.toFixed(2)}
-    Value: ${fmt.ngnM(v)} | Weight: ${fmt.pct(v/tot)} | Unrealized P&L: ${fmt.ngnM(pnl)} (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)
-    Day change: ${fmt.chg(h.day_change ?? 0)} | Div yield on file: ${h.instrument?.coupon_pct ?? 0}%`
-  }).join('\n\n')
+  // NAV trajectory summary
+  const navSummary = navHistory && navHistory.length > 0
+    ? '\nNAV HISTORY:\n' + navHistory.map(n => `  ${n.nav_date}: ₦${(n.nav_value/1e6).toFixed(2)}M${n.notes ? ' — ' + n.notes : ''}`).join('\n')
+    : ''
 
-  const fiLines = fixedInc.map(h => {
-    const mv = h.quantity * (h.latest_price ?? h.avg_cost)
-    return `  ${h.instrument?.name ?? h.instrument_id}: Face ₦${fmt.ngnM(h.quantity)} | Mkt val ${fmt.ngnM(mv)} | Yield ${h.instrument?.coupon_pct ?? 0}%`
-  }).join('\n')
-
-  const sleeveLines = sv.map(s =>
-    `  ${s.name}: Target ${fmt.pct(s.target_pct)} | Actual ${fmt.pct(s.act)} | Value ${fmt.ngnM(s.val)} | Status: ${s.status} | Diff: ${(s.diff>=0?'+':'')+fmt.ngnM(s.diff)}`
-  ).join('\n')
-
-  // Transaction history summary
+  // Recent transactions
   const txSummary = transactions && transactions.length > 0
-    ? `\nRECENT TRANSACTIONS (last 20):\n${transactions.slice(0,20).map(t =>
-        `  ${t.trade_date} | ${t.action} | ${t.instrument_id} | ${Math.round(t.quantity||0).toLocaleString()} shares @ ₦${Number(t.price||0).toFixed(2)} | Gross: ${fmt.ngnM(t.gross_value||0)} | Fees: ₦${Number(t.fees||0).toLocaleString()}`
-      ).join('\n')}`
+    ? '\nRECENT TRANSACTIONS (last 20):\n' + transactions.slice(0, 20).map(t =>
+        `  ${t.trade_date} | ${t.action} | ${t.instrument_id || '—'} | ${t.quantity ? Number(t.quantity).toLocaleString() + ' @ ₦' + Number(t.price || 0).toFixed(2) : '₦' + Number(t.amount || 0).toLocaleString()} | fees: ₦${Number(t.fees || 0).toLocaleString()}`
+      ).join('\n')
     : ''
 
-  // NAV history
-  const navLines = navHistory && navHistory.length > 0
-    ? `\nNAV HISTORY:\n${navHistory.map(n => `  ${n.nav_date}: ${fmt.ngnM(n.nav_value)}${n.notes ? ' — '+n.notes : ''}`).join('\n')}`
-    : ''
+  // Watchlist context
+  const watchlistContext = buildWatchlistContext(holdings, watchlist ?? [], tot)
 
   const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Asset Management, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
@@ -90,137 +150,124 @@ CURRENCY: ${portfolio.currency}
 FX RATE: ${fxRate ? `₦${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
 
 PERFORMANCE:
-  Starting NAV: ${fmt.ngnM(portfolio.starting_nav)} (${portfolio.start_date})
-  Current NAV:  ${fmt.ngnM(tot)}
-  Total P&L:    ${fmt.ngnM(pl)} (${fmt.pct(ret)})
+  Starting NAV: ₦${(portfolio.starting_nav/1e6).toFixed(2)}M  (${portfolio.start_date})
+  Current NAV:  ₦${(tot/1e6).toFixed(2)}M
+  Total P&L:    ₦${(pl/1e6).toFixed(2)}M  (${(ret*100).toFixed(1)}%)
 
 MANDATE:
-  Income target:    ${fmt.pct(portfolio.income_target)} p.a.
-  Cap target:       ${fmt.pct(portfolio.cap_target)} p.a.
-  Max single eq:    ${fmt.pct(portfolio.max_eq_single)}
-  Max eq sleeve:    ${fmt.pct(portfolio.max_eq_sleeve)}
-  Drawdown alert:   ${fmt.pct(portfolio.dd_alert)}
-  Drawdown action:  ${fmt.pct(portfolio.dd_action)}
+  Income target:  ${fmt.pct(portfolio.income_target)} p.a.
+  Cap target:     ${fmt.pct(portfolio.cap_target)} p.a.
+  Max single eq:  ${fmt.pct(portfolio.max_eq_single)}
+  Max eq sleeve:  ${fmt.pct(portfolio.max_eq_sleeve)}
+  DD alert:       ${fmt.pct(portfolio.dd_alert)}
+  DD action:      ${fmt.pct(portfolio.dd_action)}
 
 SLEEVE ALLOCATION:
-${sleeveLines}
+${sv.map(s => `  ${s.name}: ${fmt.pct(s.act)} actual vs ${fmt.pct(s.target_pct)} target | ₦${(s.val/1e6).toFixed(2)}M | ${s.status} | diff: ${(s.diff>=0?'+':'')}₦${(Math.abs(s.diff)/1e6).toFixed(2)}M`).join('\n')}
 
 EQUITY HOLDINGS:
-${holdingLines}
+${equities.map(h => {
+  const p = h.latest_price ?? h.avg_cost
+  const v = h.quantity * p
+  const pnl = h.quantity * (p - h.avg_cost)
+  return `  ${h.instrument_id} (${h.instrument?.name}):
+    ${Math.round(h.quantity).toLocaleString()} shares | avg cost ₦${h.avg_cost.toFixed(2)} | price ₦${p.toFixed(2)}
+    value ₦${(v/1e6).toFixed(2)}M | weight ${(v/tot*100).toFixed(1)}% | unrealised P&L ${pnl>=0?'+':''}₦${(pnl/1e6).toFixed(2)}M (${((p-h.avg_cost)/h.avg_cost*100).toFixed(1)}%)`
+}).join('\n\n')}
 
 FIXED INCOME / CASH:
-${fiLines || '  None currently held'}
+${fixedInc.length > 0 ? fixedInc.map(h => `  ${h.instrument?.name}: ₦${(h.quantity/1e6).toFixed(2)}M face | yield ${h.instrument?.coupon_pct ?? 0}%`).join('\n') : '  None held — cash only'}
+${navSummary}
 ${txSummary}
-${navLines}
+${watchlistContext}
 
 ═══════════════════════════════════════════════════════
-YOUR ANALYSIS TASK
+REPORT STRUCTURE (write in clean markdown with ## headers)
 ═══════════════════════════════════════════════════════
-
-Write a deeply analytical, forward-looking portfolio report in clean plain text with markdown headers.
-Use your knowledge of Nigerian markets, CBN policy, and these specific companies to provide genuine insight.
-Every section should give the portfolio manager something actionable and specific — not generic commentary.
-
-FORMAT: Clean markdown. Use ## for sections, ### for subsections, **bold** for key numbers and signals.
-No HTML. No bullet-point padding. Write in paragraphs where analysis is needed. Use tables only for data grids.
-
-REPORT STRUCTURE:
 
 ## EXECUTIVE SUMMARY
-3-4 sentences maximum. Lead with the single most important insight about this portfolio right now.
-State the most urgent action in the final sentence, bolded.
+3–4 sentences max. Most important insight first. Final sentence bold = single most urgent action.
 
 ## PORTFOLIO PERFORMANCE REVIEW
-Analyse performance against mandate targets. Is the ${fmt.pct(portfolio.income_target)} income target being met?
-Is the ${fmt.pct(portfolio.cap_target)} cap target on track? What has driven returns?
-If NAV history is available, analyse the trajectory — where was growth strong, where was it weak?
-What does the ${fmt.pct(ret)} total return since inception tell us about portfolio construction quality?
+Analyse returns vs mandate. NAV trajectory from history. Income target tracking.
+Call out whether total return and the trajectory are healthy given mandate.
 
 ## MARKET CONTEXT: NIGERIA — ${period}
+
 ### Monetary Policy & Rates
-Your assessment of where CBN is headed. Use your knowledge of the current MPR (26.5%, cut 50bps Feb 2026),
-the inflation trajectory (falling for 11 consecutive months to ~15.1% Jan 2026), and what this means
-for fixed income and equity valuations going forward. When do you expect the next cut? What's the real yield?
+CBN MPR at 26.5% (cut 50bps Feb 2026). Inflation at 15.1% (Jan 2026, declining 11 months).
+Real yield, next cut timing, what it means for equities vs fixed income.
 
 ### NGX Equity Market
-Honest assessment of the NGX environment. Your knowledge of YTD performance, sector dynamics,
-banking recapitalisation momentum, and what's driving or dragging the index.
-How does this portfolio's equity exposure fit the current market backdrop?
+Your knowledge of NGX YTD performance, sector dynamics, banking recapitalisation.
+How does this portfolio's equity positioning fit the current backdrop?
 
 ### Fixed Income Opportunity
-Assess the NTB/FGN opportunity: 364D NTBs at ~18.47%, 10yr FGN bonds at ~16.06%.
-What is the real yield after 15.1% inflation? What is the duration risk given CBN easing?
-What is the optimal positioning right now — short duration or extend for capital gains?
+NTB 364D at ~18.47%, FGN 10yr at ~16.06%. Real yields. Duration positioning.
+For this portfolio specifically — what is the income foregone by being underweight fixed income?
 
 ### FX & Macro Risks
-USD/NGN trajectory, oil price implications (this portfolio has Aradel/Seplat exposure — discuss specifically),
-and the top 3 macro risks to this portfolio over the next 90 days.
+USD/NGN stability, Brent implications (name ARADEL/WAPCO specifically if held).
+Top 3 macro risks over 90 days. Eagle-eye pipeline items from watchlist if relevant.
 
-## EQUITY HOLDINGS ANALYSIS
-For each stock held (${tickers}), provide a substantive paragraph covering:
-- Current valuation (P/E and P/B estimates based on your knowledge — state these are estimates)
-- Recent financial performance: last earnings result, revenue trend, dividend history
-- Business-specific risks and opportunities right now (be specific to Nigeria, not generic)
-- Technical position: where is the stock relative to its 52-week range?
-- **Signal: ACCUMULATE / HOLD / REDUCE / WATCH** — state this clearly with your specific rationale
-- Price target range (estimate) and key catalyst to watch
+## EQUITY HOLDINGS DEEP-DIVE
+For each stock in the portfolio (${tickers}):
+- Watchlist rank (from context above) and whether it still belongs at that rank
+- Valuation estimates: P/E, P/B, dividend yield (state as estimates from your knowledge)
+- Recent earnings quality and revenue trend
+- Business-specific risk/opportunity right now
+- Technical level: where is price vs 52-week range?
+- **Signal: ACCUMULATE / HOLD / REDUCE / WATCH** — clear rationale
+- Price target range and key catalyst
 
-Use your deep knowledge of each company. For example:
-- ARADEL: oil production volumes, Brent exposure, rights issue history
-- NB (Nigerian Breweries): volume trends, excise duty pressures, parent Heineken strategy
-- UNILEVER: recent delisting rumors, low float, FX cost pressure vs. naira recovery
-- WAPCO (Lafarge Africa): cement demand, infrastructure spend, AfDB pipeline
-- UACN: real estate exposure, food segment, conglomerate discount
-- NESTLE: premium pricing power, repatriation of dividends, Maggi dominance
-- FCMB: recapitalisation status, retail banking growth, asset quality
-- ACCESSCORP: tier-1 pan-African expansion, recapitalisation, dividend outlook
+## WATCHLIST OPPORTUNITY ANALYSIS
+**This section uses the Transworld NGX Master Watchlist.**
+
+### Top Watchlist Names Not in Portfolio
+Identify the 3–5 most compelling watchlist equities NOT currently held. For each:
+- Why it's ranked where it is on the watchlist
+- Why it might be relevant to THIS portfolio's mandate specifically
+- What needs to happen (price level, catalyst, or capacity) before it becomes actionable
+
+### Portfolio vs Watchlist Quality Check
+- Are all current holdings confirmed quality names per the watchlist?
+- Any holdings NOT on the watchlist? If so, why are they still held?
+- Does the fixed income allocation align with the FI watchlist? What's missing?
+
+### Eagle-Eye Pipeline Items
+Which of the eagle-eye watch items (if any) from the watchlist are most relevant to monitor for this portfolio over the next quarter?
 
 ## FIXED INCOME & CASH ANALYSIS
-Assess the current fixed income and cash positions against the mandate.
-If there is a fixed income gap (mandate requires it but none held), quantify the income being foregone.
-Recommend specific NTB tenors and FGN bond maturities to target.
-Calculate approximate income impact of deploying to mandate targets.
+Assess against mandate. Quantify income foregone. Recommend specific instruments from the FI watchlist.
+If the FI watchlist has relevant state or corporate bonds not in portfolio, mention them.
 
 ## RISK & COMPLIANCE REVIEW
-Work through each risk limit:
-- Liquidity (minimum ${fmt.pct(portfolio.liq_min)}): current ${fmt.pct(sv.find(s=>s.sleeve_id==='liq')?.act??0)} — compliant?
-- Single equity limit (${fmt.pct(portfolio.max_eq_single)}): list any breaches by name and amount over
-- Equity sleeve limit (${fmt.pct(portfolio.max_eq_sleeve)}): current position
-- Drawdown status vs ${fmt.pct(portfolio.dd_alert)} alert and ${fmt.pct(portfolio.dd_action)} action thresholds
-- Income target tracking: are we on pace for ${fmt.pct(portfolio.income_target)} income?
-
-For each breach or near-breach: state the exact shortfall, the risk it creates, and the specific action required.
+Each risk limit — is it breached? By how much? What action does it require?
+Specific ₦ amounts for any breach.
 
 ## REBALANCING RECOMMENDATIONS
-Concrete, specific recommendations with approximate trade sizes in naira.
-Prioritise by urgency. For each recommendation state:
-- What to buy or sell
-- Approximate size (₦M)
-- Why now (price level, mandate breach, market timing)
-- Expected impact on portfolio metrics
+Concrete trades with approximate ₦ sizes.
+Prioritise by urgency. Cross-reference watchlist for the buys.
 
 ## PORTFOLIO MANAGER ACTION LIST
-Number these 1-5, ranked by urgency. Each action:
+1–5 actions ranked by urgency. Format:
 **[IMMEDIATE/THIS WEEK/THIS MONTH]** — Action title
-- Specific instrument and size
-- Rationale tied to data above
-- Expected portfolio impact
+- Instrument, size, rationale, expected impact
 
 ## OUTLOOK & FORWARD GUIDANCE
-What should the portfolio look like in 3 months if recommendations are followed?
-What are the key decisions the portfolio manager needs to make?
-What market events or data releases should they be watching?
+3-month view. Key decisions needed. Events and data to watch.
+Include any eagle-eye watchlist items approaching a trigger point.
 
 ---
 *Report generated ${today} | Transworld Asset Management Portfolio Intelligence*
-*Based on portfolio data as at report date. Valuation estimates and signals are analytical in nature.*
+*Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). Valuations are analytical estimates.*
 *All investment decisions remain at the discretion of the portfolio manager.*`
 
   const response = await client.messages.create({
     model:      'claude-sonnet-4-20250514',
-    max_tokens: 7000,
+    max_tokens: 8000,
     messages:   [{ role: 'user', content: prompt }],
-  })
+  } as any)
 
   const text = (response.content as any[])
     .filter((b: any) => b.type === 'text')
