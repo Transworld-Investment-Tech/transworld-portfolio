@@ -4,8 +4,7 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { ArrowLeft, Plus, Search } from 'lucide-react'
-import PageActions from '@/components/shared/PageActions'
+import { ArrowLeft, Plus, Search, Filter } from 'lucide-react'
 
 const ACTION_COLORS: Record<string, string> = {
   BUY: 'badge-buy', SELL: 'badge-sell', INCOME: 'badge-ntb',
@@ -51,7 +50,7 @@ export default function TransactionsPage() {
     const { data: user } = await supabase.auth.getUser()
     const qty = Number(form.quantity)
     const price = Number(form.price)
-    const grossVal = ['BUY', 'SELL'].includes(form.action) ? qty * price : 0
+    const grossVal = ['BUY','SELL'].includes(form.action) ? qty * price : 0
     const { error } = await supabase.from('transactions').insert({
       portfolio_id: portfolioId,
       trade_date: form.trade_date,
@@ -78,28 +77,6 @@ export default function TransactionsPage() {
     setSaving(false)
   }
 
-  function getTxnsText(): string {
-    const lines: string[] = []
-    const totalBuys  = txns.filter(t => t.action === 'BUY').reduce((s, t) => s + (t.gross_value || 0), 0)
-    const totalSells = txns.filter(t => t.action === 'SELL').reduce((s, t) => s + (t.gross_value || 0), 0)
-    const totalFees  = txns.reduce((s, t) => s + (t.fees || 0), 0)
-    lines.push(`Total transactions: ${txns.length}`)
-    lines.push(`Buys: ${txns.filter(t=>t.action==='BUY').length} (₦${(totalBuys/1e6).toFixed(2)}M gross)`)
-    lines.push(`Sells: ${txns.filter(t=>t.action==='SELL').length} (₦${(totalSells/1e6).toFixed(2)}M gross)`)
-    lines.push(`Income entries: ${txns.filter(t=>t.action==='INCOME').length}`)
-    lines.push(`Fee entries: ${txns.filter(t=>t.action==='FEE').length}`)
-    lines.push(`Total fees paid: ₦${totalFees.toLocaleString()}`)
-    lines.push('')
-    lines.push('Date       | Action         | Instrument      | Quantity        | Price       | Gross Value | Fees')
-    lines.push('─'.repeat(100))
-    filtered.forEach(t => {
-      lines.push(
-        `${t.trade_date} | ${(t.action).padEnd(14)} | ${(t.instrument_id || '—').padEnd(15)} | ${(t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—').padEnd(15)} | ${t.price ? '₦' + Number(t.price).toFixed(2) : '—'.padEnd(10)} | ${t.gross_value ? '₦' + (t.gross_value/1e6).toFixed(2) + 'M' : '—'.padEnd(10)} | ${t.fees ? '₦' + Number(t.fees).toLocaleString() : '—'}`
-      )
-    })
-    return lines.join('\n')
-  }
-
   const filtered = txns.filter(t => {
     if (filter.action && t.action !== filter.action) return false
     if (filter.search && !t.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()) && !t.notes?.toLowerCase().includes(filter.search.toLowerCase())) return false
@@ -116,12 +93,7 @@ export default function TransactionsPage() {
         </Link>
         <div className="w-px h-4 bg-white/10" />
         <h1 className="text-base font-semibold">Transactions</h1>
-        <div className="ml-auto flex items-center gap-3">
-          <PageActions
-            pageTitle="Transaction History"
-            portfolioName={portfolio?.name ?? ''}
-            getText={getTxnsText}
-          />
+        <div className="ml-auto">
           <button onClick={() => setShowForm(!showForm)} className="flex items-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors">
             <Plus size={13} /> Enter trade
           </button>
@@ -129,6 +101,7 @@ export default function TransactionsPage() {
       </div>
 
       <div className="px-8 py-6 max-w-5xl">
+        {/* Trade entry form */}
         {showForm && (
           <form onSubmit={submitTrade} className="tw-card mb-5 border-[#a78bfa]/20">
             <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4">New trade entry</div>
@@ -214,6 +187,7 @@ export default function TransactionsPage() {
           </form>
         )}
 
+        {/* Filters */}
         <div className="flex gap-3 mb-4">
           <div className="relative flex-1 max-w-xs">
             <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#555d72]" />
@@ -226,6 +200,7 @@ export default function TransactionsPage() {
           <span className="text-xs text-[#555d72] flex items-center">{filtered.length} record{filtered.length !== 1 ? 's' : ''}</span>
         </div>
 
+        {/* Table */}
         <div className="tw-card p-0 overflow-hidden">
           {filtered.length === 0 ? (
             <div className="text-center py-10 text-xs text-[#555d72]">No transactions yet. Click "Enter trade" to add the first one.</div>

@@ -9,8 +9,6 @@ import {
   ChevronRight, AlertTriangle, Info, CheckCircle2
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
-import PageActions from '@/components/shared/PageActions'
-import PageActions from '@/components/shared/PageActions'
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
 const SleeveBarChart  = dynamic(() => import('@/components/portfolio/SleeveBarChart'),  { ssr: false })
@@ -30,7 +28,7 @@ export default function PortfolioDashboard() {
   const [refreshing, setRefreshing] = useState(false)
   const [fxRate, setFxRate]         = useState<number>(1665)
   const [report, setReport]         = useState('')
-  const [reportType, setReportType] = useState<'daily'|'weekly'|'monthly'|'quarterly'|'annual'>('monthly')
+  const [reportType, setReportType] = useState<'daily'|'weekly'|'monthly'|'quarterly'>('monthly')
   const [generatingReport, setGeneratingReport] = useState(false)
   const [reportError, setReportError] = useState('')
 
@@ -144,39 +142,6 @@ export default function PortfolioDashboard() {
           <button onClick={() => setTab('reports')} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
             <FileText size={12} /> Generate report
           </button>
-          <PageActions
-            pageTitle="Portfolio Overview"
-            portfolioName={portfolio.name}
-            getText={() => {
-              const tot = computeNAV(holdings)
-              const pl  = tot - portfolio.starting_nav
-              const sv  = computeSleeveData(holdings, sleeveDefs, tot)
-              const lines = [
-                `CLIENT:        ${portfolio.client?.name}`,
-                `PORTFOLIO:     ${portfolio.name}`,
-                `DATE:          ${new Date().toLocaleDateString('en-GB')}`,
-                `FX RATE:       ₦${Math.round(fxRate).toLocaleString()}/USD`,
-                '',
-                '── PERFORMANCE ──────────────────────────────────',
-                `Starting NAV:  ₦${(portfolio.starting_nav/1e6).toFixed(2)}M  (${portfolio.start_date})`,
-                `Current NAV:   ₦${(tot/1e6).toFixed(2)}M`,
-                `Total P&L:     ₦${(pl/1e6).toFixed(2)}M  (${(pl/portfolio.starting_nav*100).toFixed(1)}%)`,
-                `Income target: ${(portfolio.income_target*100).toFixed(1)}% p.a.`,
-                '',
-                '── SLEEVE ALLOCATION ────────────────────────────',
-                ...sv.map(s => `${s.name}: ${(s.act*100).toFixed(1)}% actual vs ${(s.target_pct*100).toFixed(1)}% target | ₦${(s.val/1e6).toFixed(2)}M | ${s.status}`),
-                '',
-                '── HOLDINGS ─────────────────────────────────────',
-                ...holdings.map(h => {
-                  const p = h.latest_price ?? h.avg_cost
-                  const v = h.quantity * p
-                  const pnl = h.quantity * (p - h.avg_cost)
-                  return `${h.instrument_id} (${h.instrument?.name}): ${Math.round(h.quantity).toLocaleString()} | ₦${p.toFixed(2)} | ₦${(v/1e6).toFixed(2)}M | wt ${(v/tot*100).toFixed(1)}% | PnL ${pnl >= 0 ? '+' : ''}₦${(pnl/1e6).toFixed(2)}M`
-                }),
-              ]
-              return lines.join('\n')
-            }}
-          />
           <Link href={`/admin/portfolios/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors">
             <Settings size={12} /> Manage
           </Link>
@@ -334,7 +299,6 @@ export default function PortfolioDashboard() {
                       <option value="weekly">Weekly report</option>
                       <option value="monthly">Monthly report</option>
                       <option value="quarterly">Quarterly report</option>
-                      <option value="annual">Annual report</option>
                     </select>
                   </div>
                   <button

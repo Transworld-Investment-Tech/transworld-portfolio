@@ -77,29 +77,6 @@ export default function HoldingsPage() {
     setHoldings(h => h.map(hold => hold.instrument_id === instrId ? { ...hold, [key]: val } : hold))
   }
 
-  function getHoldingsText(): string {
-    const lines: string[] = []
-    const totalNav = holdings.reduce((sum, h) => {
-      const p = prices[h.instrument_id] ?? h.avg_cost ?? 1
-      return sum + Number(h.quantity) * p
-    }, 0)
-    lines.push(`Total portfolio value: ₦${(totalNav / 1e6).toFixed(2)}M`)
-    lines.push(`Holdings as at: ${new Date().toLocaleDateString('en-GB')}`)
-    lines.push('')
-    lines.push('Instrument       | Sleeve | Quantity        | Avg Cost  | Mkt Price | Mkt Value  | Unrl P&L   | Weight')
-    lines.push('─'.repeat(110))
-    holdings.forEach(h => {
-      const p   = prices[h.instrument_id] ?? h.avg_cost ?? 1
-      const v   = Number(h.quantity) * p
-      const pnl = Number(h.quantity) * (p - Number(h.avg_cost))
-      const wt  = totalNav > 0 ? (v / totalNav * 100).toFixed(1) + '%' : '0%'
-      lines.push(
-        `${(h.instrument?.name ?? h.instrument_id).padEnd(16)} | ${(h.sleeve_id ?? '').padEnd(6)} | ${Number(h.quantity).toLocaleString().padEnd(15)} | ₦${Number(h.avg_cost).toFixed(2).padEnd(8)} | ₦${p.toFixed(2).padEnd(8)} | ₦${(v/1e6).toFixed(2)}M${' '.repeat(3)} | ${pnl >= 0 ? '+' : ''}₦${(pnl/1e6).toFixed(2)}M | ${wt}`
-      )
-    })
-    return lines.join('\n')
-  }
-
   const sleeveOrder = { liq: 0, ntb: 1, fgn: 2, eq: 3 }
   const grouped = holdings.reduce((acc, h) => {
     const k = h.sleeve_id || 'other'
@@ -120,11 +97,6 @@ export default function HoldingsPage() {
         <h1 className="text-base font-semibold">Edit holdings</h1>
         <div className="ml-auto flex items-center gap-3">
           {msg && <span className="text-xs text-[#00d4a4]">{msg}</span>}
-          <PageActions
-            pageTitle="Holdings"
-            portfolioName={portfolio?.name ?? ''}
-            getText={getHoldingsText}
-          />
           <button onClick={() => setAdding(true)} className="flex items-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors">
             <Plus size={13} /> Add position
           </button>
@@ -132,6 +104,7 @@ export default function HoldingsPage() {
       </div>
 
       <div className="px-8 py-6 max-w-5xl">
+        {/* Add new holding form */}
         {adding && (
           <div className="tw-card mb-5 border-[#a78bfa]/20">
             <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4">Add new position</div>
@@ -146,11 +119,11 @@ export default function HoldingsPage() {
                 </select>
               </div>
               <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Quantity / Face (₦)</label>
+                <label className="block text-xs text-[#8a91a8] mb-1.5">Quantity / Face value (₦)</label>
                 <input type="number" value={newHolding.quantity} onChange={e => setNewHolding(n => ({ ...n, quantity: e.target.value }))} placeholder="0" className="tw-input font-mono" />
               </div>
               <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Avg cost</label>
+                <label className="block text-xs text-[#8a91a8] mb-1.5">Avg cost / price</label>
                 <input type="number" value={newHolding.avg_cost} onChange={e => setNewHolding(n => ({ ...n, avg_cost: e.target.value }))} placeholder={prices[newHolding.instrument_id]?.toString() || '1'} className="tw-input font-mono" step="0.01" />
               </div>
               <div className="flex gap-2">
@@ -161,6 +134,7 @@ export default function HoldingsPage() {
           </div>
         )}
 
+        {/* Holdings grouped by sleeve */}
         {Object.entries(grouped)
           .sort(([a], [b]) => (sleeveOrder[a as keyof typeof sleeveOrder] ?? 99) - (sleeveOrder[b as keyof typeof sleeveOrder] ?? 99))
           .map(([sleeveId, items]) => (

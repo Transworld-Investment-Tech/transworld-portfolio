@@ -4,7 +4,6 @@ import { useParams, useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
 import { Save, Plus, Trash2, AlertTriangle } from 'lucide-react'
-import PageActions from '@/components/shared/PageActions'
 
 export default function PortfolioSettingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
@@ -33,7 +32,10 @@ export default function PortfolioSettingsPage() {
     load()
   }, [portfolioId])
 
-  function updateField(key: string, val: any) { setPortfolio((p: any) => ({ ...p, [key]: val })) }
+  function updateField(key: string, val: any) {
+    setPortfolio((p: any) => ({ ...p, [key]: val }))
+  }
+
   function updateSleeve(id: string, key: string, val: string) {
     setSleeves(s => s.map(sl => sl.sleeve_id === id ? { ...sl, [key]: Number(val) } : sl))
   }
@@ -60,7 +62,9 @@ export default function PortfolioSettingsPage() {
     if (!pe) {
       for (const sl of sleeves) {
         await supabase.from('sleeve_targets').update({
-          target_pct: sl.target_pct, min_pct: sl.min_pct, max_pct: sl.max_pct,
+          target_pct: sl.target_pct,
+          min_pct: sl.min_pct,
+          max_pct: sl.max_pct,
         }).match({ portfolio_id: portfolioId, sleeve_id: sl.sleeve_id })
       }
       flash('Settings saved ✓')
@@ -89,47 +93,9 @@ export default function PortfolioSettingsPage() {
     setNavLog(n => n.filter(e => e.id !== id))
   }
 
-  function flash(m: string, isErr = false) { setMsg(m); setTimeout(() => setMsg(''), 3000) }
-
-  function getSettingsText(): string {
-    if (!portfolio) return ''
-    const pct = (v: number) => `${(Math.abs(Number(v)) * 100).toFixed(1)}%`
-    const lines: string[] = [
-      `CLIENT:          ${portfolio.client?.name ?? 'N/A'}`,
-      `PORTFOLIO:       ${portfolio.name}`,
-      `LABEL:           Portfolio ${portfolio.label}`,
-      `CURRENCY:        ${portfolio.currency}`,
-      `START DATE:      ${portfolio.start_date}`,
-      `STARTING NAV:    ₦${(Number(portfolio.starting_nav) / 1e6).toFixed(2)}M`,
-      `VALUATION DATE:  ${portfolio.valuation_date ?? 'N/A'}`,
-      '',
-      '── MANDATE & TARGETS ───────────────────────────────────',
-      `Income target:          ${pct(portfolio.income_target)} p.a.`,
-      `Cap appreciation target: ${pct(portfolio.cap_target)} p.a.`,
-      `Max single equity:      ${pct(portfolio.max_eq_single)} of NAV`,
-      `Max equity sleeve:      ${pct(portfolio.max_eq_sleeve)}`,
-      `Liquidity minimum:      ${pct(portfolio.liq_min)}`,
-      `Drawdown alert:         ${pct(portfolio.dd_alert)}`,
-      `Drawdown action:        ${pct(portfolio.dd_action)}`,
-      '',
-      '── SLEEVE TARGETS ──────────────────────────────────────',
-    ]
-    sleeves.forEach(s => {
-      lines.push(`${s.name}: ${(s.target_pct*100).toFixed(0)}% target (${(s.min_pct*100).toFixed(0)}%–${(s.max_pct*100).toFixed(0)}% range)`)
-    })
-    if (navLog.length > 0) {
-      lines.push('')
-      lines.push('── NAV HISTORY ──────────────────────────────────────')
-      navLog.forEach(n => {
-        lines.push(`${n.nav_date}: ₦${(n.nav_value / 1e6).toFixed(2)}M${n.notes ? '  — ' + n.notes : ''}`)
-      })
-    }
-    if (portfolio.notes) {
-      lines.push('')
-      lines.push('── NOTES ────────────────────────────────────────────')
-      lines.push(portfolio.notes)
-    }
-    return lines.join('\n')
+  function flash(m: string, isErr = false) {
+    setMsg(m)
+    setTimeout(() => setMsg(''), 3000)
   }
 
   const pct = (v: number) => (v * 100).toFixed(1)
@@ -146,11 +112,6 @@ export default function PortfolioSettingsPage() {
         </div>
         <div className="flex items-center gap-3">
           {msg && <span className={`text-xs ${msg.includes('✓') ? 'text-[#00d4a4]' : 'text-[#ff5c7a]'}`}>{msg}</span>}
-          <PageActions
-            pageTitle="Portfolio Settings & Mandate"
-            portfolioName={portfolio.name}
-            getText={getSettingsText}
-          />
           <button onClick={savePortfolio} disabled={saving}
             className="flex items-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] disabled:opacity-50 transition-colors">
             <Save size={13} /> {saving ? 'Saving…' : 'Save changes'}
@@ -159,6 +120,8 @@ export default function PortfolioSettingsPage() {
       </div>
 
       <div className="px-8 py-6 max-w-2xl space-y-5">
+
+        {/* Portfolio details */}
         <div className="tw-card space-y-4">
           <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] pb-2 border-b border-white/[0.07]">Portfolio details</div>
           <div className="grid grid-cols-2 gap-4">
@@ -183,6 +146,7 @@ export default function PortfolioSettingsPage() {
           </div>
         </div>
 
+        {/* Return targets */}
         <div className="tw-card space-y-4">
           <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] pb-2 border-b border-white/[0.07]">Return targets & risk thresholds</div>
           <div className="grid grid-cols-2 gap-4">
@@ -211,6 +175,7 @@ export default function PortfolioSettingsPage() {
           </div>
         </div>
 
+        {/* Sleeve targets */}
         <div className="tw-card space-y-4">
           <div className="flex items-center justify-between pb-2 border-b border-white/[0.07]">
             <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72]">Sleeve allocation targets</div>
@@ -234,6 +199,7 @@ export default function PortfolioSettingsPage() {
           ))}
         </div>
 
+        {/* NAV log */}
         <div className="tw-card">
           <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] pb-3 border-b border-white/[0.07] mb-4">NAV log</div>
           <div className="grid grid-cols-3 gap-3 mb-4 items-end">
@@ -271,6 +237,7 @@ export default function PortfolioSettingsPage() {
           )}
         </div>
 
+        {/* Danger zone */}
         <div className="tw-card border-[#ff5c7a]/20">
           <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-widest text-[#ff5c7a] pb-2 border-b border-[#ff5c7a]/20 mb-4">
             <AlertTriangle size={13} /> Danger zone

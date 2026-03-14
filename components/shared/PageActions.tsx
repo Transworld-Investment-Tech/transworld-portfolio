@@ -1,23 +1,19 @@
 'use client'
 import { useState } from 'react'
-import { Printer, Copy, Check, Download } from 'lucide-react'
+import { Printer, Copy, Check } from 'lucide-react'
 
 interface PageActionsProps {
-  pageTitle: string       // e.g. "Portfolio Overview" 
-  portfolioName: string   // e.g. "CMFB Portfolio A"
-  getText: () => string   // function that returns the page data as plain text
+  pageTitle: string
+  portfolioName: string
+  getText: () => string
 }
 
 export default function PageActions({ pageTitle, portfolioName, getText }: PageActionsProps) {
   const [copied, setCopied] = useState(false)
 
-  function handlePrint() {
-    window.print()
-  }
-
   function handleCopy() {
     const date = new Date().toLocaleDateString('en-GB', {
-      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
+      weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
     })
     const text = [
       `TRANSWORLD ASSET MANAGEMENT`,
@@ -28,9 +24,8 @@ export default function PageActions({ pageTitle, portfolioName, getText }: PageA
       getText(),
       '',
       `${'─'.repeat(60)}`,
-      `Source: Transworld Portfolio Intelligence Platform`,
+      `Source: Transworld Portfolio Intelligence`,
     ].join('\n')
-
     navigator.clipboard.writeText(text)
     setCopied(true)
     setTimeout(() => setCopied(false), 2500)
@@ -47,7 +42,7 @@ export default function PageActions({ pageTitle, portfolioName, getText }: PageA
         {copied ? <><Check size={12} /> Copied!</> : <><Copy size={12} /> Copy as text</>}
       </button>
       <button
-        onClick={handlePrint}
+        onClick={() => window.print()}
         className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
         style={{ background: '#a78bfa', color: '#fff' }}>
         <Printer size={12} /> Print / PDF
