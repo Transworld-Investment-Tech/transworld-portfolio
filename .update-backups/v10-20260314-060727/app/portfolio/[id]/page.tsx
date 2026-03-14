@@ -6,13 +6,12 @@ import { supabase } from '@/lib/supabase'
 import { computeNAV, computeSleeveData, complianceAlerts, estimatedIncomePA, totalUnrealizedPnL, fmt, SLEEVE_COLOURS, type Portfolio, type Holding, type SleeveTarget } from '@/lib/portfolio'
 import {
   ArrowLeft, RefreshCw, FileText, Settings, TrendingUp, TrendingDown,
-  ChevronRight, AlertTriangle, Info, CheckCircle2
+  ChevronRight, AlertTriangle, Info, CheckCircle2, Download
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 import PageActions from '@/components/shared/PageActions'
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
-const PerformanceDashboard = dynamic(() => import('@/components/portfolio/PerformanceDashboard'), { ssr: false })
 const SleeveBarChart  = dynamic(() => import('@/components/portfolio/SleeveBarChart'),  { ssr: false })
 const IncomeChart     = dynamic(() => import('@/components/portfolio/IncomeChart'),     { ssr: false })
 
@@ -144,6 +143,15 @@ export default function PortfolioDashboard() {
           <button onClick={() => setTab('reports')} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
             <FileText size={12} /> Generate report
           </button>
+          <button
+            onClick={() => {
+              const url = `/api/export?portfolioId=${portfolioId}`
+              window.open(url, '_blank', 'width=1024,height=800')
+            }}
+            className="flex items-center gap-1.5 text-xs border border-white/10 text-[#8a91a8] hover:text-[#e8eaf0] rounded-lg px-3 py-1.5 transition-colors"
+          >
+            <Download size={12} /> Download report
+          </button>
           <Link href={`/admin/portfolios/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors">
             <Settings size={12} /> Manage
           </Link>
@@ -230,11 +238,6 @@ export default function PortfolioDashboard() {
           )}
 
           {/* TAB: HOLDINGS */}
-          {/* ── Performance Dashboard ──────────────────────── */}
-          {tab === 'overview' && (
-            <PerformanceDashboard portfolioId={portfolioId} />
-          )}
-
           {tab === 'holdings' && (
             <>
               <div className="tw-card mb-5">

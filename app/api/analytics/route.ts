@@ -1,12 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
-import {
-  calculateIRR, buildCashFlows, calcPeriodReturn, BENCHMARKS,
-} from '@/lib/analytics'
 import { computeNAV } from '@/lib/portfolio'
+import {
+  computePeriodMetrics, PERIODS, type PeriodKey,
+  buildCashFlows, calculateIRR, BENCHMARKS,
+} from '@/lib/analytics'
 
 export async function GET(req: NextRequest) {
   const portfolioId = req.nextUrl.searchParams.get('portfolioId')
+  const periodKey   = (req.nextUrl.searchParams.get('period') ?? 'ITD') as PeriodKey
+
   if (!portfolioId)
     return NextResponse.json({ error: 'portfolioId required' }, { status: 400 })
 
@@ -22,55 +25,35 @@ export async function GET(req: NextRequest) {
 
   if (!portRes.data) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  const portfolio = portRes.data
-  const navHistory = navRes.data ?? []
+  const portfolio    = portRes.data
+  const navHistory   = navRes.data ?? []
   const transactions = txRes.data ?? []
 
-  // Current NAV
   const priceMap: Record<string, number> = {}
-  pricesRes.data?.forEach((p: any) => {
-    if (!priceMap[p.instrument_id]) priceMap[p.instrument_id] = p.price
-  })
+  pricesRes.data?.forEach((p: any) => { if (!priceMap[p.instrument_id]) priceMap[p.instrument_id] = p.price })
+
   const holdings = (holdRes.data ?? []).map((h: any) => ({
     ...h,
     latest_price: priceMap[h.instrument_id] ?? h.avg_cost,
   }))
+
   const currentNAV = computeNAV(holdings)
 
-  // ── IRR ───────────────────────────────────────────────────────
-  const cashFlows = buildCashFlows(
-    portfolio.starting_nav,
-    portfolio.start_date,
-    transactions,
-    currentNAV,
-  )
-  const irr = calculateIRR(cashFlows)
+  // Compute metrics for the requested period
+  const metrics = computePeriodMetrics(periodKey, portfolio, currentNAV, navHistory, transactions)
 
-  // ── Period returns ────────────────────────────────────────────
-  // Try to get NAV from nav_log first; fall back to computing from holdings
-  const navWithCurrent = [
-    ...navHistory,
-    { nav_date: new Date().toISOString().slice(0, 10), nav_value: currentNAV },
-  ]
-
-  const periods = [
-    { label: '1 Month',   days: 30  },
-    { label: '3 Months',  days: 91  },
-    { label: '6 Months',  days: 182 },
-    { label: '1 Year',    days: 365 },
-    { label: 'Since Inception', days: Math.round((Date.now() - new Date(portfolio.start_date).getTime()) / 86400000) },
-  ]
-
-  const periodReturns = periods.map(p =>
-    calcPeriodReturn(currentNAV, navWithCurrent, p.days, p.label)
-  )
-
-  // ── Total return since inception ──────────────────────────────
-  const totalReturn = (currentNAV - portfolio.starting_nav) / portfolio.starting_nav
-  const daysInception = Math.round((Date.now() - new Date(portfolio.start_date).getTime()) / 86400000)
-  const annualisedReturn = daysInception > 0
-    ? Math.pow(1 + totalReturn, 365 / daysInception) - 1
-    : null
+  // Also compute all periods summary (lightweight — no full IRR, just simple returns)
+  const allPeriodsSummary = PERIODS.map(p => {
+    const m = computePeriodMetrics(p.key, portfolio, currentNAV, navHistory, transactions)
+    return {
+      period:      m.period,
+      periodLabel: m.periodLabel,
+      daysHeld:    m.daysHeld,
+      simpleReturn: m.simpleReturn,
+      mwr:         m.mwr,
+      annualisedMwr: m.annualisedMwr,
+    }
+  })
 
   return NextResponse.json({
     portfolioId,
@@ -78,12 +61,8 @@ export async function GET(req: NextRequest) {
     startDate:     portfolio.start_date,
     startingNAV:   portfolio.starting_nav,
     currentNAV,
-    totalReturn,
-    annualisedReturn,
-    daysInception,
-    irr,
-    periodReturns,
-    benchmarks:    BENCHMARKS,
-    cashFlowCount: cashFlows.length,
+    period:        metrics,
+    allPeriods:    allPeriodsSummary,
+    benchmarkNote: 'NGX index data estimated from known annual returns. Live data not available.',
   })
 }
