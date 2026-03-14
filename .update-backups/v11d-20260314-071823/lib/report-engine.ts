@@ -64,12 +64,13 @@ function buildWatchlistContext(
     '',
     '═══════════════════════════════════════════════════════',
     'TRANSWORLD NGX MASTER WATCHLIST CONTEXT',
-    '',
+    '(Use this for opportunity identification and portfolio gap analysis)',
+    '═══════════════════════════════════════════════════════',
     '',
     `WATCHLIST UNIVERSE: ${watchEquities.length} equities | ${watchFI.length} fixed income | ${watchOther.length} other`,
     '',
     '── TOP 20 WATCHLIST EQUITIES (by rank) ─────────────────',
-    ...watchEquities.slice(0, (reportType === 'annual' || reportType === 'quarterly') ? 8 : 15).map(w =>
+    ...watchEquities.slice(0, 20).map(w =>
       `  #${w.rank} ${w.ticker || '—'} — ${w.name}${heldTickers.has(w.ticker) ? ' [IN PORTFOLIO]' : ''}${w.sub_type ? ' (' + w.sub_type + ')' : ''}`
     ),
     '',
@@ -78,7 +79,7 @@ function buildWatchlistContext(
     ...heldAndWatched.map(w => `  ✓ ${w.ticker} (#${w.rank} on watchlist) — ${w.rationale?.slice(0, 80) ?? ''}`),
     '',
     `Top watchlist equities NOT yet in portfolio (${Math.min(notHeld.length, 10)} of ${notHeld.length}):`,
-    ...notHeld.slice(0, (reportType === 'annual' || reportType === 'quarterly') ? 5 : 8).map(w => `  → #${w.rank} ${w.ticker} — ${w.name}: ${w.rationale?.slice(0, 100) ?? ''}`),
+    ...notHeld.slice(0, 10).map(w => `  → #${w.rank} ${w.ticker} — ${w.name}: ${w.rationale?.slice(0, 100) ?? ''}`),
     '',
     heldNotOnWatchlist.length > 0
       ? `Portfolio positions NOT on master watchlist (review warranted): ${heldNotOnWatchlist.join(', ')}`
@@ -264,7 +265,7 @@ Include any eagle-eye watchlist items approaching a trigger point.
 
   const response = await client.messages.create({
     model:      'claude-sonnet-4-20250514',
-    max_tokens: (reportType === 'annual' ? 5500 : reportType === 'quarterly' ? 4500 : reportType === 'monthly' ? 3500 : 2500),
+    max_tokens: 8000,
     messages:   [{ role: 'user', content: prompt }],
   } as any)
 
