@@ -50,8 +50,8 @@ export async function GET(req: NextRequest) {
       periodLabel: m.periodLabel,
       daysHeld:    m.daysHeld,
       simplePeriodReturn: m.simplePeriodReturn,
-      mwr:         m.mwr,
-      annualisedMwr: m.irr,
+      irr:         m.irr,
+      
     }
   })
 
