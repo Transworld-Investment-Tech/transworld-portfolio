@@ -31,7 +31,9 @@ export default function HomePage() {
   const [navMap,     setNavMap]     = useState<Record<string, number>>({})
   const [loading,    setLoading]    = useState(true)
   const [deleting,   setDeleting]   = useState<string | null>(null)
-  const [confirmDel, setConfirmDel] = useState<{ id: string; name: string } | null>(null)
+  const [confirmDel,        setConfirmDel]        = useState<{ id: string; name: string } | null>(null)
+  const [confirmArchiveClient, setConfirmArchiveClient] = useState<{ id: string; name: string } | null>(null)
+  const [archivingClient,      setArchivingClient]      = useState<string | null>(null)
   const [stats, setStats] = useState({ totalPortfolios: 0, totalNAV: 0, activeClients: 0 })
 
   const loadClients = useCallback(async () => {
@@ -79,6 +81,14 @@ export default function HomePage() {
   }, [])
 
   useEffect(() => { loadClients() }, [])
+
+  async function archiveClient(id: string) {
+    setArchivingClient(id)
+    await fetch(`/api/clients/${id}`, { method: 'DELETE' })
+    setConfirmArchiveClient(null)
+    setArchivingClient(null)
+    loadClients()
+  }
 
   async function deletePortfolio(id: string) {
     setDeleting(id)
@@ -140,6 +150,47 @@ export default function HomePage() {
                   Archive portfolio
                 </button>
                 <button onClick={() => setConfirmDel(null)}
+                  className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+                  Cancel
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Archive client modal */}
+        {confirmArchiveClient && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+            <div className="bg-[#13161d] border border-white/10 rounded-2xl p-6 w-96 shadow-2xl">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 rounded-xl bg-[#f59e0b]/10 flex items-center justify-center flex-shrink-0">
+                  <AlertTriangle size={18} className="text-[#f59e0b]" />
+                </div>
+                <div>
+                  <div className="text-sm font-semibold">Archive client?</div>
+                  <div className="text-xs text-[#555d72] mt-0.5">Client and all portfolios will be hidden</div>
+                </div>
+                <button onClick={() => setConfirmArchiveClient(null)} className="ml-auto text-[#555d72] hover:text-[#e8eaf0]">
+                  <X size={16} />
+                </button>
+              </div>
+              <div className="px-3 py-2 bg-white/[0.03] rounded-lg mb-4 text-sm text-[#8a91a8]">
+                {confirmArchiveClient.name}
+              </div>
+              <div className="text-xs text-[#555d72] mb-5 leading-relaxed">
+                This archives the client and all their portfolios. All data (holdings, transactions, reports) is preserved and can be restored by setting <code className="text-[#a78bfa]">status = 'active'</code> in Supabase.
+              </div>
+              <div className="flex gap-3">
+                <button
+                  onClick={() => archiveClient(confirmArchiveClient.id)}
+                  disabled={archivingClient === confirmArchiveClient.id}
+                  className="flex items-center gap-2 bg-[#f59e0b] text-white px-4 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 hover:bg-[#d97706] transition-colors">
+                  {archivingClient === confirmArchiveClient.id
+                    ? <RefreshCw size={12} className="animate-spin" />
+                    : <Trash2 size={12} />}
+                  Archive client
+                </button>
+                <button onClick={() => setConfirmArchiveClient(null)}
                   className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
                   Cancel
                 </button>
@@ -240,10 +291,18 @@ export default function HomePage() {
                     </div>
                     <span className="text-sm font-semibold">{client.name}</span>
                     <span className={`badge ${typeColor[client.type] || 'badge-cash'}`}>{client.type}</span>
-                    <Link href={`/admin/clients/${client.id}`}
-                      className="ml-auto text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors flex items-center gap-1">
-                      Manage <ChevronRight size={11} />
-                    </Link>
+                    <div className="ml-auto flex items-center gap-2">
+                      <Link href={`/admin/clients/${client.id}`}
+                        className="text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors flex items-center gap-1">
+                        Manage <ChevronRight size={11} />
+                      </Link>
+                      <button
+                        onClick={() => setConfirmArchiveClient({ id: client.id, name: client.name })}
+                        className="flex items-center gap-1 text-[11px] text-[#555d72] hover:text-[#f59e0b] border border-white/10 hover:border-[#f59e0b]/40 rounded px-2 py-0.5 transition-colors"
+                        title="Archive client">
+                        <Trash2 size={10} /> Archive
+                      </button>
+                    </div>
                   </div>
 
                   <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
