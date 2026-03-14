@@ -28,9 +28,6 @@ export default function PortfolioDashboard() {
   const [loading, setLoading]       = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [fxRate, setFxRate]         = useState<number>(1665)
-  const [analytics,    setAnalytics]    = useState<any>(null)
-  const [analyticsLoading, setAnalyticsLoading] = useState(false)
-  const [selectedPeriod, setSelectedPeriod] = useState<string>('1 Year')
   const [report, setReport]         = useState('')
   const [reportType, setReportType] = useState<'daily'|'weekly'|'monthly'|'quarterly'|'annual'>('monthly')
   const [generatingReport, setGeneratingReport] = useState(false)
@@ -78,16 +75,6 @@ export default function PortfolioDashboard() {
       .then(d => { if (d.rates?.NGN) setFxRate(d.rates.NGN) })
       .catch(() => {})
   }, [])
-
-  // Fetch analytics (IRR, period returns, benchmarks)
-  useEffect(() => {
-    if (!portfolioId) return
-    setAnalyticsLoading(true)
-    fetch(`/api/analytics?portfolioId=${portfolioId}`)
-      .then(r => r.json())
-      .then(d => { setAnalytics(d); setAnalyticsLoading(false) })
-      .catch(() => setAnalyticsLoading(false))
-  }, [portfolioId])
 
   async function refreshPrices() {
     setRefreshing(true)
@@ -156,6 +143,39 @@ export default function PortfolioDashboard() {
           <button onClick={() => setTab('reports')} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
             <FileText size={12} /> Generate report
           </button>
+          <PageActions
+            pageTitle="Portfolio Overview"
+            portfolioName={portfolio.name}
+            getText={() => {
+              const tot = computeNAV(holdings)
+              const pl  = tot - portfolio.starting_nav
+              const sv  = computeSleeveData(holdings, sleeveDefs, tot)
+              const lines = [
+                `CLIENT:        ${portfolio.client?.name}`,
+                `PORTFOLIO:     ${portfolio.name}`,
+                `DATE:          ${new Date().toLocaleDateString('en-GB')}`,
+                `FX RATE:       ₦${Math.round(fxRate).toLocaleString()}/USD`,
+                '',
+                '── PERFORMANCE ──────────────────────────────────',
+                `Starting NAV:  ₦${(portfolio.starting_nav/1e6).toFixed(2)}M  (${portfolio.start_date})`,
+                `Current NAV:   ₦${(tot/1e6).toFixed(2)}M`,
+                `Total P&L:     ₦${(pl/1e6).toFixed(2)}M  (${(pl/portfolio.starting_nav*100).toFixed(1)}%)`,
+                `Income target: ${(portfolio.income_target*100).toFixed(1)}% p.a.`,
+                '',
+                '── SLEEVE ALLOCATION ────────────────────────────',
+                ...sv.map(s => `${s.name}: ${(s.act*100).toFixed(1)}% actual vs ${(s.target_pct*100).toFixed(1)}% target | ₦${(s.val/1e6).toFixed(2)}M | ${s.status}`),
+                '',
+                '── HOLDINGS ─────────────────────────────────────',
+                ...holdings.map(h => {
+                  const p = h.latest_price ?? h.avg_cost
+                  const v = h.quantity * p
+                  const pnl = h.quantity * (p - h.avg_cost)
+                  return `${h.instrument_id} (${h.instrument?.name}): ${Math.round(h.quantity).toLocaleString()} | ₦${p.toFixed(2)} | ₦${(v/1e6).toFixed(2)}M | wt ${(v/tot*100).toFixed(1)}% | PnL ${pnl >= 0 ? '+' : ''}₦${(pnl/1e6).toFixed(2)}M`
+                }),
+              ]
+              return lines.join('\n')
+            }}
+          />
           <Link href={`/admin/portfolios/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors">
             <Settings size={12} /> Manage
           </Link>
@@ -242,149 +262,6 @@ export default function PortfolioDashboard() {
           )}
 
           {/* TAB: HOLDINGS */}
-
-          {/* ── Performance Analytics ──────────────────────────── */}
-          {tab === 'overview' && analytics && (
-            <div className="px-6 pb-6 grid grid-cols-1 gap-4">
-
-              {/* IRR + Period Returns */}
-              <div className="tw-card">
-                <div className="flex items-center justify-between mb-4">
-                  <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72]">Performance & Returns</div>
-                  <div className="flex gap-1">
-                    {['1 Month','3 Months','1 Year','Since Inception'].map(p => (
-                      <button key={p} onClick={() => setSelectedPeriod(p)}
-                        className="px-2.5 py-1 rounded text-[11px] font-medium transition-all"
-                        style={selectedPeriod === p
-                          ? { background: '#a78bfa20', color: '#a78bfa', border: '1px solid #a78bfa40' }
-                          : { background: 'transparent', color: '#555d72', border: '1px solid rgba(255,255,255,0.07)' }}>
-                        {p}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-
-                {/* Top metrics row */}
-                <div className="grid grid-cols-4 gap-4 mb-5">
-                  {/* IRR */}
-                  <div className="text-center p-3 rounded-xl bg-[#a78bfa]/5 border border-[#a78bfa]/10">
-                    <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">IRR (Since Inception)</div>
-                    <div className="text-2xl font-bold font-mono" style={{ color: analytics.irr >= 0 ? '#22c55e' : '#ef4444' }}>
-                      {analytics.irr != null ? `${(analytics.irr * 100).toFixed(1)}%` : 'N/A'}
-                    </div>
-                    <div className="text-[10px] text-[#555d72] mt-1">Annualised</div>
-                  </div>
-
-                  {/* Annualised return */}
-                  <div className="text-center p-3 rounded-xl bg-white/[0.02] border border-white/[0.05]">
-                    <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">Annualised Return</div>
-                    <div className="text-2xl font-bold font-mono" style={{ color: analytics.annualisedReturn >= 0 ? '#22c55e' : '#ef4444' }}>
-                      {analytics.annualisedReturn != null ? `${(analytics.annualisedReturn * 100).toFixed(1)}%` : 'N/A'}
-                    </div>
-                    <div className="text-[10px] text-[#555d72] mt-1">{analytics.daysInception} days held</div>
-                  </div>
-
-                  {/* Selected period return */}
-                  {(() => {
-                    const pr = analytics.periodReturns?.find((p: any) => p.label === selectedPeriod)
-                    return (
-                      <div className="text-center p-3 rounded-xl bg-white/[0.02] border border-white/[0.05]">
-                        <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">{selectedPeriod} Return</div>
-                        <div className="text-2xl font-bold font-mono" style={{ color: pr?.percentReturn >= 0 ? '#22c55e' : '#ef4444' }}>
-                          {pr?.percentReturn != null ? `${pr.percentReturn >= 0 ? '+' : ''}${(pr.percentReturn * 100).toFixed(1)}%` : 'N/A'}
-                        </div>
-                        <div className="text-[10px] text-[#555d72] mt-1">
-                          {pr?.absoluteReturn != null ? `${pr.absoluteReturn >= 0 ? '+' : ''}₦${(Math.abs(pr.absoluteReturn)/1e6).toFixed(2)}M` : ''}
-                        </div>
-                      </div>
-                    )
-                  })()}
-
-                  {/* Total return ITD */}
-                  <div className="text-center p-3 rounded-xl bg-white/[0.02] border border-white/[0.05]">
-                    <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">Total Return ITD</div>
-                    <div className="text-2xl font-bold font-mono" style={{ color: analytics.totalReturn >= 0 ? '#22c55e' : '#ef4444' }}>
-                      {analytics.totalReturn != null ? `${analytics.totalReturn >= 0 ? '+' : ''}${(analytics.totalReturn * 100).toFixed(1)}%` : 'N/A'}
-                    </div>
-                    <div className="text-[10px] text-[#555d72] mt-1">
-                      ₦{(analytics.startingNAV/1e6).toFixed(1)}M → ₦{(analytics.currentNAV/1e6).toFixed(1)}M
-                    </div>
-                  </div>
-                </div>
-
-                {/* Period returns table */}
-                <div className="mb-5">
-                  <div className="text-[10px] font-semibold uppercase tracking-wider text-[#555d72] mb-2">All period returns</div>
-                  <table className="tw-table w-full">
-                    <thead><tr><th>Period</th><th>Start NAV</th><th>End NAV</th><th>Absolute Return</th><th>Return %</th><th>Annualised</th><th>Days</th></tr></thead>
-                    <tbody>
-                      {analytics.periodReturns?.map((pr: any) => (
-                        <tr key={pr.label} style={pr.label === selectedPeriod ? { background: 'rgba(167,139,250,0.05)' } : {}}>
-                          <td className="font-medium">{pr.label}</td>
-                          <td className="font-mono">{pr.startNAV ? `₦${(pr.startNAV/1e6).toFixed(2)}M` : '—'}</td>
-                          <td className="font-mono">₦{(pr.endNAV/1e6).toFixed(2)}M</td>
-                          <td className={`font-mono ${pr.absoluteReturn >= 0 ? 'text-[#22c55e]' : 'text-[#ef4444]'}`}>
-                            {pr.absoluteReturn != null ? `${pr.absoluteReturn >= 0 ? '+' : ''}₦${(Math.abs(pr.absoluteReturn)/1e6).toFixed(2)}M` : '—'}
-                          </td>
-                          <td className={`font-mono font-semibold ${pr.percentReturn >= 0 ? 'text-[#22c55e]' : 'text-[#ef4444]'}`}>
-                            {pr.percentReturn != null ? `${pr.percentReturn >= 0 ? '+' : ''}${(pr.percentReturn*100).toFixed(1)}%` : '—'}
-                          </td>
-                          <td className="font-mono text-[#8a91a8]">
-                            {pr.annualisedReturn != null ? `${pr.annualisedReturn >= 0 ? '+' : ''}${(pr.annualisedReturn*100).toFixed(1)}%` : '—'}
-                          </td>
-                          <td className="font-mono text-[#555d72]">{pr.daysHeld ?? '—'}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Benchmark comparison */}
-                <div>
-                  <div className="text-[10px] font-semibold uppercase tracking-wider text-[#555d72] mb-2">Benchmark comparison (annualised)</div>
-                  <table className="tw-table w-full">
-                    <thead><tr><th>Benchmark</th><th>Type</th><th>Return</th><th>vs Portfolio IRR</th><th>Source</th></tr></thead>
-                    <tbody>
-                      {/* Portfolio row first */}
-                      <tr style={{ background: 'rgba(167,139,250,0.05)' }}>
-                        <td className="font-semibold text-[#a78bfa]">This Portfolio</td>
-                        <td><span className="badge badge-stock">Discretionary</span></td>
-                        <td className="font-mono font-bold text-[#22c55e]">
-                          {analytics.irr != null ? `${(analytics.irr*100).toFixed(1)}%` : `${(analytics.annualisedReturn*100).toFixed(1)}%`}
-                        </td>
-                        <td className="font-mono text-[#555d72]">—</td>
-                        <td className="text-[10px] text-[#555d72]">Transworld PI</td>
-                      </tr>
-                      {analytics.benchmarks?.map((b: any) => {
-                        const portfolioRate = analytics.irr ?? analytics.annualisedReturn ?? 0
-                        const diff = portfolioRate - b.annualised
-                        return (
-                          <tr key={b.shortName}>
-                            <td className="font-medium">{b.name}</td>
-                            <td>
-                              <span className={`badge ${b.type === 'equity' ? 'badge-stock' : b.type === 'inflation' ? 'badge-breach' : 'badge-bond'}`}>
-                                {b.type === 'equity' ? 'Equity' : b.type === 'inflation' ? 'Inflation' : 'Fixed Income'}
-                              </span>
-                            </td>
-                            <td className="font-mono">{(b.annualised*100).toFixed(1)}%</td>
-                            <td className={`font-mono font-semibold ${diff >= 0 ? 'text-[#22c55e]' : 'text-[#ef4444]'}`}>
-                              {diff >= 0 ? '+' : ''}{(diff*100).toFixed(1)}pp
-                            </td>
-                            <td className="text-[10px] text-[#555d72]">{b.source}</td>
-                          </tr>
-                        )
-                      })}
-                    </tbody>
-                  </table>
-                  <div className="mt-2 text-[10px] text-[#555d72]">
-                    pp = percentage points outperformance vs benchmark. Positive = portfolio outperforms.
-                    IRR uses actual cash flows. Benchmarks are point-in-time annualised rates, not IRR-adjusted.
-                  </div>
-                </div>
-              </div>
-            </div>
-          )}
-
           {tab === 'holdings' && (
             <>
               <div className="tw-card mb-5">
