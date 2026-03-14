@@ -2,7 +2,7 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { Clock, Sparkles, FileText, Calendar, Copy, Check, Printer } from 'lucide-react'
+import { Clock, Sparkles, FileText, Calendar, Copy, Check } from 'lucide-react'
 import type { ReportType } from '@/lib/report-engine'
 
 const REPORT_TYPES: { value: ReportType; label: string; desc: string; color: string }[] = [
@@ -99,10 +99,6 @@ export default function PortfolioReportsPage() {
       if (data) setSelectedReport(data)
     } catch (e) { setError((e as Error).message) }
     finally { setGenerating(false) }
-  }
-
-  function printReport() {
-    window.print()
   }
 
   function copyReport() {
@@ -219,20 +215,13 @@ export default function PortfolioReportsPage() {
                 </span>
                 <span className="text-xs text-[#555d72]">{selectedReport.report_date}</span>
               </div>
-              <div className="flex items-center gap-2">
-                <button onClick={copyReport}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-                  style={copied
-                    ? { background: '#22c55e18', color: '#22c55e', border: '1px solid #22c55e40' }
-                    : { background: 'transparent', color: '#8a91a8', border: '1px solid rgba(255,255,255,0.1)' }}>
-                  {copied ? <><Check size={12} />Copied!</> : <><Copy size={12} />Copy to clipboard</>}
-                </button>
-                <button onClick={printReport}
-                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
-                  style={{ background: '#a78bfa', color: '#fff' }}>
-                  <Printer size={12} /> Print / PDF
-                </button>
-              </div>
+              <button onClick={copyReport}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
+                style={copied
+                  ? { background: '#22c55e18', color: '#22c55e', border: '1px solid #22c55e40' }
+                  : { background: '#a78bfa18', color: '#a78bfa', border: '1px solid #a78bfa40' }}>
+                {copied ? <><Check size={12} />Copied!</> : <><Copy size={12} />Copy to clipboard</>}
+              </button>
             </div>
 
             {/* Report content */}
