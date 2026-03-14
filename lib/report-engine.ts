@@ -1,6 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
-import { fetchMarketSnapshot } from './market-snapshot'
 
 export type ReportType = 'daily' | 'weekly' | 'monthly' | 'quarterly' | 'annual'
 
@@ -12,6 +11,8 @@ export interface ReportInput {
   dateFrom?: string
   dateTo?: string
   fxRate?: number
+  transactions?: any[]
+  navHistory?: any[]
 }
 
 function periodLabel(type: ReportType, from?: string, to?: string): string {
@@ -28,174 +29,204 @@ function periodLabel(type: ReportType, from?: string, to?: string): string {
 
 export async function generateAIReport(input: ReportInput): Promise<string> {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  const { portfolio, holdings, sleeveDefs, reportType, dateFrom, dateTo } = input
+  const { portfolio, holdings, sleeveDefs, reportType, dateFrom, dateTo, fxRate, transactions, navHistory } = input
 
-  const tot    = computeNAV(holdings)
-  const pl     = tot - portfolio.starting_nav
-  const ret    = pl / portfolio.starting_nav
-  const sv     = computeSleeveData(holdings, sleeveDefs, tot)
+  const tot   = computeNAV(holdings)
+  const pl    = tot - portfolio.starting_nav
+  const ret   = pl / portfolio.starting_nav
+  const sv    = computeSleeveData(holdings, sleeveDefs, tot)
   const period = periodLabel(reportType, dateFrom, dateTo)
   const today  = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
 
-  const equities  = holdings.filter(h => h.instrument?.type === 'Stock')
-  const fixedInc  = holdings.filter(h => h.instrument?.type !== 'Stock')
-  const tickers   = equities.map(h => h.instrument_id)
+  const equities = holdings.filter(h => h.instrument?.type === 'Stock')
+  const fixedInc = holdings.filter(h => h.instrument?.type !== 'Stock')
+  const tickers  = equities.map(h => h.instrument_id).join(', ')
 
-  // Pre-fetch market data (no web_search tool needed)
-  const market = await fetchMarketSnapshot(tickers, process.env.APIFY_API_KEY)
+  // Build rich portfolio context
+  const holdingLines = equities.map(h => {
+    const p   = h.latest_price ?? h.avg_cost
+    const v   = h.quantity * p
+    const pnl = v - (h.quantity * h.avg_cost)
+    const pnlPct = ((p - h.avg_cost) / h.avg_cost) * 100
+    return `  ${h.instrument_id} (${h.instrument?.name ?? ''}):
+    Shares: ${Math.round(h.quantity).toLocaleString()} | Avg cost: ₦${h.avg_cost.toFixed(2)} | Current: ₦${p.toFixed(2)}
+    Value: ${fmt.ngnM(v)} | Weight: ${fmt.pct(v/tot)} | Unrealized P&L: ${fmt.ngnM(pnl)} (${pnlPct>=0?'+':''}${pnlPct.toFixed(1)}%)
+    Day change: ${fmt.chg(h.day_change ?? 0)} | Div yield on file: ${h.instrument?.coupon_pct ?? 0}%`
+  }).join('\n\n')
 
-  // Build compact portfolio summary
-  const portfolioData = {
-    name:      portfolio.name,
-    client:    (portfolio as any).client?.name ?? 'N/A',
-    period,
-    nav:       fmt.ngnM(tot),
-    startNav:  fmt.ngnM(portfolio.starting_nav),
-    pl:        fmt.ngnM(pl),
-    plSign:    pl >= 0 ? 'positive' : 'negative',
-    ret:       fmt.pct(ret),
-    targets:   { income: fmt.pct(portfolio.income_target), cap: fmt.pct(portfolio.cap_target) },
-    limits:    { maxEqSingle: fmt.pct(portfolio.max_eq_single), maxEqSleeve: fmt.pct(portfolio.max_eq_sleeve), ddAlert: fmt.pct(portfolio.dd_alert), ddAction: fmt.pct(portfolio.dd_action) },
-    sleeves:   sv.map(s => ({ name: s.name, target: fmt.pct(s.target_pct), actual: fmt.pct(s.act), value: fmt.ngnM(s.val), status: s.status, diff: (s.diff >= 0 ? '+' : '') + fmt.ngnM(s.diff) })),
-    equities:  equities.map(h => {
-      const p = h.latest_price ?? h.avg_cost
-      const v = h.quantity * p
-      const mkt = market.stocks[h.instrument_id]
-      return {
-        ticker:   h.instrument_id,
-        name:     h.instrument?.name ?? h.instrument_id,
-        shares:   Math.round(h.quantity).toLocaleString(),
-        avgCost:  `₦${h.avg_cost.toFixed(2)}`,
-        mktPrice: mkt?.price ?? `₦${p.toFixed(2)}`,
-        dayChg:   mkt?.change ?? fmt.chg(h.day_change ?? 0),
-        value:    fmt.ngnM(v),
-        weight:   fmt.pct(v / tot),
-        unrlPL:   fmt.ngnM(v - h.quantity * h.avg_cost),
-        divYield: h.instrument?.coupon_pct ? `${h.instrument.coupon_pct}%` : 'N/A',
-      }
-    }),
-    fixedInc: fixedInc.map(h => ({
-      name:      h.instrument?.name ?? h.instrument_id,
-      type:      h.instrument?.type ?? 'Fixed Income',
-      face:      fmt.ngnM(h.quantity),
-      mktVal:    fmt.ngnM(h.quantity * (h.latest_price ?? h.avg_cost)),
-      yield:     h.instrument?.coupon_pct ? `${h.instrument.coupon_pct}%` : 'N/A',
-    })),
-    mandate:   sleeveDefs.map(s => `${s.name}: ${fmt.pct(s.target_pct)} target (${fmt.pct(s.min_pct)}–${fmt.pct(s.max_pct)})`).join(' | '),
-  }
+  const fiLines = fixedInc.map(h => {
+    const mv = h.quantity * (h.latest_price ?? h.avg_cost)
+    return `  ${h.instrument?.name ?? h.instrument_id}: Face ₦${fmt.ngnM(h.quantity)} | Mkt val ${fmt.ngnM(mv)} | Yield ${h.instrument?.coupon_pct ?? 0}%`
+  }).join('\n')
 
-  const prompt = `You are a senior investment analyst at Transworld Asset Management, Lagos.
-Generate a professional ${reportType.toUpperCase()} portfolio report for: ${period}
-Report generated: ${today}
+  const sleeveLines = sv.map(s =>
+    `  ${s.name}: Target ${fmt.pct(s.target_pct)} | Actual ${fmt.pct(s.act)} | Value ${fmt.ngnM(s.val)} | Status: ${s.status} | Diff: ${(s.diff>=0?'+':'')+fmt.ngnM(s.diff)}`
+  ).join('\n')
 
-=== PRE-FETCHED MARKET DATA (use this directly — do not search for it) ===
-FX Rate: ${market.fx.usdNgn} (${market.fx.source})
-CBN MPR: ${market.cbr.mpr}
-Inflation: ${market.cbr.inflation}
-Last MPC: ${market.cbr.lastMPC}
-NTB Rates — 91D: ${market.ntbRates.d91} | 182D: ${market.ntbRates.d182} | 364D: ${market.ntbRates.d364}
-FGN Yields — 5yr: ${market.fgnYields.y5} | 10yr: ${market.fgnYields.y10}
-NGX ASI: ${market.ngxASI.level} (Day: ${market.ngxASI.change}, YTD: ${market.ngxASI.ytd})
-Brent Crude: ${market.brent.price} (${market.brent.change})
-Data fetched: ${market.fetchedAt}
+  // Transaction history summary
+  const txSummary = transactions && transactions.length > 0
+    ? `\nRECENT TRANSACTIONS (last 20):\n${transactions.slice(0,20).map(t =>
+        `  ${t.trade_date} | ${t.action} | ${t.instrument_id} | ${Math.round(t.quantity||0).toLocaleString()} shares @ ₦${Number(t.price||0).toFixed(2)} | Gross: ${fmt.ngnM(t.gross_value||0)} | Fees: ₦${Number(t.fees||0).toLocaleString()}`
+      ).join('\n')}`
+    : ''
 
-Stock prices from Apify:
-${Object.values(market.stocks).map(s => `${s.ticker}: ${s.price} (${s.change}) — ${s.source}`).join('\n')}
+  // NAV history
+  const navLines = navHistory && navHistory.length > 0
+    ? `\nNAV HISTORY:\n${navHistory.map(n => `  ${n.nav_date}: ${fmt.ngnM(n.nav_value)}${n.notes ? ' — '+n.notes : ''}`).join('\n')}`
+    : ''
 
-=== PORTFOLIO DATA ===
-${JSON.stringify(portfolioData, null, 1)}
+  const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Asset Management, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
-=== YOUR TASK ===
-Using the market data above PLUS your training knowledge about these Nigerian stocks and markets,
-generate a complete, beautiful HTML portfolio report.
+Generate a rigorous, insightful ${reportType.toUpperCase()} portfolio intelligence report for the period: ${period}
+Generated: ${today}
 
-For each equity holding, use your knowledge to provide:
-- P/E ratio estimate and P/B ratio (based on recent data you know)
-- Dividend yield and approximate ex-dividend timing
-- Recent earnings commentary (beat/miss based on your knowledge)
-- Investment signal: ACCUMULATE / HOLD / REDUCE / WATCH with clear rationale
-- 52-week price range (approximate based on your knowledge)
+═══════════════════════════════════════════════════════
+PORTFOLIO DATA
+═══════════════════════════════════════════════════════
 
-For macro commentary, use the pre-fetched data above plus your knowledge of:
-- CBN policy trajectory and implications
-- NGX sector dynamics (banking recapitalisation, consumer sector, oil & gas)
-- Nigeria's fiscal and FX outlook
+CLIENT: ${(portfolio as any).client?.name ?? 'N/A'}
+PORTFOLIO: ${portfolio.name}
+CURRENCY: ${portfolio.currency}
+FX RATE: ${fxRate ? `₦${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
 
-Output ONLY a complete HTML document starting with <!DOCTYPE html>. No markdown. No text before the doctype.
+PERFORMANCE:
+  Starting NAV: ${fmt.ngnM(portfolio.starting_nav)} (${portfolio.start_date})
+  Current NAV:  ${fmt.ngnM(tot)}
+  Total P&L:    ${fmt.ngnM(pl)} (${fmt.pct(ret)})
 
-HTML DESIGN — inline styles only (one <style> reset block in <head> allowed):
-Colors: navy #0f1923, gold #c9a84c, bg #f0f2f5, cards white, green #22c55e, red #ef4444, amber #f59e0b, purple #8b5cf6, blue #3b82f6
-Font: Segoe UI/Arial. Max-width 960px centered. 40px side padding. Printable A4.
+MANDATE:
+  Income target:    ${fmt.pct(portfolio.income_target)} p.a.
+  Cap target:       ${fmt.pct(portfolio.cap_target)} p.a.
+  Max single eq:    ${fmt.pct(portfolio.max_eq_single)}
+  Max eq sleeve:    ${fmt.pct(portfolio.max_eq_sleeve)}
+  Drawdown alert:   ${fmt.pct(portfolio.dd_alert)}
+  Drawdown action:  ${fmt.pct(portfolio.dd_action)}
 
-SECTIONS:
+SLEEVE ALLOCATION:
+${sleeveLines}
 
-1. HEADER — full-width navy band. Left: "TRANSWORLD ASSET MANAGEMENT" gold 11px uppercase tracked, portfolio name white 26px bold, report type + period grey. Right: date + gold "CONFIDENTIAL" badge. 4px gold bottom border.
+EQUITY HOLDINGS:
+${holdingLines}
 
-2. EXECUTIVE SUMMARY — white card, 4px gold left border. "EXECUTIVE SUMMARY" gold uppercase label. 4-5 sentences. Bold key number. Last sentence bold = single most urgent action.
+FIXED INCOME / CASH:
+${fiLines || '  None currently held'}
+${txSummary}
+${navLines}
 
-3. KPI STRIP — 5 equal flex cards:
-   Current NAV (gold top border) | P&L vs Start (green/red) | Total Return % (green/red) | Drawdown (green/amber/red) | Income Progress (purple)
-   Each: 11px grey label top, 24px bold monospace number, 11px grey sub-label.
+═══════════════════════════════════════════════════════
+YOUR ANALYSIS TASK
+═══════════════════════════════════════════════════════
 
-4. ALLOCATION vs TARGETS — "PORTFOLIO ALLOCATION" heading.
-   Table: Sleeve | Target% | Actual% | Value(₦M) | Diff | Status badge | Action
-   CSS progress bar per sleeve: filled=actual%, thin vertical line=target%.
-   Green bar=OK, red=BREACH, amber=OVER. Colored pill badges.
+Write a deeply analytical, forward-looking portfolio report in clean plain text with markdown headers.
+Use your knowledge of Nigerian markets, CBN policy, and these specific companies to provide genuine insight.
+Every section should give the portfolio manager something actionable and specific — not generic commentary.
 
-5. MARKET COMMENTARY — 2×2 card grid, each with colored left border (4px):
-   A. MONETARY POLICY & RATES (blue #3b82f6) — MPR table, inflation, rate direction outlook
-   B. NGX EQUITY MARKET (green) — ASI data, sector themes, banking recapitalisation update
-   C. FIXED INCOME (purple) — NTB rates table by tenor, FGN yields, roll/extend recommendation
-   D. FX & MACRO (amber) — USD/NGN, Brent, top 3 risks to portfolio next 30-90 days
+FORMAT: Clean markdown. Use ## for sections, ### for subsections, **bold** for key numbers and signals.
+No HTML. No bullet-point padding. Write in paragraphs where analysis is needed. Use tables only for data grids.
 
-6. EQUITY HOLDINGS DEEP-DIVE — one card per equity:
-   Header: dark ticker badge (gold text) | company name bold | market price 20px | day change pill green/red
-   Row 1: Shares | Avg cost | Unrealized P&L (green/red) | Weight %
-   Row 2: P/E | P/B | Div yield | Ex-div date | Earnings badge (BEAT/MISS/IN-LINE)
-   Row 3: 52-wk range | Sector | Market cap (est.) | Beta vs ASI
-   SIGNAL BANNER — full width colored footer on card:
-     ACCUMULATE (green) / HOLD (blue) / REDUCE (red) / WATCH (amber)
-     2-3 sentences of rationale citing specific data
-     Italic small: "Analytical suggestion — portfolio manager discretion applies."
+REPORT STRUCTURE:
 
-7. FIXED INCOME ANALYSIS — table: Instrument | Type | Face Val | Mkt Val | Yield | Duration view | Recommendation
+## EXECUTIVE SUMMARY
+3-4 sentences maximum. Lead with the single most important insight about this portfolio right now.
+State the most urgent action in the final sentence, bolded.
 
-8. RISK DASHBOARD — "RISK & COMPLIANCE MONITOR"
-   Table: Check | Current | Threshold | Status badge | Action required
-   Rows: Liquidity%, Max single equity%, Equity sleeve%, Drawdown status, Income on track
+## PORTFOLIO PERFORMANCE REVIEW
+Analyse performance against mandate targets. Is the ${fmt.pct(portfolio.income_target)} income target being met?
+Is the ${fmt.pct(portfolio.cap_target)} cap target on track? What has driven returns?
+If NAV history is available, analyse the trajectory — where was growth strong, where was it weak?
+What does the ${fmt.pct(ret)} total return since inception tell us about portfolio construction quality?
 
-9. REBALANCING GUIDE — table:
-   Sleeve | Target(₦M) | Actual(₦M) | Gap(₦M) | Action | Instrument(s) | Priority badge
-   Priority: IMMEDIATE(red) | THIS WEEK(amber) | THIS MONTH(blue) | ON TRACK(grey)
+## MARKET CONTEXT: NIGERIA — ${period}
+### Monetary Policy & Rates
+Your assessment of where CBN is headed. Use your knowledge of the current MPR (26.5%, cut 50bps Feb 2026),
+the inflation trajectory (falling for 11 consecutive months to ~15.1% Jan 2026), and what this means
+for fixed income and equity valuations going forward. When do you expect the next cut? What's the real yield?
 
-10. PRIORITY ACTIONS 1-5 — numbered:
-    Bold action title | Instrument + size | Rationale (cite data) | Expected impact | Urgency badge
+### NGX Equity Market
+Honest assessment of the NGX environment. Your knowledge of YTD performance, sector dynamics,
+banking recapitalisation momentum, and what's driving or dragging the index.
+How does this portfolio's equity exposure fit the current market backdrop?
 
-11. FOOTER — grey bg, 11px.
-    "This report is prepared by Transworld Asset Management. AI-assisted analytical suggestions do not constitute investment advice. The portfolio manager retains full discretion over all investment decisions. Market data sourced from public sources as at ${today}."
+### Fixed Income Opportunity
+Assess the NTB/FGN opportunity: 364D NTBs at ~18.47%, 10yr FGN bonds at ~16.06%.
+What is the real yield after 15.1% inflation? What is the duration risk given CBN easing?
+What is the optimal positioning right now — short duration or extend for capital gains?
 
-RULES:
-- Output ONLY valid HTML starting with <!DOCTYPE html>
-- All CSS inline except one <style> block in <head> for body reset + @media print
-- Cite data source next to market numbers (e.g. "exchangerate-api.com" or "Apify/TradingView")
-- If a value is unknown write "est." or "N/A" — never fabricate precise numbers
-- Signals clearly labelled as analytical suggestions
-- Make it genuinely beautiful and printable`
+### FX & Macro Risks
+USD/NGN trajectory, oil price implications (this portfolio has Aradel/Seplat exposure — discuss specifically),
+and the top 3 macro risks to this portfolio over the next 90 days.
 
-  // No web_search tool — Claude uses pre-fetched data + training knowledge
+## EQUITY HOLDINGS ANALYSIS
+For each stock held (${tickers}), provide a substantive paragraph covering:
+- Current valuation (P/E and P/B estimates based on your knowledge — state these are estimates)
+- Recent financial performance: last earnings result, revenue trend, dividend history
+- Business-specific risks and opportunities right now (be specific to Nigeria, not generic)
+- Technical position: where is the stock relative to its 52-week range?
+- **Signal: ACCUMULATE / HOLD / REDUCE / WATCH** — state this clearly with your specific rationale
+- Price target range (estimate) and key catalyst to watch
+
+Use your deep knowledge of each company. For example:
+- ARADEL: oil production volumes, Brent exposure, rights issue history
+- NB (Nigerian Breweries): volume trends, excise duty pressures, parent Heineken strategy
+- UNILEVER: recent delisting rumors, low float, FX cost pressure vs. naira recovery
+- WAPCO (Lafarge Africa): cement demand, infrastructure spend, AfDB pipeline
+- UACN: real estate exposure, food segment, conglomerate discount
+- NESTLE: premium pricing power, repatriation of dividends, Maggi dominance
+- FCMB: recapitalisation status, retail banking growth, asset quality
+- ACCESSCORP: tier-1 pan-African expansion, recapitalisation, dividend outlook
+
+## FIXED INCOME & CASH ANALYSIS
+Assess the current fixed income and cash positions against the mandate.
+If there is a fixed income gap (mandate requires it but none held), quantify the income being foregone.
+Recommend specific NTB tenors and FGN bond maturities to target.
+Calculate approximate income impact of deploying to mandate targets.
+
+## RISK & COMPLIANCE REVIEW
+Work through each risk limit:
+- Liquidity (minimum ${fmt.pct(portfolio.liq_min)}): current ${fmt.pct(sv.find(s=>s.sleeve_id==='liq')?.act??0)} — compliant?
+- Single equity limit (${fmt.pct(portfolio.max_eq_single)}): list any breaches by name and amount over
+- Equity sleeve limit (${fmt.pct(portfolio.max_eq_sleeve)}): current position
+- Drawdown status vs ${fmt.pct(portfolio.dd_alert)} alert and ${fmt.pct(portfolio.dd_action)} action thresholds
+- Income target tracking: are we on pace for ${fmt.pct(portfolio.income_target)} income?
+
+For each breach or near-breach: state the exact shortfall, the risk it creates, and the specific action required.
+
+## REBALANCING RECOMMENDATIONS
+Concrete, specific recommendations with approximate trade sizes in naira.
+Prioritise by urgency. For each recommendation state:
+- What to buy or sell
+- Approximate size (₦M)
+- Why now (price level, mandate breach, market timing)
+- Expected impact on portfolio metrics
+
+## PORTFOLIO MANAGER ACTION LIST
+Number these 1-5, ranked by urgency. Each action:
+**[IMMEDIATE/THIS WEEK/THIS MONTH]** — Action title
+- Specific instrument and size
+- Rationale tied to data above
+- Expected portfolio impact
+
+## OUTLOOK & FORWARD GUIDANCE
+What should the portfolio look like in 3 months if recommendations are followed?
+What are the key decisions the portfolio manager needs to make?
+What market events or data releases should they be watching?
+
+---
+*Report generated ${today} | Transworld Asset Management Portfolio Intelligence*
+*Based on portfolio data as at report date. Valuation estimates and signals are analytical in nature.*
+*All investment decisions remain at the discretion of the portfolio manager.*`
+
   const response = await client.messages.create({
     model:      'claude-sonnet-4-20250514',
     max_tokens: 7000,
     messages:   [{ role: 'user', content: prompt }],
   })
 
-  const text = response.content
+  const text = (response.content as any[])
     .filter((b: any) => b.type === 'text')
-    .map((b: any) => b.text)
+    .map((b: any) => b.text as string)
     .join('\n')
+    .trim()
 
-  return text
-    .replace(/^```html\n?/i, '')
-    .replace(/\n?```$/i, '')
-    .trim() || '<p style="color:red;padding:20px;">Report generation failed — no content returned.</p>'
+  return text || 'Report generation failed — no content returned.'
 }
