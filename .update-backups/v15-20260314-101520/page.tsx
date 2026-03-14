@@ -2,7 +2,7 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
-import { FileText, Download, ChevronRight, Search, Trash2, RefreshCw } from 'lucide-react'
+import { FileText, Download, ChevronRight, Search } from 'lucide-react'
 
 export default function AllReportsPage() {
   const [reports, setReports] = useState<any[]>([])
@@ -10,7 +10,6 @@ export default function AllReportsPage() {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState('')
   const [selectedReport, setSelectedReport] = useState<any>(null)
-  const [deleting, setDeleting] = useState<string | null>(null)
 
   useEffect(() => {
     supabase.from('reports')
@@ -19,15 +18,6 @@ export default function AllReportsPage() {
       .limit(100)
       .then(({ data }) => { setReports(data ?? []); setLoading(false) })
   }, [])
-
-  async function deleteReport(id: string) {
-    if (!confirm('Delete this report? This cannot be undone.')) return
-    setDeleting(id)
-    await fetch(`/api/reports/${id}`, { method: 'DELETE' })
-    setReports(r => r.filter(x => x.id !== id))
-    if (selectedReport?.id === id) setSelectedReport(null)
-    setDeleting(null)
-  }
 
   function downloadReport(r: any) {
     const blob = new Blob([r.content], { type: 'text/plain' })
@@ -65,23 +55,11 @@ export default function AllReportsPage() {
             <div className="text-center py-8 text-xs text-[#555d72]">No reports found</div>
           ) : (
             filtered.map(r => (
-              <div key={r.id}
-                className={`px-5 py-3.5 border-b border-white/[0.05] cursor-pointer transition-colors group relative ${selectedReport?.id === r.id ? 'bg-[#a78bfa]/[0.07]' : 'hover:bg-white/[0.02]'}`}
-                onClick={() => setSelectedReport(r)}>
+              <div key={r.id} onClick={() => setSelectedReport(r)}
+                className={`px-5 py-3.5 border-b border-white/[0.05] cursor-pointer transition-colors ${selectedReport?.id === r.id ? 'bg-[#a78bfa]/[0.07]' : 'hover:bg-white/[0.02]'}`}>
                 <div className="flex items-start justify-between gap-2 mb-1">
                   <div className="text-xs font-medium truncate">{r.portfolio?.name}</div>
-                  <div className="flex items-center gap-1 flex-shrink-0">
-                    <span className="badge badge-ntb capitalize text-[9px]">{r.report_type}</span>
-                    <button
-                      onClick={e => { e.stopPropagation(); deleteReport(r.id) }}
-                      disabled={deleting === r.id}
-                      className="w-5 h-5 rounded flex items-center justify-center opacity-0 group-hover:opacity-100 hover:bg-[#ef4444]/20 transition-all"
-                      title="Delete report">
-                      {deleting === r.id
-                        ? <RefreshCw size={10} className="animate-spin text-[#555d72]" />
-                        : <Trash2 size={10} className="text-[#555d72] hover:text-[#ef4444]" />}
-                    </button>
-                  </div>
+                  <span className="badge badge-ntb capitalize text-[9px] flex-shrink-0">{r.report_type}</span>
                 </div>
                 <div className="text-[10px] text-[#555d72]">{r.portfolio?.client?.name}</div>
                 <div className="text-[10px] text-[#555d72] mt-0.5">{new Date(r.created_at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' })}</div>
