@@ -40,7 +40,8 @@ function periodLabel(type: ReportType, from?: string, to?: string): string {
 function buildWatchlistContext(
   holdings: Holding[],
   watchlist: WatchlistItem[],
-  tot: number
+  tot: number,
+  reportType: string
 ): string {
   if (!watchlist || watchlist.length === 0) return ''
 
@@ -132,7 +133,7 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
     : ''
 
   // Watchlist context
-  const watchlistContext = buildWatchlistContext(holdings, watchlist ?? [], tot)
+  const watchlistContext = buildWatchlistContext(holdings, watchlist ?? [], tot, reportType)
 
   const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Asset Management, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
