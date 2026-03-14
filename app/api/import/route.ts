@@ -73,10 +73,10 @@ export async function POST(req: NextRequest) {
     const instrId = (row.instrument_id ?? '').toUpperCase().trim()
     if (!knownInstruments.has(instrId) && instrId) {
       results.warnings.push(`Unknown instrument "${instrId}" — auto-creating as Stock`)
-      await db.from('instruments').insert({
+      await db.from('instruments').upsert({
         instrument_id: instrId, name: instrId, type: 'Stock',
         sleeve_id: 'eq', asset_class: 'Equity', approved: false,
-      }, { onConflict: 'instrument_id' })
+      }, { onConflict: 'instrument_id', ignoreDuplicates: true })
     }
 
     // Compute gross value if missing
