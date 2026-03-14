@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { ArrowLeft, Plus, Search, ChevronDown, ChevronRight } from 'lucide-react'
+import { ArrowLeft, Plus, Search } from 'lucide-react'
 import PageActions from '@/components/shared/PageActions'
 
 const ACTION_COLORS: Record<string, string> = {
@@ -14,16 +14,36 @@ const ACTION_COLORS: Record<string, string> = {
 
 type FeeView = 'total' | 'breakdown'
 
+// Virtual rows derived from BUY/SELL fee columns — shown when a fee type filter is active
+function buildFeeRows(txns: any[]): any[] {
+  const rows: any[] = []
+  txns.filter(t => t.action === 'BUY' || t.action === 'SELL').forEach(t => {
+    if (t.fee_commission && t.fee_commission > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'Brokerage Commission', _feeAmount: t.fee_commission, action: 'FEE', income_category: 'Brokerage Commission' })
+    if (t.fee_contract_stamp && t.fee_contract_stamp > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'Stamp Duty', _feeAmount: t.fee_contract_stamp, action: 'FEE', income_category: 'Stamp Duty' })
+    if (t.fee_vat && t.fee_vat > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'VAT', _feeAmount: t.fee_vat, action: 'FEE', income_category: 'VAT' })
+    if (t.fee_exchange && t.fee_exchange > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'Exchange Levy', _feeAmount: t.fee_exchange, action: 'FEE', income_category: 'Exchange Levy' })
+    if (t.fee_clearing && t.fee_clearing > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'Clearing Fee', _feeAmount: t.fee_clearing, action: 'FEE', income_category: 'Clearing Fee' })
+    if (t.fee_sms && t.fee_sms > 0)
+      rows.push({ ...t, _virtual: true, _feeType: 'SMS Charge', _feeAmount: t.fee_sms, action: 'FEE', income_category: 'SMS Charge' })
+  })
+  return rows
+}
+
 export default function TransactionsPage() {
   const { id: portfolioId } = useParams() as { id: string }
-  const [portfolio,    setPortfolio]    = useState<any>(null)
-  const [txns,         setTxns]         = useState<any[]>([])
-  const [instruments,  setInstruments]  = useState<any[]>([])
-  const [loading,      setLoading]      = useState(true)
-  const [showForm,     setShowForm]     = useState(false)
-  const [saving,       setSaving]       = useState(false)
-  const [filter,       setFilter]       = useState({ action: '', search: '' })
-  const [feeView,      setFeeView]      = useState<FeeView>('total')
+  const [portfolio,   setPortfolio]   = useState<any>(null)
+  const [txns,        setTxns]        = useState<any[]>([])
+  const [instruments, setInstruments] = useState<any[]>([])
+  const [loading,     setLoading]     = useState(true)
+  const [showForm,    setShowForm]    = useState(false)
+  const [saving,      setSaving]      = useState(false)
+  const [feeView,     setFeeView]     = useState<FeeView>('total')
+  const [filter, setFilter] = useState({ action: '', search: '', feeType: '' })
   const [form, setForm] = useState({
     trade_date: new Date().toISOString().slice(0, 10),
     instrument_id: '', action: 'BUY',
@@ -79,22 +99,46 @@ export default function TransactionsPage() {
     setSaving(false)
   }
 
-  const filtered = txns.filter(t => {
-    if (filter.action && t.action !== filter.action) return false
-    if (filter.search && !t.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()) && !t.notes?.toLowerCase().includes(filter.search.toLowerCase())) return false
-    return true
-  })
+  // Fee type options — static list covers all known types
+  const FEE_TYPES = [
+    'Management Fee',
+    'Brokerage Commission',
+    'Stamp Duty',
+    'VAT',
+    'Exchange Levy',
+    'Clearing Fee',
+    'SMS Charge',
+  ]
+
+  // When a fee type is selected, show virtual rows derived from fee columns
+  // Otherwise show normal transaction rows
+  const feeRows = buildFeeRows(txns)
+
+  const filtered = (() => {
+    if (filter.feeType) {
+      // Show virtual fee rows for the selected type
+      return feeRows
+        .filter(r => r._feeType === filter.feeType)
+        .filter(r => !filter.search || r.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()))
+    }
+    // Normal filtering
+    return txns.filter(t => {
+      if (filter.action && t.action !== filter.action) return false
+      if (filter.search && !t.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()) && !t.notes?.toLowerCase().includes(filter.search.toLowerCase())) return false
+      return true
+    })
+  })()
 
   // Fee summary totals
   const feeTotals = {
-    commission:    txns.reduce((s, t) => s + (t.fee_commission    ?? 0), 0),
-    vat:           txns.reduce((s, t) => s + (t.fee_vat           ?? 0), 0),
-    stamp:         txns.reduce((s, t) => s + (t.fee_contract_stamp?? 0), 0),
-    exchange:      txns.reduce((s, t) => s + (t.fee_exchange      ?? 0), 0),
-    clearing:      txns.reduce((s, t) => s + (t.fee_clearing      ?? 0), 0),
-    sms:           txns.reduce((s, t) => s + (t.fee_sms           ?? 0), 0),
-    management:    txns.reduce((s, t) => s + (t.fee_management    ?? 0), 0),
-    total:         txns.reduce((s, t) => s + (t.fees              ?? 0), 0),
+    commission: txns.reduce((s, t) => s + (t.fee_commission     ?? 0), 0),
+    vat:        txns.reduce((s, t) => s + (t.fee_vat            ?? 0), 0),
+    stamp:      txns.reduce((s, t) => s + (t.fee_contract_stamp ?? 0), 0),
+    exchange:   txns.reduce((s, t) => s + (t.fee_exchange       ?? 0), 0),
+    clearing:   txns.reduce((s, t) => s + (t.fee_clearing       ?? 0), 0),
+    sms:        txns.reduce((s, t) => s + (t.fee_sms            ?? 0), 0),
+    management: txns.reduce((s, t) => s + (t.fee_management     ?? 0), 0),
+    total:      txns.reduce((s, t) => s + (t.fees               ?? 0), 0),
   }
 
   function getTxnsText(): string {
@@ -152,10 +196,10 @@ export default function TransactionsPage() {
         {/* Fee summary cards */}
         <div className="grid grid-cols-4 gap-3 mb-5">
           {[
-            { label: 'Brokerage commission', value: feeTotals.commission, color: '#a78bfa' },
-            { label: 'Statutory charges',   value: feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.vat + feeTotals.sms, color: '#fb923c' },
-            { label: 'Management fees',     value: feeTotals.management, color: '#60a5fa' },
-            { label: 'Total fees paid',      value: feeTotals.total, color: '#ff5c7a' },
+            { label: 'Brokerage commission', value: feeTotals.commission,  color: '#a78bfa' },
+            { label: 'Statutory charges',    value: feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.vat + feeTotals.sms, color: '#fb923c' },
+            { label: 'Management fees',      value: feeTotals.management,  color: '#60a5fa' },
+            { label: 'Total fees paid',       value: feeTotals.total,       color: '#ff5c7a' },
           ].map(item => (
             <div key={item.label} className="tw-card py-3 px-4" style={{ borderTop: `2px solid ${item.color}` }}>
               <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">{item.label}</div>
@@ -166,18 +210,16 @@ export default function TransactionsPage() {
           ))}
         </div>
 
-        {/* Fee breakdown detail */}
+        {/* Statutory breakdown */}
         <div className="tw-card mb-5 py-3">
-          <div className="flex items-center justify-between mb-3">
-            <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72]">Statutory charge breakdown</div>
-          </div>
+          <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-3">Statutory charge breakdown</div>
           <div className="grid grid-cols-6 gap-3">
             {[
-              { label: 'VAT (7.5% of commission)', value: feeTotals.vat },
-              { label: 'Contract stamp (0.08%)',    value: feeTotals.stamp },
+              { label: 'VAT (7.5% of commission)', value: feeTotals.vat      },
+              { label: 'Contract stamp (0.08%)',    value: feeTotals.stamp    },
               { label: 'NGX exchange levy (0.3%)',  value: feeTotals.exchange },
               { label: 'CSCS clearing (0.3%)',      value: feeTotals.clearing },
-              { label: 'SMS charges',               value: feeTotals.sms },
+              { label: 'SMS charges',               value: feeTotals.sms     },
               { label: 'Subtotal statutory',        value: feeTotals.vat + feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.sms },
             ].map(item => (
               <div key={item.label} className="text-center">
@@ -247,7 +289,10 @@ export default function TransactionsPage() {
               <div><label className="block text-xs text-[#8a91a8] mb-1.5">Counterparty</label><input value={form.counterparty} onChange={set('counterparty')} className="tw-input" /></div>
               <div><label className="block text-xs text-[#8a91a8] mb-1.5">Maturity date</label><input type="date" value={form.maturity_date} onChange={set('maturity_date')} className="tw-input" /></div>
             </div>
-            <div className="mb-4"><label className="block text-xs text-[#8a91a8] mb-1.5">Notes</label><input value={form.notes} onChange={set('notes')} className="tw-input" /></div>
+            <div className="mb-4">
+              <label className="block text-xs text-[#8a91a8] mb-1.5">Notes</label>
+              <input value={form.notes} onChange={set('notes')} className="tw-input" />
+            </div>
             {form.action === 'BUY' && form.quantity && form.price && (
               <div className="mb-4 px-3 py-2 bg-[#a78bfa]/10 rounded-lg text-xs text-[#a78bfa]">
                 Gross value: ₦{(Number(form.quantity) * Number(form.price)).toLocaleString()}
@@ -262,16 +307,54 @@ export default function TransactionsPage() {
           </form>
         )}
 
-        {/* Filters + fee view toggle */}
-        <div className="flex gap-3 mb-4 items-center">
-          <div className="relative flex-1 max-w-xs">
+        {/* Filters */}
+        <div className="flex flex-wrap gap-3 mb-4 items-center">
+          {/* Search */}
+          <div className="relative">
             <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#555d72]" />
-            <input value={filter.search} onChange={e => setFilter(f => ({ ...f, search: e.target.value }))} placeholder="Search by instrument…" className="tw-input pl-8 py-1.5 text-xs" />
+            <input
+              value={filter.search}
+              onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
+              placeholder="Search by instrument…"
+              className="tw-input pl-8 py-1.5 text-xs w-48"
+            />
           </div>
-          <select value={filter.action} onChange={e => setFilter(f => ({ ...f, action: e.target.value }))} className="tw-select py-1.5 text-xs w-36">
+
+          {/* Action filter */}
+          <select
+            value={filter.action}
+            onChange={e => setFilter(f => ({ ...f, action: e.target.value, feeType: '' }))}
+            className="tw-select py-1.5 text-xs w-40"
+          >
             <option value="">All actions</option>
-            {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => <option key={a}>{a}</option>)}
+            {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => (
+              <option key={a} value={a}>{a}</option>
+            ))}
           </select>
+
+          {/* Fee type filter */}
+          <select
+            value={filter.feeType}
+            onChange={e => setFilter(f => ({ ...f, feeType: e.target.value, action: '' }))}
+            className="tw-select py-1.5 text-xs w-52"
+          >
+            <option value="">All fee types</option>
+            {FEE_TYPES.map(ft => (
+              <option key={ft} value={ft}>{ft}</option>
+            ))}
+          </select>
+
+          {/* Clear filters */}
+          {(filter.action || filter.feeType || filter.search) && (
+            <button
+              onClick={() => setFilter({ action: '', search: '', feeType: '' })}
+              className="text-[11px] text-[#555d72] hover:text-[#e8eaf0] px-2 py-1 border border-white/10 rounded transition-colors"
+            >
+              Clear filters
+            </button>
+          )}
+
+          {/* Fee column toggle */}
           <div className="flex items-center gap-1 ml-auto">
             <span className="text-[10px] text-[#555d72] mr-1">Fee columns:</span>
             {(['total', 'breakdown'] as FeeView[]).map(v => (
@@ -284,13 +367,25 @@ export default function TransactionsPage() {
               </button>
             ))}
           </div>
-          <span className="text-xs text-[#555d72]">{filtered.length} records</span>
+
+          <span className="text-xs text-[#555d72]">
+            {filtered.length} record{filtered.length !== 1 ? 's' : ''}
+            {filter.feeType && <span className="text-[#a78bfa] ml-1">— {filter.feeType}</span>}
+          </span>
         </div>
+
+        {/* Info note when viewing fee sub-type */}
+        {filter.feeType && (
+          <div className="mb-3 px-3 py-2 bg-[#a78bfa]/10 border border-[#a78bfa]/20 rounded-lg text-[11px] text-[#a78bfa]">
+            Showing <strong>{filter.feeType}</strong> charges extracted from BUY/SELL transactions.
+            Each row represents the {filter.feeType.toLowerCase()} component of the parent trade.
+          </div>
+        )}
 
         {/* Transaction table */}
         <div className="tw-card p-0 overflow-x-auto">
           {filtered.length === 0 ? (
-            <div className="text-center py-10 text-xs text-[#555d72]">No transactions yet.</div>
+            <div className="text-center py-10 text-xs text-[#555d72]">No records match the current filter.</div>
           ) : (
             <table className="tw-table w-full" style={{ minWidth: feeView === 'breakdown' ? 1100 : 800 }}>
               <thead>
@@ -298,19 +393,21 @@ export default function TransactionsPage() {
                   <th>Date</th>
                   <th>Action</th>
                   <th>Instrument</th>
-                  <th>Qty / Amount</th>
+                  <th>{filter.feeType ? 'Fee type' : 'Qty / Amount'}</th>
                   <th>Price (₦)</th>
                   <th>Gross value</th>
-                  {feeView === 'total' ? (
+                  {filter.feeType ? (
+                    <th style={{ color: '#a78bfa' }}>Fee amount</th>
+                  ) : feeView === 'total' ? (
                     <th>Total fees</th>
                   ) : (
                     <>
-                      <th className="text-[#a78bfa]">Commission</th>
-                      <th className="text-[#fb923c]">VAT</th>
-                      <th className="text-[#fb923c]">Stamp</th>
-                      <th className="text-[#fb923c]">Exch fee</th>
-                      <th className="text-[#fb923c]">Clearing</th>
-                      <th className="text-[#60a5fa]">Mgmt fee</th>
+                      <th style={{ color: '#a78bfa' }}>Commission</th>
+                      <th style={{ color: '#fb923c' }}>VAT</th>
+                      <th style={{ color: '#fb923c' }}>Stamp</th>
+                      <th style={{ color: '#fb923c' }}>Exch fee</th>
+                      <th style={{ color: '#fb923c' }}>Clearing</th>
+                      <th style={{ color: '#60a5fa' }}>Mgmt fee</th>
                       <th>Total</th>
                     </>
                   )}
@@ -318,8 +415,9 @@ export default function TransactionsPage() {
                 </tr>
               </thead>
               <tbody>
-                {filtered.map(t => (
-                  <tr key={t.id}>
+                {filtered.map((t, idx) => (
+                  <tr key={t._virtual ? `${t.id}-${t._feeType}` : t.id}
+                    style={t._virtual ? { background: 'rgba(167,139,250,0.03)' } : {}}>
                     <td className="font-mono text-[11px]">{t.trade_date}</td>
                     <td><span className={`badge ${ACTION_COLORS[t.action] ?? 'badge-hold'}`}>{t.action}</span></td>
                     <td>
@@ -327,25 +425,32 @@ export default function TransactionsPage() {
                       {t.income_category && <div className="text-[10px] text-[#555d72]">{t.income_category}</div>}
                     </td>
                     <td className="font-mono text-xs">
-                      {t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'}
+                      {filter.feeType
+                        ? <span className="text-[#a78bfa] text-[11px]">{t._feeType}</span>
+                        : t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'
+                      }
                     </td>
                     <td className="font-mono text-xs">{t.price ? `₦${Number(t.price).toFixed(2)}` : '—'}</td>
                     <td className="font-mono text-xs">
                       {t.gross_value ? fmt.ngnM(t.gross_value) : t.amount ? fmt.ngnM(t.amount) : '—'}
                     </td>
-                    {feeView === 'total' ? (
+                    {filter.feeType ? (
+                      <td className="font-mono text-xs font-semibold" style={{ color: '#a78bfa' }}>
+                        ₦{Number(t._feeAmount).toLocaleString()}
+                      </td>
+                    ) : feeView === 'total' ? (
                       <td className="font-mono text-xs text-[#555d72]">
                         {t.fees ? `₦${Number(t.fees).toLocaleString()}` : '—'}
                       </td>
                     ) : (
                       <>
-                        <td className="font-mono text-xs text-[#a78bfa]">{t.fee_commission ? `₦${Number(t.fee_commission).toLocaleString()}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_vat ? `₦${Number(t.fee_vat).toFixed(0)}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_contract_stamp ? `₦${Number(t.fee_contract_stamp).toFixed(0)}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_exchange ? `₦${Number(t.fee_exchange).toFixed(0)}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_clearing ? `₦${Number(t.fee_clearing).toFixed(0)}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#60a5fa]">{t.fee_management ? `₦${Number(t.fee_management).toLocaleString()}` : '—'}</td>
-                        <td className="font-mono text-xs text-[#ff5c7a]">{t.fees ? `₦${Number(t.fees).toLocaleString()}` : '—'}</td>
+                        <td className="font-mono text-xs text-[#a78bfa]">{t.fee_commission     ? `₦${Number(t.fee_commission).toLocaleString()}`      : '—'}</td>
+                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_vat            ? `₦${Number(t.fee_vat).toFixed(0)}`                   : '—'}</td>
+                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_contract_stamp ? `₦${Number(t.fee_contract_stamp).toFixed(0)}`         : '—'}</td>
+                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_exchange       ? `₦${Number(t.fee_exchange).toFixed(0)}`               : '—'}</td>
+                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_clearing       ? `₦${Number(t.fee_clearing).toFixed(0)}`               : '—'}</td>
+                        <td className="font-mono text-xs text-[#60a5fa]">{t.fee_management     ? `₦${Number(t.fee_management).toLocaleString()}`       : '—'}</td>
+                        <td className="font-mono text-xs text-[#ff5c7a]">{t.fees              ? `₦${Number(t.fees).toLocaleString()}`                  : '—'}</td>
                       </>
                     )}
                     <td className="text-[11px] text-[#555d72] max-w-[160px] truncate">{t.notes || '—'}</td>
