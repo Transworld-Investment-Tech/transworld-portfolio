@@ -47,7 +47,7 @@ export default function NAVTrendChart({ data, startingNAV }: { data: NAVPoint[];
             borderWidth: 1,
             titleColor: '#e8eaf0',
             bodyColor: '#8a91a8',
-            callbacks: { label: ctx => ` NAV ₦${ctx.parsed.y.toFixed(2)}M` }
+            callbacks: { label: ctx => ` NAV ₦${(ctx.parsed.y ?? 0).toFixed(2)}M` }
           }
         },
         scales: {

@@ -48,7 +48,7 @@ export default function AUMBarChart({ portfolios }: { portfolios: PortfolioBar[]
             bodyColor: '#8a91a8',
             callbacks: {
               title: (items) => sorted[items[0].dataIndex]?.name,
-              label: (ctx) => ` NAV: ₦${ctx.parsed.y.toFixed(2)}M`,
+              label: (ctx) => ` NAV: ₦${(ctx.parsed.y ?? 0).toFixed(2)}M`,
             }
           }
         },
