@@ -5,6 +5,7 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
 import { ArrowLeft, Save, Plus, Trash2 } from 'lucide-react'
+import PageActions from '@/components/shared/PageActions'
 
 export default function HoldingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
