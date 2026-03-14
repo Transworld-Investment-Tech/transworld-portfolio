@@ -19,27 +19,81 @@ export interface Quote {
   fetched_at: string
 }
 
+// Full NGX instrument map — instrument_id → TradingView symbol
+// TradingView uses NGX: prefix for Nigerian Exchange Group stocks
 const NGX_SYMBOL_MAP: Record<string, string> = {
-  'UBA':      'NGX:UBA',
-  'GTCO':     'NGX:GTCO',
-  'ZENITH':   'NGX:ZENITHBANK',
-  'DANGCEM':  'NGX:DANGCEM',
-  'STANBIC':  'NGX:STANBIC',
-  'SEPLAT':   'NGX:SEPLAT',
+  // Banking & Finance
+  'ACCESSCORP':  'NGX:ACCESSCORP',
+  'GTCO':        'NGX:GTCO',
+  'ZENITHBANK':  'NGX:ZENITHBANK',
+  'UBA':         'NGX:UBA',
+  'FBNH':        'NGX:FBNH',
+  'FIRSTHOLDCO': 'NGX:FBNH',
+  'FIDELITYBK':  'NGX:FIDELITYBK',
+  'FCMB':        'NGX:FCMB',
+  'UBN':         'NGX:UBN',
+  'WEMABANK':    'NGX:WEMABANK',
+  'STANBIC':     'NGX:STANBIC',
+  'STERLINGNG':  'NGX:STERLINGNG',
+  'AFRIPRUD':    'NGX:AFRIPRUD',
+  'UCAP':        'NGX:UCAP',
+  // Oil & Gas
+  'SEPLAT':      'NGX:SEPLAT',
+  'ARADEL':      'NGX:ARADEL',
+  'OANDO':       'NGX:OANDO',
+  'ETERNA':      'NGX:ETERNA',
+  'CONOIL':      'NGX:CONOIL',
+  'MRS':         'NGX:MRS',
+  'TOTAL':       'NGX:TOTAL',
+  // Telecoms & Tech
+  'MTNN':        'NGX:MTNN',
+  'AIRTELAFRI':  'NGX:AIRTELAFRI',
+  // Industrial & Cement
+  'DANGCEM':     'NGX:DANGCEM',
+  'WAPCO':       'NGX:WAPCO',
+  'JBERGER':     'NGX:JBERGER',
+  'SCOA':        'NGX:SCOA',
+  // Consumer Goods & FMCG
+  'NB':          'NGX:NB',
+  'GUINNESS':    'NGX:GUINNESS',
+  'NESTLE':      'NGX:NESTLE',
+  'UNILEVER':    'NGX:UNILEVER',
+  'DANGSUGAR':   'NGX:DANGSUGAR',
+  'FLOURMILL':   'NGX:FLOURMILL',
+  'CADBURY':     'NGX:CADBURY',
+  'PZ':          'NGX:PZ',
+  'VITAFOAM':    'NGX:VITAFOAM',
+  // Agriculture
+  'OKOMUOIL':    'NGX:OKOMUOIL',
+  'PRESCO':      'NGX:PRESCO',
+  // Conglomerates
+  'UACN':        'NGX:UACN',
+  'TRANSCORP':   'NGX:TRANSCORP',
+  // Insurance
+  'AIICO':       'NGX:AIICO',
+  'WAPIC':       'NGX:WAPIC',
+  'CUSTODIAN':   'NGX:CUSTODIAN',
+  'PRESTIGE':    'NGX:PRESTIGE',
+  'MANSARD':     'NGX:MANSARD',
+  // Services & Others
+  'NAHCO':       'NGX:NAHCO',
+  'JOHNHOLT':    'NGX:JOHNHOLT',
+  'TRIPPLEG':    'NGX:TRIPPLEG',
+  'UPDC':        'NGX:UPDC',
+  'UPDCREIT':    'NGX:UPDCREIT',
+  'ETI':         'NGX:ETI',
+  'ZENITH':      'NGX:ZENITHBANK',   // legacy alias
 }
 
-const NGX_REVERSE_MAP: Record<string, string> = {
-  'UBA':        'UBA',
-  'GTCO':       'GTCO',
-  'ZENITHBANK': 'ZENITH',
-  'DANGCEM':    'DANGCEM',
-  'STANBIC':    'STANBIC',
-  'SEPLAT':     'SEPLAT',
-}
+// Reverse map: TradingView symbol suffix → instrument_id
+const NGX_REVERSE_MAP: Record<string, string> = Object.fromEntries(
+  Object.entries(NGX_SYMBOL_MAP).map(([id, sym]) => [sym.replace('NGX:', ''), id])
+)
 
 // ---- Fetch NGX equity prices via Apify TradingView scraper ----
 export async function fetchNGXPrices(apifyKey: string): Promise<Quote[]> {
-  const symbols = Object.values(NGX_SYMBOL_MAP)
+  // Deduplicate symbols (some instrument_ids map to same TradingView symbol)
+  const symbols = [...new Set(Object.values(NGX_SYMBOL_MAP))]
 
   const response = await fetch(
     `https://api.apify.com/v2/acts/apify~trading-view-scraper/run-sync-get-dataset-items?token=${apifyKey}&timeout=90`,
