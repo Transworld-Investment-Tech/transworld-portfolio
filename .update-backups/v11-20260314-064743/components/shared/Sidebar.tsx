@@ -5,7 +5,7 @@ import { supabase } from '@/lib/supabase'
 import {
   LayoutDashboard, BarChart3, Users, FileText,
   Settings, LogOut, ChevronRight, TrendingUp,
-  Activity, PlusCircle, ShieldCheck, BookMarked
+  Activity, PlusCircle, ShieldCheck
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -39,7 +39,6 @@ export default function Sidebar({ portfolioName, portfolioLabel, clientName, por
   const mainNav: NavItem[] = [
     { href: '/', label: 'All portfolios', icon: <LayoutDashboard size={15} />, exact: true },
     { href: '/admin', label: 'Admin panel', icon: <ShieldCheck size={15} /> },
-    { href: '/watchlist', label: 'NGX Watchlist', icon: <BookMarked size={15} /> },
   ]
 
   const portfolioNav: NavItem[] = portfolioId ? [
