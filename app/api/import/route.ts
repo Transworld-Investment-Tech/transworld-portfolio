@@ -76,7 +76,7 @@ export async function POST(req: NextRequest) {
       await db.from('instruments').insert({
         instrument_id: instrId, name: instrId, type: 'Stock',
         sleeve_id: 'eq', asset_class: 'Equity', approved: false,
-      }).onConflict('instrument_id').merge()
+      }, { onConflict: 'instrument_id' })
     }
 
     // Compute gross value if missing
