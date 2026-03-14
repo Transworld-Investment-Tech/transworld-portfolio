@@ -1,0 +1,31 @@
+import { NextRequest, NextResponse } from 'next/server'
+
+export async function middleware(req: NextRequest) {
+  const pathname = req.nextUrl.pathname
+
+  // Always allow these through
+  if (
+    pathname.startsWith('/login') ||
+    pathname.startsWith('/_next') ||
+    pathname.startsWith('/api/')
+  ) {
+    return NextResponse.next()
+  }
+
+  // Check for Supabase session cookie (works with Next.js 15)
+  const cookies = req.cookies.getAll()
+  const hasSession = cookies.some(c => 
+    c.name.includes('auth-token') || 
+    c.name.includes('sb-') && c.name.includes('-auth')
+  )
+
+  if (!hasSession) {
+    return NextResponse.redirect(new URL('/login', req.url))
+  }
+
+  return NextResponse.next()
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)'],
+}
