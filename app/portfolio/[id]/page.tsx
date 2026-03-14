@@ -5,7 +5,7 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { computeNAV, computeSleeveData, complianceAlerts, estimatedIncomePA, totalUnrealizedPnL, fmt, SLEEVE_COLOURS, type Portfolio, type Holding, type SleeveTarget } from '@/lib/portfolio'
 import {
-  ArrowLeft, RefreshCw, FileText, Settings, TrendingUp, TrendingDown,
+  ArrowLeft, RefreshCw, FileText, Settings, TrendingUp, TrendingDown, Download,
   ChevronRight, AlertTriangle, Info, CheckCircle2
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
@@ -151,6 +151,11 @@ export default function PortfolioDashboard() {
           <span className="text-[11px] text-[#555d72]">USD/NGN ₦{Math.round(fxRate).toLocaleString()}</span>
           <button onClick={refreshPrices} disabled={refreshing} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50">
             <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} /> {refreshing ? 'Fetching…' : 'Live prices'}
+          </button>
+          <button
+            onClick={() => window.open('/api/export?portfolioId=' + portfolioId, '_blank', 'width=1024,height=800')}
+            className="flex items-center gap-1.5 text-xs border border-white/10 text-[#8a91a8] hover:text-[#e8eaf0] rounded-lg px-3 py-1.5 transition-colors">
+            <Download size={12} /> Download report
           </button>
           <button onClick={() => setTab('reports')} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
             <FileText size={12} /> Generate report
