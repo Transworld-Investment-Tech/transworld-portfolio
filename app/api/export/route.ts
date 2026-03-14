@@ -38,7 +38,7 @@ export async function GET(req: NextRequest) {
   const sleeveDefs = sleeveRes.data ?? []
   const currentNAV = computeNAV(holdings)
   const sleeveData = computeSleeveData(holdings, sleeveDefs, currentNAV)
-  const alerts = complianceAlerts(holdings, sleeveDefs, portfolio, currentNAV)
+  const alerts = complianceAlerts(holdings, sleeveDefs, portfolio as any, currentNAV)
   const fxRate = fxRes?.rates?.NGN ?? 1665
 
   // IRR
