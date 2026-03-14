@@ -49,9 +49,9 @@ export async function GET(req: NextRequest) {
       period:      m.period,
       periodLabel: m.periodLabel,
       daysHeld:    m.daysHeld,
-      simpleReturn: m.simpleReturn,
+      simplePeriodReturn: m.simplePeriodReturn,
       mwr:         m.mwr,
-      annualisedMwr: m.annualisedMwr,
+      annualisedMwr: m.irr,
     }
   })
 
