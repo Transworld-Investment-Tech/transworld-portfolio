@@ -29,9 +29,7 @@ export default function PortfolioDashboard() {
   const [refreshing, setRefreshing] = useState(false)
   const [fxRate, setFxRate]         = useState<number>(1665)
   const [dividends,  setDividends]  = useState<any>(null)
-  const [divLoading,    setDivLoading]    = useState(false)
-  const [divRefreshing, setDivRefreshing] = useState(false)
-  const [divRefreshMsg, setDivRefreshMsg] = useState('')
+  const [divLoading, setDivLoading] = useState(false)
   const [report, setReport]         = useState('')
   const [reportType, setReportType] = useState<'daily'|'weekly'|'monthly'|'quarterly'|'annual'>('monthly')
   const [generatingReport, setGeneratingReport] = useState(false)
@@ -89,19 +87,6 @@ export default function PortfolioDashboard() {
       .then(d => { setDividends(d); setDivLoading(false) })
       .catch(() => setDivLoading(false))
   }, [portfolioId, holdings.length])
-
-  async function refreshDividends() {
-    setDivRefreshing(true); setDivRefreshMsg('')
-    try {
-      const res = await fetch('/api/dividends/refresh', { method: 'POST' })
-      const d   = await res.json()
-      setDivRefreshMsg(d.ok ? `✓ ${d.message}` : 'Refresh failed')
-      const r2  = await fetch(`/api/dividends?portfolioId=${portfolioId}`)
-      setDividends(await r2.json())
-      setTimeout(() => setDivRefreshMsg(''), 6000)
-    } catch { setDivRefreshMsg('Refresh failed') }
-    setDivRefreshing(false)
-  }
 
   async function refreshPrices() {
     setRefreshing(true)
@@ -271,14 +256,6 @@ export default function PortfolioDashboard() {
                   <div>
                     <div className="text-[10px] font-bold uppercase tracking-widest text-[#555d72]">Estimated Dividend Income</div>
                     <div className="text-[10px] text-[#555d72] mt-0.5">Based on last declared DPS × current shares held</div>
-                  </div>
-                  <div className="flex items-center gap-3">
-                    {divRefreshMsg && <span className="text-[10px]" style={{ color: divRefreshMsg.startsWith('✓') ? '#22c55e' : '#ff5c7a' }}>{divRefreshMsg}</span>}
-                    <button onClick={refreshDividends} disabled={divRefreshing}
-                      className="flex items-center gap-1.5 text-[11px] font-medium border border-white/10 text-[#8a91a8] hover:text-[#e8eaf0] rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50 no-print">
-                      <svg className={divRefreshing ? 'animate-spin' : ''} width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5"><path d="M23 4v6h-6"/><path d="M1 20v-6h6"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-                      {divRefreshing ? 'Refreshing…' : 'Refresh from NGX'}
-                    </button>
                   </div>
                   <div className="text-right">
                     <div className="text-xs font-semibold" style={{ color: dividends.incomeTargetGap > 0 ? '#ef4444' : '#22c55e' }}>
