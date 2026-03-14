@@ -50,7 +50,7 @@ export default function IncomeChart({ holdings }: { holdings: Holding[] }) {
             borderWidth: 1,
             titleColor: '#e8eaf0',
             bodyColor: '#8a91a8',
-            callbacks: { label: ctx => ` ${ctx.dataset.label}: ₦${ctx.parsed.y.toLocaleString()}K` }
+            callbacks: { label: ctx => ` ${ctx.dataset.label}: ₦${(ctx.parsed.y ?? 0).toLocaleString()}K` }
           }
         },
         scales: {
