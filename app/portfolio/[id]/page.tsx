@@ -9,6 +9,7 @@ import {
   ChevronRight, AlertTriangle, Info, CheckCircle2
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
+import PageActions from '@/components/shared/PageActions'
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
 const SleeveBarChart  = dynamic(() => import('@/components/portfolio/SleeveBarChart'),  { ssr: false })
