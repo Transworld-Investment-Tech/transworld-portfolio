@@ -5,13 +5,14 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { computeNAV, computeSleeveData, complianceAlerts, estimatedIncomePA, totalUnrealizedPnL, fmt, SLEEVE_COLOURS, type Portfolio, type Holding, type SleeveTarget } from '@/lib/portfolio'
 import {
-  ArrowLeft, RefreshCw, FileText, Settings, TrendingUp, TrendingDown,
+  ArrowLeft, RefreshCw, FileText, Settings, TrendingUp, TrendingDown, Download,
   ChevronRight, AlertTriangle, Info, CheckCircle2
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 import PageActions from '@/components/shared/PageActions'
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
+const PerformanceDashboard = dynamic(() => import('@/components/portfolio/PerformanceDashboard'), { ssr: false })
 const SleeveBarChart  = dynamic(() => import('@/components/portfolio/SleeveBarChart'),  { ssr: false })
 const IncomeChart     = dynamic(() => import('@/components/portfolio/IncomeChart'),     { ssr: false })
 
@@ -28,8 +29,6 @@ export default function PortfolioDashboard() {
   const [loading, setLoading]       = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [fxRate, setFxRate]         = useState<number>(1665)
-  const [dividends,  setDividends]  = useState<any>(null)
-  const [divLoading, setDivLoading] = useState(false)
   const [report, setReport]         = useState('')
   const [reportType, setReportType] = useState<'daily'|'weekly'|'monthly'|'quarterly'|'annual'>('monthly')
   const [generatingReport, setGeneratingReport] = useState(false)
@@ -77,16 +76,6 @@ export default function PortfolioDashboard() {
       .then(d => { if (d.rates?.NGN) setFxRate(d.rates.NGN) })
       .catch(() => {})
   }, [])
-
-  // Fetch dividend estimates
-  useEffect(() => {
-    if (!portfolioId) return
-    setDivLoading(true)
-    fetch(`/api/dividends?portfolioId=${portfolioId}`)
-      .then(r => r.json())
-      .then(d => { setDividends(d); setDivLoading(false) })
-      .catch(() => setDivLoading(false))
-  }, [portfolioId, holdings.length])
 
   async function refreshPrices() {
     setRefreshing(true)
@@ -152,7 +141,7 @@ export default function PortfolioDashboard() {
           <button onClick={refreshPrices} disabled={refreshing} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50">
             <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} /> {refreshing ? 'Fetching…' : 'Live prices'}
           </button>
-          <button onClick={() => setTab('reports')} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
+          <button onClick={() => window.open("/api/export?portfolioId="+portfolioId, "_blank", "width=1024,height=800")} className="flex items-center gap-1.5 text-xs border border-white/10 text-[#8a91a8] hover:text-[#e8eaf0] rounded-lg px-3 py-1.5 transition-colors"><Download size={12} /> Download report</button><button onClick={() => setTab("reports")} className="flex items-center gap-1.5 text-xs bg-[#a78bfa] text-white rounded-lg px-3 py-1.5">
             <FileText size={12} /> Generate report
           </button>
           <Link href={`/admin/portfolios/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors">
@@ -241,141 +230,9 @@ export default function PortfolioDashboard() {
           )}
 
           {/* TAB: HOLDINGS */}
-
-          {/* ── Dividend Income Panel ──────────────────────────── */}
-          {tab === 'overview' && dividends && !divLoading && (
-            <div className="px-6 pb-2">
-              <div className="tw-card p-0 overflow-hidden">
-                {/* Header */}
-                <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.07]">
-                  <div>
-                    <div className="text-[10px] font-bold uppercase tracking-widest text-[#555d72]">Estimated Dividend Income</div>
-                    <div className="text-[10px] text-[#555d72] mt-0.5">Based on last declared DPS × current shares held</div>
-                  </div>
-                  <div className="text-right">
-                    <div className="text-xs font-semibold" style={{ color: dividends.incomeTargetGap > 0 ? '#ef4444' : '#22c55e' }}>
-                      {dividends.incomeTargetGap > 0
-                        ? `₦${(dividends.incomeTargetGap/1e6).toFixed(2)}M income shortfall`
-                        : `₦${(Math.abs(dividends.incomeTargetGap)/1e6).toFixed(2)}M above target`}
-                    </div>
-                    <div className="text-[10px] text-[#555d72]">vs {(dividends.incomeTarget*100).toFixed(0)}% mandate target</div>
-                  </div>
-                </div>
-
-                {/* KPI row */}
-                <div className="grid grid-cols-4 divide-x divide-white/[0.07]">
-                  {[
-                    {
-                      label: 'Est. Annual Income',
-                      value: `₦${(dividends.totalEstimatedIncome/1e6).toFixed(2)}M`,
-                      sub: `${(dividends.portfolioYield*100).toFixed(2)}% portfolio yield`,
-                      color: dividends.totalEstimatedIncome > 0 ? '#22c55e' : '#555d72',
-                      note: 'Paying positions only'
-                    },
-                    {
-                      label: 'Conservative Range',
-                      value: `₦${(dividends.incomeForecastLow/1e6).toFixed(2)}M`,
-                      sub: 'High-confidence positions',
-                      color: '#60a5fa',
-                      note: 'Declared + confirmed'
-                    },
-                    {
-                      label: 'Optimistic Range',
-                      value: `₦${(dividends.incomeForecastHigh/1e6).toFixed(2)}M`,
-                      sub: 'Incl. potential resumptions',
-                      color: '#f59e0b',
-                      note: '+2% on suspended stocks'
-                    },
-                    {
-                      label: 'Income Target',
-                      value: `₦${(dividends.portfolioNAV * dividends.incomeTarget / 1e6).toFixed(2)}M`,
-                      sub: `${(dividends.incomeTarget*100).toFixed(0)}% p.a. of NAV`,
-                      color: '#a78bfa',
-                      note: `${dividends.payingPositions} paying · ${dividends.suspendedPositions} suspended`
-                    },
-                  ].map(item => (
-                    <div key={item.label} className="px-5 py-4">
-                      <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">{item.label}</div>
-                      <div className="text-xl font-bold font-mono" style={{ color: item.color }}>{item.value}</div>
-                      <div className="text-[10px] text-[#8a91a8] mt-1">{item.sub}</div>
-                      <div className="text-[9px] text-[#555d72] mt-0.5">{item.note}</div>
-                    </div>
-                  ))}
-                </div>
-
-                {/* Per-stock breakdown */}
-                <div className="border-t border-white/[0.07]">
-                  <table className="tw-table w-full">
-                    <thead>
-                      <tr>
-                        <th>Stock</th>
-                        <th>Shares</th>
-                        <th>DPS (₦)</th>
-                        <th>Div yield</th>
-                        <th>Est. annual income</th>
-                        <th>Status</th>
-                        <th>Next expected</th>
-                        <th>Notes</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {dividends.positions.map((p: any) => (
-                        <tr key={p.instrumentId}>
-                          <td>
-                            <div className="font-medium">{p.name}</div>
-                            <div className="text-[10px] text-[#555d72] font-mono">{p.instrumentId}</div>
-                          </td>
-                          <td className="font-mono">{p.shares.toLocaleString()}</td>
-                          <td className="font-mono">{p.divPerShare > 0 ? `₦${p.divPerShare.toFixed(2)}` : '—'}</td>
-                          <td className="font-mono">
-                            {p.divYieldPct > 0
-                              ? <span style={{ color: p.divYieldPct >= 0.04 ? '#22c55e' : p.divYieldPct >= 0.02 ? '#f59e0b' : '#8a91a8' }}>
-                                  {(p.divYieldPct*100).toFixed(2)}%
-                                </span>
-                              : <span className="text-[#555d72]">—</span>}
-                          </td>
-                          <td className="font-mono font-semibold" style={{ color: p.annualIncome > 0 ? '#22c55e' : '#555d72' }}>
-                            {p.annualIncome > 0 ? `₦${p.annualIncome.toLocaleString('en-NG', {maximumFractionDigits:0})}` : '₦0'}
-                          </td>
-                          <td>
-                            <span className={`badge ${
-                              p.divStatus === 'paying'    ? 'badge-ok' :
-                              p.divStatus === 'suspended' ? 'badge-breach' :
-                              'badge-hold'
-                            }`} style={{ textTransform: 'capitalize' as const }}>
-                              {p.divStatus}
-                            </span>
-                          </td>
-                          <td className="font-mono text-[11px] text-[#555d72]">
-                            {p.nextDivDate ?? '—'}
-                          </td>
-                          <td className="text-[11px] text-[#555d72] max-w-[200px]" style={{ whiteSpace:'normal' as const, lineHeight:1.4 }}>
-                            {p.divNotes ? p.divNotes.slice(0, 80) + (p.divNotes.length > 80 ? '…' : '') : '—'}
-                          </td>
-                        </tr>
-                      ))}
-                      {/* Total row */}
-                      <tr style={{ background: 'rgba(167,139,250,0.05)', borderTop: '1px solid rgba(255,255,255,0.07)' }}>
-                        <td className="font-bold" colSpan={4}>Total estimated annual income</td>
-                        <td className="font-mono font-bold text-[#22c55e]">
-                          ₦{dividends.totalEstimatedIncome.toLocaleString('en-NG', {maximumFractionDigits:0})}
-                        </td>
-                        <td colSpan={3} className="text-[11px] text-[#555d72]">
-                          Yield: {(dividends.portfolioYield*100).toFixed(2)}% · Target: {(dividends.incomeTarget*100).toFixed(0)}% · Gap: {dividends.incomeTargetGap > 0 ? '−' : '+'}₦{(Math.abs(dividends.incomeTargetGap)/1e6).toFixed(2)}M
-                        </td>
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-
-                {/* Methodology note */}
-                <div className="px-5 py-2.5 border-t border-white/[0.07] bg-[#13161d]">
-                  <p className="text-[10px] text-[#555d72] leading-relaxed">
-                    <strong className="text-[#8a91a8]">Methodology:</strong> {dividends.methodology}
-                  </p>
-                </div>
-              </div>
-            </div>
+          {/* ── Performance Dashboard ──────────────────────── */}
+          {tab === 'overview' && (
+            <PerformanceDashboard portfolioId={portfolioId} />
           )}
 
           {tab === 'holdings' && (
