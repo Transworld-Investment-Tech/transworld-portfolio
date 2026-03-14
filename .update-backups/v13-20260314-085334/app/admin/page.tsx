@@ -3,7 +3,7 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { Users, BarChart3, TrendingUp, FileText, Settings, RefreshCw, PlusCircle, Activity, ChevronRight, Upload } from 'lucide-react'
+import { Users, BarChart3, TrendingUp, FileText, Settings, RefreshCw, PlusCircle, Activity, ChevronRight } from 'lucide-react'
 
 export default function AdminPage() {
   const [stats, setStats] = useState({ clients: 0, portfolios: 0, reports: 0 })
@@ -29,7 +29,6 @@ export default function AdminPage() {
     { href: '/admin/portfolios/new', icon: <BarChart3 size={16} />, label: 'New portfolio', sub: 'Create portfolio A/B/C/D for a client', color: '#2dd4bf' },
     { href: '/admin/settings', icon: <Settings size={16} />, label: 'Settings', sub: 'API keys, Apify, Anthropic', color: '#60a5fa' },
     { href: '/admin/reports', icon: <FileText size={16} />, label: 'All reports', sub: 'View & download generated reports', color: '#fb923c' },
-    { href: '/admin/import', icon: <Upload size={16} />, label: 'Import transactions', sub: 'Upload CSV/Excel from broker system', color: '#22c55e' },
   ]
 
   return (
