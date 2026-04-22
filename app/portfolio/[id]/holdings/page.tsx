@@ -4,11 +4,14 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { ArrowLeft, Save, Plus, Trash2, LineChart } from 'lucide-react'
-import PageActions from '@/components/shared/PageActions'
+import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle } from 'lucide-react'
 
-// v17: prices now display an "As of" date with a stale indicator.
-// Staleness threshold matches the Market Prices admin page.
+// v20d: Hybrid rewrite.
+// Sidebar is rendered by app/portfolio/[id]/layout.tsx — do NOT render one here.
+// PageActions dropped from this page; replaced with an inline hybrid Copy button
+// wired to the existing getHoldingsText() formatter.
+
+// v17: prices display an "As of" date with a stale indicator.
 const STALE_DAYS = 3
 
 function stalenessOf(priceDate?: string): 'fresh' | 'stale' | 'none' {
@@ -26,6 +29,16 @@ function formatShortDate(iso?: string): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
 }
 
+const SLEEVE_NAMES: Record<string, string> = {
+  liq: 'Cash & Liquidity',
+  eq:  'Equities (NGX)',
+  fi:  'Fixed Income',
+  ntb: 'Treasury Bills',
+  fgn: 'FGN Bonds',
+}
+
+const SLEEVE_ORDER: Record<string, number> = { liq: 0, ntb: 1, fgn: 2, fi: 3, eq: 4 }
+
 export default function HoldingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
   const [portfolio, setPortfolio] = useState<any>(null)
@@ -38,6 +51,7 @@ export default function HoldingsPage() {
   const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '' })
   const [loading, setLoading] = useState(true)
   const [msg, setMsg] = useState('')
+  const [copied, setCopied] = useState(false)
 
   useEffect(() => { load() }, [portfolioId])
 
@@ -46,7 +60,6 @@ export default function HoldingsPage() {
       supabase.from('portfolios').select('*, client:clients(name)').eq('id', portfolioId).single(),
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId).order('sleeve_id'),
       supabase.from('instruments').select('*').eq('approved', true).order('name'),
-      // v17: also pull price_date so the holdings table can show staleness
       supabase.from('market_prices').select('instrument_id, price, price_date').order('price_date', { ascending: false }),
     ])
     setPortfolio(portRes.data)
@@ -55,7 +68,6 @@ export default function HoldingsPage() {
     const pm: Record<string, number> = {}
     const pd: Record<string, string> = {}
     priceRes.data?.forEach((p: any) => {
-      // First occurrence wins after DESC sort — that's the latest row per instrument.
       if (!(p.instrument_id in pm)) {
         pm[p.instrument_id] = p.price
         pd[p.instrument_id] = p.price_date
@@ -129,7 +141,12 @@ export default function HoldingsPage() {
     return lines.join('\n')
   }
 
-  const sleeveOrder = { liq: 0, ntb: 1, fgn: 2, eq: 3 }
+  async function copyText() {
+    await navigator.clipboard.writeText(getHoldingsText())
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2500)
+  }
+
   const grouped = holdings.reduce((acc, h) => {
     const k = h.sleeve_id || 'other'
     if (!acc[k]) acc[k] = []
@@ -137,157 +154,260 @@ export default function HoldingsPage() {
     return acc
   }, {} as Record<string, any[]>)
 
-  // Count held positions with stale/missing prices — surfaced as a yellow hint badge
   const staleHeldCount = holdings.filter(h => stalenessOf(priceDates[h.instrument_id]) !== 'fresh').length
 
-  if (loading) return <div className="flex items-center justify-center h-64 text-[#555d72] text-xs">Loading…</div>
+  if (loading) {
+    return (
+      <div className="hybrid-page" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', color: 'var(--text-3)', fontSize: 14 }}>
+        Loading…
+      </div>
+    )
+  }
 
   return (
-    <div>
-      <div className="px-8 py-5 border-b border-white/[0.07] bg-[#13161d] flex items-center gap-4">
-        <Link href={`/portfolio/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-          <ArrowLeft size={13} /> {portfolio?.name}
-        </Link>
-        <div className="w-px h-4 bg-white/10" />
-        <h1 className="text-base font-semibold">Edit holdings</h1>
-        {staleHeldCount > 0 && (
-          <Link
-            href="/admin/prices?stale=1"
-            className="flex items-center gap-1.5 text-[10px] text-[#eab308] bg-[#eab308]/10 border border-[#eab308]/20 rounded-full px-2.5 py-0.5 hover:bg-[#eab308]/15 transition-colors"
-            title="Click to open Market prices filtered to stale entries">
-            <span className="w-1.5 h-1.5 rounded-full bg-[#eab308] inline-block" />
-            {staleHeldCount} stale price{staleHeldCount === 1 ? '' : 's'}
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      {/* Page header */}
+      <div className="page-head">
+        <div>
+          <div className="eyebrow" style={{ marginBottom: 10 }}>
+            {portfolio?.client?.name} · {portfolio?.name}
+          </div>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Holdings
+          </h1>
+        </div>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {staleHeldCount > 0 && (
+            <Link
+              href="/admin/prices?stale=1"
+              style={{
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 6,
+                fontSize: 10,
+                color: 'var(--warn)',
+                background: 'rgba(166, 124, 42, 0.1)',
+                border: '1px solid rgba(166, 124, 42, 0.25)',
+                borderRadius: 999,
+                padding: '3px 12px',
+                textDecoration: 'none',
+                fontWeight: 600,
+                letterSpacing: '0.04em',
+              }}
+              title="Click to open Market prices filtered to stale entries"
+            >
+              <AlertTriangle size={10} />
+              {staleHeldCount} stale price{staleHeldCount === 1 ? '' : 's'}
+            </Link>
+          )}
+          {msg && (
+            <span style={{ fontSize: 11, color: 'var(--pos)' }}>{msg}</span>
+          )}
+          <Link href="/admin/prices" className="btn-h" style={{ textDecoration: 'none' }}>
+            <LineChart size={12} /> Manage prices
           </Link>
-        )}
-        <div className="ml-auto flex items-center gap-3">
-          {msg && <span className="text-xs text-[#00d4a4]">{msg}</span>}
-          <Link
-            href="/admin/prices"
-            className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-2 transition-colors"
-            title="Open the central Market Prices page">
-            <LineChart size={13} /> Manage prices
-          </Link>
-          <PageActions
-            pageTitle="Holdings"
-            portfolioName={portfolio?.name ?? ''}
-            getText={getHoldingsText}
-          />
-          <button onClick={() => setAdding(true)} className="flex items-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors">
-            <Plus size={13} /> Add position
+          <button className="btn-h" onClick={copyText}>
+            {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
+          </button>
+          <button className="btn-h btn-h-primary" onClick={() => setAdding(true)}>
+            <Plus size={12} /> Add position
           </button>
         </div>
       </div>
 
-      <div className="px-8 py-6 max-w-5xl">
-        {adding && (
-          <div className="tw-card mb-5 border-[#a78bfa]/20">
-            <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4">Add new position</div>
-            <div className="grid grid-cols-4 gap-3 items-end">
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Instrument</label>
-                <select value={newHolding.instrument_id} onChange={e => setNewHolding(n => ({ ...n, instrument_id: e.target.value }))} className="tw-select">
-                  <option value="">Select…</option>
-                  {instruments.filter(i => !holdings.find(h => h.instrument_id === i.instrument_id)).map(i => (
-                    <option key={i.instrument_id} value={i.instrument_id}>{i.name} ({i.instrument_id})</option>
+      {/* Add position form */}
+      {adding && (
+        <div className="panel" style={{ marginBottom: 20, borderColor: 'rgba(176, 139, 62, 0.3)' }}>
+          <div className="panel-header">
+            <div className="panel-title">Add new position</div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr 1fr auto', gap: 12, alignItems: 'end' }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Instrument</label>
+              <select
+                value={newHolding.instrument_id}
+                onChange={e => setNewHolding(n => ({ ...n, instrument_id: e.target.value }))}
+                className="select-h"
+              >
+                <option value="">Select…</option>
+                {instruments
+                  .filter(i => !holdings.find(h => h.instrument_id === i.instrument_id))
+                  .map(i => (
+                    <option key={i.instrument_id} value={i.instrument_id}>
+                      {i.name} ({i.instrument_id})
+                    </option>
                   ))}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Quantity / Face (₦)</label>
-                <input type="number" value={newHolding.quantity} onChange={e => setNewHolding(n => ({ ...n, quantity: e.target.value }))} placeholder="0" className="tw-input font-mono" />
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Avg cost</label>
-                <input type="number" value={newHolding.avg_cost} onChange={e => setNewHolding(n => ({ ...n, avg_cost: e.target.value }))} placeholder={prices[newHolding.instrument_id]?.toString() || '1'} className="tw-input font-mono" step="0.01" />
-              </div>
-              <div className="flex gap-2">
-                <button onClick={addHolding} className="flex-1 py-2 bg-[#a78bfa] text-white rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors">Add</button>
-                <button onClick={() => setAdding(false)} className="px-3 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">✕</button>
-              </div>
+              </select>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Quantity / Face (₦)</label>
+              <input
+                type="number"
+                value={newHolding.quantity}
+                onChange={e => setNewHolding(n => ({ ...n, quantity: e.target.value }))}
+                placeholder="0"
+                className="input-h input-h-mono"
+              />
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Avg cost</label>
+              <input
+                type="number"
+                value={newHolding.avg_cost}
+                onChange={e => setNewHolding(n => ({ ...n, avg_cost: e.target.value }))}
+                placeholder={prices[newHolding.instrument_id]?.toString() || '1'}
+                className="input-h input-h-mono"
+                step="0.01"
+              />
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              <button className="btn-h btn-h-primary" onClick={addHolding}>Add</button>
+              <button className="btn-h" onClick={() => setAdding(false)}>✕</button>
             </div>
           </div>
-        )}
+        </div>
+      )}
 
-        {Object.entries(grouped)
-          .sort(([a], [b]) => (sleeveOrder[a as keyof typeof sleeveOrder] ?? 99) - (sleeveOrder[b as keyof typeof sleeveOrder] ?? 99))
-          .map(([sleeveId, items]) => (
-          <div key={sleeveId} className="tw-card mb-4">
-            <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4 capitalize">{sleeveId} sleeve</div>
-            <table className="tw-table w-full">
-              <thead>
-                <tr>
-                  <th>Instrument</th>
-                  <th>Type</th>
-                  <th>Quantity / Face (₦)</th>
-                  <th>Avg cost</th>
-                  <th>Current price</th>
-                  <th>As of</th>
-                  <th>Market value</th>
-                  <th>Unreal. P&L</th>
-                  <th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {(items as any[]).map(h => {
-                  const mktPrice = prices[h.instrument_id] ?? h.avg_cost ?? 1
-                  const priceDate = priceDates[h.instrument_id]
-                  const stale = stalenessOf(priceDate)
-                  const dotColor =
-                    stale === 'fresh' ? '#22c55e' :
-                    stale === 'stale' ? '#eab308' : '#6b7280'
-                  const dotTitle =
-                    stale === 'fresh' ? `Fresh price (within ${STALE_DAYS} days)` :
-                    stale === 'stale' ? `Stale price — older than ${STALE_DAYS} days. Click Manage prices to override.` :
-                    'No market price on record — displaying average cost. Click Manage prices to set one.'
-                  const mktVal = Number(h.quantity) * mktPrice
-                  const pnl = Number(h.quantity) * (mktPrice - Number(h.avg_cost))
-                  return (
-                    <tr key={h.instrument_id}>
-                      <td>
-                        <div className="text-sm font-medium">{h.instrument?.name}</div>
-                        <div className="text-[10px] text-[#555d72] font-mono">{h.instrument_id}</div>
-                      </td>
-                      <td><span className={`badge badge-${h.instrument?.type === 'NTB' ? 'ntb' : h.instrument?.type === 'Bond' ? 'bond' : h.instrument?.type === 'Stock' ? 'stock' : 'cash'}`}>{h.instrument?.type}</span></td>
-                      <td>
-                        <input type="number" value={h.quantity} onChange={e => updateLocal(h.instrument_id, 'quantity', e.target.value)}
-                          className="tw-input py-1 text-xs font-mono text-right w-32" />
-                      </td>
-                      <td>
-                        <input type="number" value={h.avg_cost} onChange={e => updateLocal(h.instrument_id, 'avg_cost', e.target.value)}
-                          step="0.01" className="tw-input py-1 text-xs font-mono text-right w-28" />
-                      </td>
-                      <td className="font-mono">₦{mktPrice.toFixed(h.instrument?.type === 'Stock' ? 2 : 4)}</td>
-                      <td>
-                        <span className="inline-flex items-center gap-1.5 text-[11px]" title={dotTitle}>
-                          <span style={{ background: dotColor }} className="w-2 h-2 rounded-full inline-block flex-shrink-0" />
-                          <span className={
-                            stale === 'stale' ? 'text-[#eab308]' :
-                            stale === 'none'  ? 'text-[#555d72]' : 'text-[#8a91a8]'
-                          }>{formatShortDate(priceDate)}</span>
-                        </span>
-                      </td>
-                      <td className="font-mono">{fmt.ngnM(mktVal)}</td>
-                      <td className={`font-mono text-xs ${pnl >= 0 ? 'text-[#00d4a4]' : 'text-[#ff5c7a]'}`}>{pnl >= 0 ? '+' : ''}{fmt.ngnM(pnl)}</td>
-                      <td>
-                        <div className="flex gap-1.5">
-                          <button onClick={() => saveHolding(h)} disabled={saving[h.instrument_id]}
-                            className="flex items-center gap-1 text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors px-2 py-1 border border-white/10 rounded">
-                            <Save size={11} /> {saving[h.instrument_id] ? '…' : 'Save'}
-                          </button>
-                          <button onClick={() => deleteHolding(h.instrument_id)}
-                            className="flex items-center gap-1 text-[11px] text-[#555d72] hover:text-[#ff5c7a] transition-colors px-2 py-1 border border-white/10 rounded">
-                            <Trash2 size={11} />
-                          </button>
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
+      {/* Grouped holdings */}
+      {Object.entries(grouped)
+        .sort(([a], [b]) => (SLEEVE_ORDER[a] ?? 99) - (SLEEVE_ORDER[b] ?? 99))
+        .map(([sleeveId, items]) => (
+          <div key={sleeveId} className="panel" style={{ marginBottom: 14 }}>
+            <div className="panel-header">
+              <div className="panel-title">{SLEEVE_NAMES[sleeveId] ?? sleeveId}</div>
+              <div className="panel-meta">
+                {(items as any[]).length} position{(items as any[]).length === 1 ? '' : 's'}
+              </div>
+            </div>
+            <div style={{ overflowX: 'auto' }}>
+              <table className="h-table" style={{ minWidth: 900 }}>
+                <thead>
+                  <tr>
+                    <th>Instrument</th>
+                    <th>Type</th>
+                    <th className="num">Quantity / Face (₦)</th>
+                    <th className="num">Avg cost</th>
+                    <th className="num">Current price</th>
+                    <th>As of</th>
+                    <th className="num">Market value</th>
+                    <th className="num">Unreal. P&amp;L</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {(items as any[]).map(h => {
+                    const mktPrice = prices[h.instrument_id] ?? h.avg_cost ?? 1
+                    const priceDate = priceDates[h.instrument_id]
+                    const stale = stalenessOf(priceDate)
+                    const dotColor =
+                      stale === 'fresh' ? 'var(--pos)' :
+                      stale === 'stale' ? 'var(--warn)' : 'var(--text-4)'
+                    const dotTitle =
+                      stale === 'fresh' ? `Fresh price (within ${STALE_DAYS} days)` :
+                      stale === 'stale' ? `Stale price — older than ${STALE_DAYS} days. Click Manage prices to override.` :
+                      'No market price on record — displaying average cost. Click Manage prices to set one.'
+                    const mktVal = Number(h.quantity) * mktPrice
+                    const pnl = Number(h.quantity) * (mktPrice - Number(h.avg_cost))
+                    const typePill =
+                      h.instrument?.type === 'Stock' ? 'pill-ok' :
+                      h.instrument?.type === 'Bond' ? 'pill-buy' :
+                      h.instrument?.type === 'NTB' ? 'pill-warn' :
+                      'pill-hold'
+                    return (
+                      <tr key={h.instrument_id}>
+                        <td>
+                          <div style={{ fontWeight: 500 }}>{h.instrument?.name}</div>
+                          <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                            {h.instrument_id}
+                          </div>
+                        </td>
+                        <td>
+                          <span className={`pill ${typePill}`}>{h.instrument?.type}</span>
+                        </td>
+                        <td className="num">
+                          <input
+                            type="number"
+                            value={h.quantity}
+                            onChange={e => updateLocal(h.instrument_id, 'quantity', e.target.value)}
+                            className="input-h-cell"
+                            style={{ width: 140 }}
+                          />
+                        </td>
+                        <td className="num">
+                          <input
+                            type="number"
+                            value={h.avg_cost}
+                            onChange={e => updateLocal(h.instrument_id, 'avg_cost', e.target.value)}
+                            step="0.01"
+                            className="input-h-cell"
+                            style={{ width: 110 }}
+                          />
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
+                          ₦{mktPrice.toFixed(h.instrument?.type === 'Stock' ? 2 : 4)}
+                        </td>
+                        <td>
+                          <span
+                            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }}
+                            title={dotTitle}
+                          >
+                            <span
+                              style={{
+                                width: 7,
+                                height: 7,
+                                borderRadius: '50%',
+                                background: dotColor,
+                                display: 'inline-block',
+                                flexShrink: 0,
+                              }}
+                            />
+                            <span
+                              style={{
+                                color:
+                                  stale === 'stale' ? 'var(--warn)' :
+                                  stale === 'none' ? 'var(--text-3)' : 'var(--text-2)',
+                              }}
+                            >
+                              {formatShortDate(priceDate)}
+                            </span>
+                          </span>
+                        </td>
+                        <td className="num num-serif">{fmt.ngnM(mktVal)}</td>
+                        <td
+                          className="num num-serif"
+                          style={{ color: pnl >= 0 ? 'var(--pos)' : 'var(--neg)' }}
+                        >
+                          {pnl >= 0 ? '+' : '−'}{fmt.ngnM(Math.abs(pnl))}
+                        </td>
+                        <td>
+                          <div style={{ display: 'flex', gap: 6, justifyContent: 'flex-end' }}>
+                            <button
+                              className="btn-h"
+                              style={{ fontSize: 11, padding: '4px 9px' }}
+                              onClick={() => saveHolding(h)}
+                              disabled={saving[h.instrument_id]}
+                              title="Save changes"
+                            >
+                              <Save size={10} /> {saving[h.instrument_id] ? '…' : 'Save'}
+                            </button>
+                            <button
+                              className="btn-h"
+                              style={{ fontSize: 11, padding: '4px 8px', color: 'var(--text-3)' }}
+                              onClick={() => deleteHolding(h.instrument_id)}
+                              title="Remove position"
+                            >
+                              <Trash2 size={10} />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
           </div>
         ))}
-      </div>
-    </div>
+    </main>
   )
 }

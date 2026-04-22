@@ -438,7 +438,120 @@
   line-height: 1;
 }
 
-/* Portfolio card (All Portfolios grid) */
+/* v20d — Hybrid form controls + supporting utilities for phase 2 pages
+   (Holdings, Transactions, Reports, Settings). Added in v20d; may be
+   consumed by admin pages in v20e onwards. */
+
+.input-h {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 7px 11px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+}
+.input-h:focus { border-color: var(--gold); }
+.input-h::placeholder { color: var(--text-4); }
+.input-h:disabled { opacity: 0.6; cursor: not-allowed; }
+.input-h-mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+.input-h-sm {
+  padding: 5px 9px;
+  font-size: 12px;
+}
+
+.select-h {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 7px 32px 7px 11px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+  appearance: none;
+  cursor: pointer;
+  background-image: url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath d='M3 4.5l3 3 3-3' stroke='%235c6573' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+.select-h:focus { border-color: var(--gold); }
+.select-h:disabled { opacity: 0.6; cursor: not-allowed; }
+
+.textarea-h {
+  width: 100%;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 8px 11px;
+  font-size: 13px;
+  font-family: var(--font-sans);
+  color: var(--text);
+  outline: none;
+  transition: border-color 0.15s;
+  resize: vertical;
+  line-height: 1.5;
+}
+.textarea-h:focus { border-color: var(--gold); }
+
+/* In-table editable input — transparent until hover, gold border on focus */
+.input-h-cell {
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 2px;
+  padding: 4px 8px;
+  font-size: 13px;
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+  outline: none;
+  text-align: right;
+  transition: all 0.15s;
+}
+.input-h-cell:hover {
+  border-color: var(--border);
+  background: var(--bg-soft);
+}
+.input-h-cell:focus {
+  border-color: var(--gold);
+  background: var(--card);
+}
+
+/* Mini KPI tile — smaller than .h-kpi, with custom-color top stripe via
+   inline `style={{ borderTopColor: ... }}`. Used for fee summary row. */
+.kpi-mini {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-top: 2px solid var(--text-4);
+  border-radius: 4px;
+  padding: 14px 16px;
+}
+.kpi-mini-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-3);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.kpi-mini-value {
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  line-height: 1;
+}
+
+
 .portfolio-card {
   background: var(--card);
   border: 1px solid var(--border);

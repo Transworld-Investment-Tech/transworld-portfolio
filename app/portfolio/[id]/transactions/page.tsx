@@ -1,20 +1,26 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
-import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { ArrowLeft, Plus, Search } from 'lucide-react'
-import PageActions from '@/components/shared/PageActions'
+import { Plus, Search, Copy, Check, Info } from 'lucide-react'
 
-const ACTION_COLORS: Record<string, string> = {
-  BUY: 'badge-buy', SELL: 'badge-sell', INCOME: 'badge-ntb',
-  FEE: 'badge-hold', TRANSFER_IN: 'badge-ok', TRANSFER_OUT: 'badge-breach',
+// v20d: Hybrid rewrite.
+// Sidebar rendered by app/portfolio/[id]/layout.tsx — do NOT render here.
+// PageActions dropped; inline hybrid Copy button wired to getTxnsText().
+// Virtual fee rows logic preserved verbatim — only styling changes.
+
+const ACTION_PILL: Record<string, string> = {
+  BUY:           'pill-buy',
+  SELL:          'pill-sell',
+  INCOME:        'pill-warn',
+  FEE:           'pill-hold',
+  TRANSFER_IN:   'pill-ok',
+  TRANSFER_OUT:  'pill-breach',
 }
 
 type FeeView = 'total' | 'breakdown'
 
-// Virtual rows derived from BUY/SELL fee columns — shown when a fee type filter is active
 function buildFeeRows(txns: any[]): any[] {
   const rows: any[] = []
   txns.filter(t => t.action === 'BUY' || t.action === 'SELL').forEach(t => {
@@ -34,6 +40,16 @@ function buildFeeRows(txns: any[]): any[] {
   return rows
 }
 
+const FEE_TYPES = [
+  'Management Fee',
+  'Brokerage Commission',
+  'Stamp Duty',
+  'VAT',
+  'Exchange Levy',
+  'Clearing Fee',
+  'SMS Charge',
+]
+
 export default function TransactionsPage() {
   const { id: portfolioId } = useParams() as { id: string }
   const [portfolio,   setPortfolio]   = useState<any>(null)
@@ -43,6 +59,7 @@ export default function TransactionsPage() {
   const [showForm,    setShowForm]    = useState(false)
   const [saving,      setSaving]      = useState(false)
   const [feeView,     setFeeView]     = useState<FeeView>('total')
+  const [copied,      setCopied]      = useState(false)
   const [filter, setFilter] = useState({ action: '', search: '', feeType: '' })
   const [form, setForm] = useState({
     trade_date: new Date().toISOString().slice(0, 10),
@@ -99,29 +116,14 @@ export default function TransactionsPage() {
     setSaving(false)
   }
 
-  // Fee type options — static list covers all known types
-  const FEE_TYPES = [
-    'Management Fee',
-    'Brokerage Commission',
-    'Stamp Duty',
-    'VAT',
-    'Exchange Levy',
-    'Clearing Fee',
-    'SMS Charge',
-  ]
-
-  // When a fee type is selected, show virtual rows derived from fee columns
-  // Otherwise show normal transaction rows
   const feeRows = buildFeeRows(txns)
 
   const filtered = (() => {
     if (filter.feeType) {
-      // Show virtual fee rows for the selected type
       return feeRows
         .filter(r => r._feeType === filter.feeType)
         .filter(r => !filter.search || r.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()))
     }
-    // Normal filtering
     return txns.filter(t => {
       if (filter.action && t.action !== filter.action) return false
       if (filter.search && !t.instrument_id?.toLowerCase().includes(filter.search.toLowerCase()) && !t.notes?.toLowerCase().includes(filter.search.toLowerCase())) return false
@@ -129,7 +131,6 @@ export default function TransactionsPage() {
     })
   })()
 
-  // Fee summary totals
   const feeTotals = {
     commission: txns.reduce((s, t) => s + (t.fee_commission     ?? 0), 0),
     vat:        txns.reduce((s, t) => s + (t.fee_vat            ?? 0), 0),
@@ -172,295 +173,378 @@ export default function TransactionsPage() {
     return lines.join('\n')
   }
 
-  if (loading) return <div className="flex items-center justify-center h-64 text-[#555d72] text-xs">Loading…</div>
+  async function copyText() {
+    await navigator.clipboard.writeText(getTxnsText())
+    setCopied(true)
+    setTimeout(() => setCopied(false), 2500)
+  }
+
+  if (loading) {
+    return (
+      <div className="hybrid-page" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: '100vh', color: 'var(--text-3)', fontSize: 14 }}>
+        Loading…
+      </div>
+    )
+  }
 
   return (
-    <div>
-      {/* Header */}
-      <div className="px-8 py-5 border-b border-white/[0.07] bg-[#13161d] flex items-center gap-4">
-        <Link href={`/portfolio/${portfolioId}`} className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-          <ArrowLeft size={13} /> {portfolio?.name}
-        </Link>
-        <div className="w-px h-4 bg-white/10" />
-        <h1 className="text-base font-semibold">Transactions</h1>
-        <div className="ml-auto flex items-center gap-3">
-          <PageActions pageTitle="Transaction History" portfolioName={portfolio?.name ?? ''} getText={getTxnsText} />
-          <button onClick={() => setShowForm(!showForm)} className="flex items-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors">
-            <Plus size={13} /> Enter trade
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      {/* Page header */}
+      <div className="page-head">
+        <div>
+          <div className="eyebrow" style={{ marginBottom: 10 }}>
+            {portfolio?.client?.name} · {portfolio?.name}
+          </div>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Transactions
+          </h1>
+        </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <button className="btn-h" onClick={copyText}>
+            {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
+          </button>
+          <button className="btn-h btn-h-primary" onClick={() => setShowForm(!showForm)}>
+            <Plus size={12} /> Enter trade
           </button>
         </div>
       </div>
 
-      <div className="px-8 py-6 max-w-7xl">
+      {/* Fee summary cards (4 tiles with accent top borders) */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 18 }}>
+        <div className="kpi-mini" style={{ borderTopColor: 'var(--gold)' }}>
+          <div className="kpi-mini-label">Brokerage commission</div>
+          <div className="kpi-mini-value" style={{ color: 'var(--gold)' }}>
+            ₦{feeTotals.commission.toLocaleString()}
+          </div>
+        </div>
+        <div className="kpi-mini" style={{ borderTopColor: 'var(--warn)' }}>
+          <div className="kpi-mini-label">Statutory charges</div>
+          <div className="kpi-mini-value" style={{ color: 'var(--warn)' }}>
+            ₦{(feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.vat + feeTotals.sms).toLocaleString()}
+          </div>
+        </div>
+        <div className="kpi-mini" style={{ borderTopColor: 'var(--sidebar-bg)' }}>
+          <div className="kpi-mini-label">Management fees</div>
+          <div className="kpi-mini-value" style={{ color: 'var(--sidebar-bg)' }}>
+            ₦{feeTotals.management.toLocaleString()}
+          </div>
+        </div>
+        <div className="kpi-mini" style={{ borderTopColor: 'var(--neg)' }}>
+          <div className="kpi-mini-label">Total fees paid</div>
+          <div className="kpi-mini-value" style={{ color: 'var(--neg)' }}>
+            ₦{feeTotals.total.toLocaleString()}
+          </div>
+        </div>
+      </div>
 
-        {/* Fee summary cards */}
-        <div className="grid grid-cols-4 gap-3 mb-5">
+      {/* Statutory breakdown */}
+      <div className="panel" style={{ marginBottom: 18 }}>
+        <div className="panel-header">
+          <div className="panel-title">Statutory charge breakdown</div>
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, 1fr)', gap: 14 }}>
           {[
-            { label: 'Brokerage commission', value: feeTotals.commission,  color: '#a78bfa' },
-            { label: 'Statutory charges',    value: feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.vat + feeTotals.sms, color: '#fb923c' },
-            { label: 'Management fees',      value: feeTotals.management,  color: '#60a5fa' },
-            { label: 'Total fees paid',       value: feeTotals.total,       color: '#ff5c7a' },
-          ].map(item => (
-            <div key={item.label} className="tw-card py-3 px-4" style={{ borderTop: `2px solid ${item.color}` }}>
-              <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">{item.label}</div>
-              <div className="text-lg font-bold font-mono" style={{ color: item.color }}>
+            { label: 'VAT (7.5% of commission)',  value: feeTotals.vat      },
+            { label: 'Contract stamp (0.08%)',    value: feeTotals.stamp    },
+            { label: 'NGX exchange levy (0.3%)',  value: feeTotals.exchange },
+            { label: 'CSCS clearing (0.3%)',      value: feeTotals.clearing },
+            { label: 'SMS charges',               value: feeTotals.sms      },
+            { label: 'Subtotal statutory',        value: feeTotals.vat + feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.sms },
+          ].map((item, idx, arr) => (
+            <div key={item.label} style={{ textAlign: 'center' }}>
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.35, letterSpacing: '0.02em' }}>
+                {item.label}
+              </div>
+              <div
+                style={{
+                  fontSize: 15,
+                  fontFamily: 'var(--font-mono)',
+                  fontWeight: 500,
+                  color: idx === arr.length - 1 ? 'var(--text)' : 'var(--text-2)',
+                }}
+              >
                 ₦{item.value.toLocaleString()}
               </div>
             </div>
           ))}
         </div>
+      </div>
 
-        {/* Statutory breakdown */}
-        <div className="tw-card mb-5 py-3">
-          <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-3">Statutory charge breakdown</div>
-          <div className="grid grid-cols-6 gap-3">
-            {[
-              { label: 'VAT (7.5% of commission)', value: feeTotals.vat      },
-              { label: 'Contract stamp (0.08%)',    value: feeTotals.stamp    },
-              { label: 'NGX exchange levy (0.3%)',  value: feeTotals.exchange },
-              { label: 'CSCS clearing (0.3%)',      value: feeTotals.clearing },
-              { label: 'SMS charges',               value: feeTotals.sms     },
-              { label: 'Subtotal statutory',        value: feeTotals.vat + feeTotals.stamp + feeTotals.exchange + feeTotals.clearing + feeTotals.sms },
-            ].map(item => (
-              <div key={item.label} className="text-center">
-                <div className="text-[10px] text-[#555d72] mb-1 leading-tight">{item.label}</div>
-                <div className="text-sm font-mono font-semibold text-[#8a91a8]">₦{item.value.toLocaleString()}</div>
-              </div>
-            ))}
+      {/* Trade entry form */}
+      {showForm && (
+        <form onSubmit={submitTrade} className="panel" style={{ marginBottom: 18, borderColor: 'rgba(176, 139, 62, 0.3)' }}>
+          <div className="panel-header">
+            <div className="panel-title">New trade entry</div>
           </div>
-        </div>
 
-        {/* Trade entry form */}
-        {showForm && (
-          <form onSubmit={submitTrade} className="tw-card mb-5 border-[#a78bfa]/20">
-            <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4">New trade entry</div>
-            <div className="grid grid-cols-3 gap-4 mb-4">
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Trade date <span className="text-[#ff5c7a]">*</span></label>
-                <input type="date" value={form.trade_date} onChange={set('trade_date')} required className="tw-input" />
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Action <span className="text-[#ff5c7a]">*</span></label>
-                <select value={form.action} onChange={set('action')} className="tw-select">
-                  {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => <option key={a}>{a}</option>)}
-                </select>
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Instrument</label>
-                <select value={form.instrument_id} onChange={set('instrument_id')} className="tw-select">
-                  <option value="">Select instrument…</option>
-                  {instruments.map(i => <option key={i.instrument_id} value={i.instrument_id}>{i.name}</option>)}
-                </select>
-              </div>
-            </div>
-            <div className="grid grid-cols-4 gap-4 mb-4">
-              {['BUY','SELL'].includes(form.action) && <>
-                <div>
-                  <label className="block text-xs text-[#8a91a8] mb-1.5">Quantity</label>
-                  <input type="number" value={form.quantity} onChange={set('quantity')} placeholder="0" className="tw-input font-mono" step="any" />
-                </div>
-                <div>
-                  <label className="block text-xs text-[#8a91a8] mb-1.5">Price (₦)</label>
-                  <input type="number" value={form.price} onChange={set('price')} placeholder="0.00" className="tw-input font-mono" step="0.0001" />
-                </div>
-              </>}
-              {['INCOME','FEE'].includes(form.action) && (
-                <div>
-                  <label className="block text-xs text-[#8a91a8] mb-1.5">Amount (₦)</label>
-                  <input type="number" value={form.amount} onChange={set('amount')} placeholder="0" className="tw-input font-mono" />
-                </div>
-              )}
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Total fees (₦)</label>
-                <input type="number" value={form.fees} onChange={set('fees')} placeholder="0" className="tw-input font-mono" />
-              </div>
-              {form.action === 'INCOME' && (
-                <div>
-                  <label className="block text-xs text-[#8a91a8] mb-1.5">Income category</label>
-                  <select value={form.income_category} onChange={set('income_category')} className="tw-select">
-                    <option value="">Select…</option>
-                    {['Interest','Coupon','Dividend','Other'].map(c => <option key={c}>{c}</option>)}
-                  </select>
-                </div>
-              )}
-            </div>
-            <div className="grid grid-cols-3 gap-4 mb-4">
-              <div><label className="block text-xs text-[#8a91a8] mb-1.5">Broker</label><input value={form.broker} onChange={set('broker')} className="tw-input" /></div>
-              <div><label className="block text-xs text-[#8a91a8] mb-1.5">Counterparty</label><input value={form.counterparty} onChange={set('counterparty')} className="tw-input" /></div>
-              <div><label className="block text-xs text-[#8a91a8] mb-1.5">Maturity date</label><input type="date" value={form.maturity_date} onChange={set('maturity_date')} className="tw-input" /></div>
-            </div>
-            <div className="mb-4">
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Notes</label>
-              <input value={form.notes} onChange={set('notes')} className="tw-input" />
-            </div>
-            {form.action === 'BUY' && form.quantity && form.price && (
-              <div className="mb-4 px-3 py-2 bg-[#a78bfa]/10 rounded-lg text-xs text-[#a78bfa]">
-                Gross value: ₦{(Number(form.quantity) * Number(form.price)).toLocaleString()}
-              </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
+            <FormField label="Trade date" required>
+              <input type="date" value={form.trade_date} onChange={set('trade_date')} required className="input-h" />
+            </FormField>
+            <FormField label="Action" required>
+              <select value={form.action} onChange={set('action')} className="select-h">
+                {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => <option key={a}>{a}</option>)}
+              </select>
+            </FormField>
+            <FormField label="Instrument">
+              <select value={form.instrument_id} onChange={set('instrument_id')} className="select-h">
+                <option value="">Select instrument…</option>
+                {instruments.map(i => <option key={i.instrument_id} value={i.instrument_id}>{i.name}</option>)}
+              </select>
+            </FormField>
+          </div>
+
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 16 }}>
+            {['BUY','SELL'].includes(form.action) && (
+              <>
+                <FormField label="Quantity">
+                  <input type="number" value={form.quantity} onChange={set('quantity')} placeholder="0" className="input-h input-h-mono" step="any" />
+                </FormField>
+                <FormField label="Price (₦)">
+                  <input type="number" value={form.price} onChange={set('price')} placeholder="0.00" className="input-h input-h-mono" step="0.0001" />
+                </FormField>
+              </>
             )}
-            <div className="flex gap-3">
-              <button type="submit" disabled={saving} className="flex items-center gap-2 bg-[#a78bfa] text-white px-5 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] disabled:opacity-50 transition-colors">
-                {saving ? 'Saving…' : 'Submit trade'}
-              </button>
-              <button type="button" onClick={() => setShowForm(false)} className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">Cancel</button>
-            </div>
-          </form>
-        )}
-
-        {/* Filters */}
-        <div className="flex flex-wrap gap-3 mb-4 items-center">
-          {/* Search */}
-          <div className="relative">
-            <Search size={13} className="absolute left-2.5 top-1/2 -translate-y-1/2 text-[#555d72]" />
-            <input
-              value={filter.search}
-              onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
-              placeholder="Search by instrument…"
-              className="tw-input pl-8 py-1.5 text-xs w-48"
-            />
+            {['INCOME','FEE'].includes(form.action) && (
+              <FormField label="Amount (₦)">
+                <input type="number" value={form.amount} onChange={set('amount')} placeholder="0" className="input-h input-h-mono" />
+              </FormField>
+            )}
+            <FormField label="Total fees (₦)">
+              <input type="number" value={form.fees} onChange={set('fees')} placeholder="0" className="input-h input-h-mono" />
+            </FormField>
+            {form.action === 'INCOME' && (
+              <FormField label="Income category">
+                <select value={form.income_category} onChange={set('income_category')} className="select-h">
+                  <option value="">Select…</option>
+                  {['Interest','Coupon','Dividend','Other'].map(c => <option key={c}>{c}</option>)}
+                </select>
+              </FormField>
+            )}
           </div>
 
-          {/* Action filter */}
-          <select
-            value={filter.action}
-            onChange={e => setFilter(f => ({ ...f, action: e.target.value, feeType: '' }))}
-            className="tw-select py-1.5 text-xs w-40"
-          >
-            <option value="">All actions</option>
-            {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => (
-              <option key={a} value={a}>{a}</option>
-            ))}
-          </select>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
+            <FormField label="Broker"><input value={form.broker} onChange={set('broker')} className="input-h" /></FormField>
+            <FormField label="Counterparty"><input value={form.counterparty} onChange={set('counterparty')} className="input-h" /></FormField>
+            <FormField label="Maturity date"><input type="date" value={form.maturity_date} onChange={set('maturity_date')} className="input-h" /></FormField>
+          </div>
 
-          {/* Fee type filter */}
-          <select
-            value={filter.feeType}
-            onChange={e => setFilter(f => ({ ...f, feeType: e.target.value, action: '' }))}
-            className="tw-select py-1.5 text-xs w-52"
-          >
-            <option value="">All fee types</option>
-            {FEE_TYPES.map(ft => (
-              <option key={ft} value={ft}>{ft}</option>
-            ))}
-          </select>
+          <div style={{ marginBottom: 16 }}>
+            <FormField label="Notes"><input value={form.notes} onChange={set('notes')} className="input-h" /></FormField>
+          </div>
 
-          {/* Clear filters */}
-          {(filter.action || filter.feeType || filter.search) && (
-            <button
-              onClick={() => setFilter({ action: '', search: '', feeType: '' })}
-              className="text-[11px] text-[#555d72] hover:text-[#e8eaf0] px-2 py-1 border border-white/10 rounded transition-colors"
-            >
-              Clear filters
-            </button>
+          {form.action === 'BUY' && form.quantity && form.price && (
+            <div className="alert-h alert-h-info" style={{ marginBottom: 16, fontSize: 12 }}>
+              Gross value: <strong style={{ fontFamily: 'var(--font-mono)', marginLeft: 4 }}>
+                ₦{(Number(form.quantity) * Number(form.price)).toLocaleString()}
+              </strong>
+            </div>
           )}
 
-          {/* Fee column toggle */}
-          <div className="flex items-center gap-1 ml-auto">
-            <span className="text-[10px] text-[#555d72] mr-1">Fee columns:</span>
-            {(['total', 'breakdown'] as FeeView[]).map(v => (
-              <button key={v} onClick={() => setFeeView(v)}
-                className="px-2.5 py-1 rounded text-[11px] font-medium transition-all capitalize"
-                style={feeView === v
-                  ? { background: '#a78bfa20', color: '#a78bfa', border: '1px solid #a78bfa40' }
-                  : { background: 'transparent', color: '#555d72', border: '1px solid rgba(255,255,255,0.07)' }}>
-                {v}
-              </button>
-            ))}
+          <div style={{ display: 'flex', gap: 10 }}>
+            <button type="submit" disabled={saving} className="btn-h btn-h-primary">
+              {saving ? 'Saving…' : 'Submit trade'}
+            </button>
+            <button type="button" onClick={() => setShowForm(false)} className="btn-h">
+              Cancel
+            </button>
           </div>
+        </form>
+      )}
 
-          <span className="text-xs text-[#555d72]">
-            {filtered.length} record{filtered.length !== 1 ? 's' : ''}
-            {filter.feeType && <span className="text-[#a78bfa] ml-1">— {filter.feeType}</span>}
-          </span>
+      {/* Filters row */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginBottom: 12 }}>
+        <div style={{ position: 'relative', width: 200 }}>
+          <Search
+            size={12}
+            style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }}
+          />
+          <input
+            value={filter.search}
+            onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
+            placeholder="Search by instrument…"
+            className="input-h input-h-sm"
+            style={{ paddingLeft: 30 }}
+          />
         </div>
 
-        {/* Info note when viewing fee sub-type */}
-        {filter.feeType && (
-          <div className="mb-3 px-3 py-2 bg-[#a78bfa]/10 border border-[#a78bfa]/20 rounded-lg text-[11px] text-[#a78bfa]">
+        <select
+          value={filter.action}
+          onChange={e => setFilter(f => ({ ...f, action: e.target.value, feeType: '' }))}
+          className="select-h"
+          style={{ width: 160, padding: '5px 32px 5px 9px', fontSize: 12 }}
+        >
+          <option value="">All actions</option>
+          {['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].map(a => (
+            <option key={a} value={a}>{a}</option>
+          ))}
+        </select>
+
+        <select
+          value={filter.feeType}
+          onChange={e => setFilter(f => ({ ...f, feeType: e.target.value, action: '' }))}
+          className="select-h"
+          style={{ width: 200, padding: '5px 32px 5px 9px', fontSize: 12 }}
+        >
+          <option value="">All fee types</option>
+          {FEE_TYPES.map(ft => (
+            <option key={ft} value={ft}>{ft}</option>
+          ))}
+        </select>
+
+        {(filter.action || filter.feeType || filter.search) && (
+          <button
+            onClick={() => setFilter({ action: '', search: '', feeType: '' })}
+            className="btn-h"
+            style={{ fontSize: 11, padding: '4px 10px' }}
+          >
+            Clear filters
+          </button>
+        )}
+
+        {/* Fee column toggle */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
+          <span style={{ fontSize: 10, color: 'var(--text-3)', marginRight: 4 }}>Fee columns:</span>
+          {(['total', 'breakdown'] as FeeView[]).map(v => (
+            <button
+              key={v}
+              onClick={() => setFeeView(v)}
+              style={{
+                padding: '4px 11px',
+                borderRadius: 2,
+                fontSize: 11,
+                fontWeight: 500,
+                textTransform: 'capitalize' as const,
+                cursor: 'pointer',
+                transition: 'all 0.15s',
+                fontFamily: 'var(--font-sans)',
+                ...(feeView === v
+                  ? { background: 'var(--gold-soft)', color: 'var(--gold)', border: '1px solid rgba(176, 139, 62, 0.3)' }
+                  : { background: 'transparent', color: 'var(--text-3)', border: '1px solid var(--border)' }),
+              }}
+            >
+              {v}
+            </button>
+          ))}
+        </div>
+
+        <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {filtered.length} record{filtered.length !== 1 ? 's' : ''}
+          {filter.feeType && <span style={{ color: 'var(--gold)', marginLeft: 4 }}>— {filter.feeType}</span>}
+        </span>
+      </div>
+
+      {/* Fee type info note */}
+      {filter.feeType && (
+        <div className="alert-h alert-h-info" style={{ marginBottom: 12, fontSize: 11 }}>
+          <Info size={12} style={{ marginTop: 1, flexShrink: 0 }} />
+          <span>
             Showing <strong>{filter.feeType}</strong> charges extracted from BUY/SELL transactions.
             Each row represents the {filter.feeType.toLowerCase()} component of the parent trade.
-          </div>
-        )}
+          </span>
+        </div>
+      )}
 
-        {/* Transaction table */}
-        <div className="tw-card p-0 overflow-x-auto">
-          {filtered.length === 0 ? (
-            <div className="text-center py-10 text-xs text-[#555d72]">No records match the current filter.</div>
-          ) : (
-            <table className="tw-table w-full" style={{ minWidth: feeView === 'breakdown' ? 1100 : 800 }}>
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Action</th>
-                  <th>Instrument</th>
-                  <th>{filter.feeType ? 'Fee type' : 'Qty / Amount'}</th>
-                  <th>Price (₦)</th>
-                  <th>Gross value</th>
+      {/* Transaction table */}
+      <div className="panel" style={{ padding: 0, overflowX: 'auto' }}>
+        {filtered.length === 0 ? (
+          <div style={{ textAlign: 'center', padding: '40px 0', fontSize: 12, color: 'var(--text-3)' }}>
+            No records match the current filter.
+          </div>
+        ) : (
+          <table className="h-table" style={{ minWidth: feeView === 'breakdown' ? 1100 : 800 }}>
+            <thead>
+              <tr>
+                <th>Date</th>
+                <th>Action</th>
+                <th>Instrument</th>
+                <th>{filter.feeType ? 'Fee type' : 'Qty / Amount'}</th>
+                <th className="num">Price (₦)</th>
+                <th className="num">Gross value</th>
+                {filter.feeType ? (
+                  <th className="num" style={{ color: 'var(--gold)' }}>Fee amount</th>
+                ) : feeView === 'total' ? (
+                  <th className="num">Total fees</th>
+                ) : (
+                  <>
+                    <th className="num" style={{ color: 'var(--gold)' }}>Commission</th>
+                    <th className="num" style={{ color: 'var(--warn)' }}>VAT</th>
+                    <th className="num" style={{ color: 'var(--warn)' }}>Stamp</th>
+                    <th className="num" style={{ color: 'var(--warn)' }}>Exch fee</th>
+                    <th className="num" style={{ color: 'var(--warn)' }}>Clearing</th>
+                    <th className="num" style={{ color: 'var(--sidebar-bg)' }}>Mgmt fee</th>
+                    <th className="num">Total</th>
+                  </>
+                )}
+                <th>Notes</th>
+              </tr>
+            </thead>
+            <tbody>
+              {filtered.map(t => (
+                <tr
+                  key={t._virtual ? `${t.id}-${t._feeType}` : t.id}
+                  style={t._virtual ? { background: 'rgba(176, 139, 62, 0.04)' } : {}}
+                >
+                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{t.trade_date}</td>
+                  <td><span className={`pill ${ACTION_PILL[t.action] ?? 'pill-hold'}`}>{t.action}</span></td>
+                  <td>
+                    <div style={{ fontWeight: 500 }}>{t.instrument_id || '—'}</div>
+                    {t.income_category && (
+                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.income_category}</div>
+                    )}
+                  </td>
+                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                    {filter.feeType
+                      ? <span style={{ color: 'var(--gold)', fontSize: 11 }}>{t._feeType}</span>
+                      : t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'
+                    }
+                  </td>
+                  <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                    {t.price ? `₦${Number(t.price).toFixed(2)}` : '—'}
+                  </td>
+                  <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                    {t.gross_value ? fmt.ngnM(t.gross_value) : t.amount ? fmt.ngnM(t.amount) : '—'}
+                  </td>
                   {filter.feeType ? (
-                    <th style={{ color: '#a78bfa' }}>Fee amount</th>
+                    <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--gold)', fontWeight: 500 }}>
+                      ₦{Number(t._feeAmount).toLocaleString()}
+                    </td>
                   ) : feeView === 'total' ? (
-                    <th>Total fees</th>
+                    <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-3)' }}>
+                      {t.fees ? `₦${Number(t.fees).toLocaleString()}` : '—'}
+                    </td>
                   ) : (
                     <>
-                      <th style={{ color: '#a78bfa' }}>Commission</th>
-                      <th style={{ color: '#fb923c' }}>VAT</th>
-                      <th style={{ color: '#fb923c' }}>Stamp</th>
-                      <th style={{ color: '#fb923c' }}>Exch fee</th>
-                      <th style={{ color: '#fb923c' }}>Clearing</th>
-                      <th style={{ color: '#60a5fa' }}>Mgmt fee</th>
-                      <th>Total</th>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--gold)' }}>{t.fee_commission     ? `₦${Number(t.fee_commission).toLocaleString()}`      : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_vat            ? `₦${Number(t.fee_vat).toFixed(0)}`                    : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_contract_stamp ? `₦${Number(t.fee_contract_stamp).toFixed(0)}`          : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_exchange       ? `₦${Number(t.fee_exchange).toFixed(0)}`                : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_clearing       ? `₦${Number(t.fee_clearing).toFixed(0)}`                : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--sidebar-bg)' }}>{t.fee_management     ? `₦${Number(t.fee_management).toLocaleString()}`        : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--neg)', fontWeight: 500 }}>{t.fees ? `₦${Number(t.fees).toLocaleString()}`                   : '—'}</td>
                     </>
                   )}
-                  <th>Notes</th>
+                  <td style={{ fontSize: 11, color: 'var(--text-3)', maxWidth: 160, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                    {t.notes || '—'}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {filtered.map((t, idx) => (
-                  <tr key={t._virtual ? `${t.id}-${t._feeType}` : t.id}
-                    style={t._virtual ? { background: 'rgba(167,139,250,0.03)' } : {}}>
-                    <td className="font-mono text-[11px]">{t.trade_date}</td>
-                    <td><span className={`badge ${ACTION_COLORS[t.action] ?? 'badge-hold'}`}>{t.action}</span></td>
-                    <td>
-                      <div className="font-medium">{t.instrument_id || '—'}</div>
-                      {t.income_category && <div className="text-[10px] text-[#555d72]">{t.income_category}</div>}
-                    </td>
-                    <td className="font-mono text-xs">
-                      {filter.feeType
-                        ? <span className="text-[#a78bfa] text-[11px]">{t._feeType}</span>
-                        : t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'
-                      }
-                    </td>
-                    <td className="font-mono text-xs">{t.price ? `₦${Number(t.price).toFixed(2)}` : '—'}</td>
-                    <td className="font-mono text-xs">
-                      {t.gross_value ? fmt.ngnM(t.gross_value) : t.amount ? fmt.ngnM(t.amount) : '—'}
-                    </td>
-                    {filter.feeType ? (
-                      <td className="font-mono text-xs font-semibold" style={{ color: '#a78bfa' }}>
-                        ₦{Number(t._feeAmount).toLocaleString()}
-                      </td>
-                    ) : feeView === 'total' ? (
-                      <td className="font-mono text-xs text-[#555d72]">
-                        {t.fees ? `₦${Number(t.fees).toLocaleString()}` : '—'}
-                      </td>
-                    ) : (
-                      <>
-                        <td className="font-mono text-xs text-[#a78bfa]">{t.fee_commission     ? `₦${Number(t.fee_commission).toLocaleString()}`      : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_vat            ? `₦${Number(t.fee_vat).toFixed(0)}`                   : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_contract_stamp ? `₦${Number(t.fee_contract_stamp).toFixed(0)}`         : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_exchange       ? `₦${Number(t.fee_exchange).toFixed(0)}`               : '—'}</td>
-                        <td className="font-mono text-xs text-[#fb923c]">{t.fee_clearing       ? `₦${Number(t.fee_clearing).toFixed(0)}`               : '—'}</td>
-                        <td className="font-mono text-xs text-[#60a5fa]">{t.fee_management     ? `₦${Number(t.fee_management).toLocaleString()}`       : '—'}</td>
-                        <td className="font-mono text-xs text-[#ff5c7a]">{t.fees              ? `₦${Number(t.fees).toLocaleString()}`                  : '—'}</td>
-                      </>
-                    )}
-                    <td className="text-[11px] text-[#555d72] max-w-[160px] truncate">{t.notes || '—'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </div>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
+    </main>
+  )
+}
+
+function FormField({ label, required, children }: { label: string; required?: boolean; children: React.ReactNode }) {
+  return (
+    <div>
+      <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+        {label}
+        {required && <span style={{ color: 'var(--neg)', marginLeft: 3 }}>*</span>}
+      </label>
+      {children}
     </div>
   )
 }
