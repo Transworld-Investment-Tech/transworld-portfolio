@@ -1,20 +1,32 @@
 // ============================================================
 // MARKET DATA — DIRECT NGX SCRAPE + EXCHANGERATE
 // ============================================================
-// v16: The Apify actor `apify/trading-view-scraper` was removed
-// from the Apify Store, causing silent 502s on Live Prices refresh.
-// We now scrape NGX's own equities price list page directly. No
-// third-party API key is required for the primary path.
+// v16b fix: v16's single-regex approach had a lazy quantifier that
+// crossed ticker boundaries and also only accepted icon classes
+// `iconNull|iconUp|iconDown`. NGX actually uses `iconNull|iconGreen|
+// iconRed`, so every mover (gainer or loser) was rejected within its
+// own block, and the regex then consumed the next flat ticker's price
+// downstream. Result: FCMB stored at 146.14 instead of 13.50, etc.
+//
+// This rewrite splits the HTML into per-ticker chunks FIRST, then parses
+// each chunk in isolation. A chunk that doesn't yield a complete
+// (symbol, price, change) triple is discarded — it cannot contaminate
+// other tickers by construction.
 //
 // Source: https://ngxgroup.com/exchange/data/equities-price-list/
-// Format: Server-rendered HTML. Each listed security appears in
-// a <span class="ticker__list__item"> block containing:
-//   - An <a href="...?symbol=SYMBOL&directory=companydirectory"> tag
-//   - A price literal like "N123.45"
-//   - A <span class="iconNull|iconUp|iconDown"> with "X.XX %"
+// Each listing appears as:
+//   <span class="ticker__list__item">
+//     <a href="...?symbol=SYMBOL&directory=DIR">SYMBOL [FLAG]</a>
+//     NPRICE
+//     <span class="icon{Null|Green|Red}">PCT %</span>
+//   </span>
 //
-// The page repeats each ticker in 6 scrolling marquees; we dedup
-// by instrument_id and keep the first occurrence.
+// The same ticker can appear under three directories on this page:
+//   companydirectory   (equities — what we want)
+//   bonddirectory      (debt instruments; irrelevant for our equity holdings)
+//   etpdirectory       (exchange-traded products)
+// We restrict to `companydirectory` so an FCMB equity isn't
+// shadowed by an FCMB bond listing with a different price.
 // ============================================================
 
 export interface Quote {
@@ -26,8 +38,7 @@ export interface Quote {
 }
 
 // NGX's published ticker sometimes differs from our instrument_id.
-// This map translates NGX-published tickers to the internal IDs used
-// by the `instruments` table in Supabase.
+// Extend this map as new mismatches are discovered.
 const NGX_TICKER_ALIASES: Record<string, string> = {
   FIRSTHOLDCO: 'FBNH',   // First HoldCo (was First Bank of Nigeria Holdings)
   MOBIL: 'MRS',          // MRS Oil Nigeria (historical Mobil ticker)
@@ -35,10 +46,84 @@ const NGX_TICKER_ALIASES: Record<string, string> = {
 
 const NGX_EQUITIES_URL = 'https://ngxgroup.com/exchange/data/equities-price-list/'
 
-// User-Agent is required — NGX returns 403 or a stripped page to default fetch UAs.
+// User-Agent required — NGX returns 403 or a stripped page for default fetch UA.
 const BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
+
+// Split the HTML into per-ticker chunks and parse each independently.
+// Returns only chunks that contain all three fields; silently drops malformed ones.
+function parseNGXChunks(html: string): Quote[] {
+  // Split on the opening <span class="ticker__list__item"> tag. The first
+  // element is the preamble (head, nav, etc.) and has no ticker; skip it.
+  const chunks = html.split(/<span\s+class="ticker__list__item">/i).slice(1)
+
+  const fetchedAt = new Date().toISOString()
+  const seen = new Map<string, Quote>()
+
+  for (const chunk of chunks) {
+    // Truncate at the next chunk boundary so we can't accidentally peek
+    // forward. (split() already did this, but belt-and-braces.)
+    const block = chunk.split('</span>')[0] + (chunk.includes('</span>') ? '</span>' : '')
+
+    // Extract the symbol from the ?symbol= URL param — always alphabetic,
+    // immune to bracket suffixes like "FCMB [MRF]" in the display text.
+    // The href looks like: ...?symbol=FCMB&directory=companydirectory
+    // value of `directory` is one of: companydirectory | bonddirectory | etpdirectory
+    const symbolMatch = /\?symbol=([A-Z0-9_]+)&directory=([a-z]+)directory/i.exec(chunk)
+    if (!symbolMatch) continue
+
+    const rawTicker = symbolMatch[1]
+    const directory = (symbolMatch[2] || '').toLowerCase()
+
+    // Restrict to equities. bond/etp entries for the same symbol are a
+    // different security and must not be upserted under the equity's ID.
+    if (directory !== 'company') continue
+
+    // Extract price: an `N` immediately followed by digits, after the </a>.
+    // Anchor to the start of the chunk so we don't match numbers inside
+    // other attributes or scripts that happen to start with N.
+    const priceMatch = /<\/a>\s*N([\d,]+\.?\d*)\s*<span\s+class="icon/.exec(chunk)
+    if (!priceMatch) continue
+    const price = parseFloat(priceMatch[1].replace(/,/g, ''))
+    if (!Number.isFinite(price) || price <= 0) continue
+
+    // Extract direction + magnitude from the icon span. Accept ANY icon class
+    // (iconNull, iconGreen, iconRed, and any future variants).
+    const iconMatch = /<span\s+class="icon([A-Za-z]+)"[^>]*>\s*([-+]?\d+\.?\d*)\s*%/.exec(chunk)
+    if (!iconMatch) continue
+
+    const iconVariant = iconMatch[1].toLowerCase()
+    let change = parseFloat(iconMatch[2])
+    if (!Number.isFinite(change)) change = 0
+
+    // Derive sign from class name. "null" = flat, "red"/"down" = negative,
+    // everything else (green/up) = positive.
+    if (iconVariant === 'null') {
+      change = 0
+    } else if (iconVariant === 'red' || iconVariant === 'down') {
+      if (change > 0) change = -change
+    }
+    // iconGreen/iconUp: leave as-is (already positive or parsed as-is)
+
+    const instrument_id = NGX_TICKER_ALIASES[rawTicker] || rawTicker
+
+    // Dedup by instrument_id. Since we've restricted to companydirectory,
+    // there should now be at most one equity entry per symbol on the page,
+    // but keep the dedup as defence in depth.
+    if (!seen.has(instrument_id)) {
+      seen.set(instrument_id, {
+        instrument_id,
+        price,
+        day_change: change,
+        source: 'ngx',
+        fetched_at: fetchedAt,
+      })
+    }
+  }
+
+  return [...seen.values()]
+}
 
 // --------------------------------------------------------------
 // Primary: Direct scrape of NGX equities price list
@@ -66,58 +151,21 @@ export async function fetchNGXPrices(
     )
   }
 
-  // Each ticker entry looks like:
-  //   <a href="...?symbol=GTCO&directory=companydirectory" style="...">GTCO </a>
-  //   N123.45
-  //   <span class="iconNull">0.00 %</span>
-  //
-  // We capture from the URL `symbol=` (always clean, no bracket suffixes like [MRF])
-  // through to the percentage span text.
-  const re =
-    /<a\s+href="[^"]*\?symbol=([A-Z0-9_]+)&[^"]*"[^>]*>[\s\S]*?<\/a>\s*N([\d,]+\.?\d*)\s*<span\s+class="(iconNull|iconUp|iconDown)"[^>]*>\s*([-+]?\d+\.?\d*)\s*%/g
+  const allQuotes = parseNGXChunks(html)
 
-  const fetchedAt = new Date().toISOString()
-  const seen = new Map<string, Quote>()
-
-  let match: RegExpExecArray | null
-  while ((match = re.exec(html)) !== null) {
-    const rawTicker = match[1]
-    const price = parseFloat(match[2].replace(/,/g, ''))
-    const direction = match[3]
-    let change = parseFloat(match[4])
-
-    if (!Number.isFinite(price) || price <= 0) continue
-    if (!Number.isFinite(change)) change = 0
-    if (direction === 'iconDown' && change > 0) change = -change
-    if (direction === 'iconNull') change = 0
-
-    // Translate NGX-published ticker → our instrument_id
-    const instrument_id = NGX_TICKER_ALIASES[rawTicker] || rawTicker
-
-    // If caller supplied a whitelist (the instruments we actually hold),
-    // skip anything not in it. Prevents FK violations on market_prices insert
-    // (see pitfall #5) and avoids bloating the price table with 400+ rows.
-    if (validInstrumentIds && !validInstrumentIds.has(instrument_id)) continue
-
-    // Dedup — NGX repeats each ticker in up to 6 marquees; take the first.
-    if (!seen.has(instrument_id)) {
-      seen.set(instrument_id, {
-        instrument_id,
-        price,
-        day_change: change,
-        source: 'ngx',
-        fetched_at: fetchedAt,
-      })
-    }
-  }
-
-  if (seen.size === 0) {
+  if (allQuotes.length === 0) {
     throw new Error(
-      'NGX parse returned 0 quotes — regex may no longer match the page structure'
+      'NGX parse yielded 0 quotes — page structure may have changed, regex no longer matches'
     )
   }
 
-  return [...seen.values()]
+  // Apply caller-supplied whitelist AFTER parsing so the parse itself is
+  // independently diagnosable (count returned irrespective of holdings).
+  const filtered = validInstrumentIds
+    ? allQuotes.filter((q) => validInstrumentIds.has(q.instrument_id))
+    : allQuotes
+
+  return filtered
 }
 
 // --------------------------------------------------------------
@@ -136,10 +184,7 @@ export async function fetchFXRate(): Promise<number | null> {
 }
 
 // --------------------------------------------------------------
-// Alpha Vantage fallback (kept for back-compat; not used by default)
-// Alpha Vantage has tight rate limits (5 req/min free tier) so it's
-// impractical for 50+ tickers, but we keep the export so anything
-// importing this symbol elsewhere still compiles.
+// Alpha Vantage stub — kept for back-compat; not used in the primary path.
 // --------------------------------------------------------------
 export async function fetchAlphaVantage(
   symbol: string,
@@ -161,9 +206,7 @@ export async function fetchAlphaVantage(
 }
 
 // --------------------------------------------------------------
-// Aggregator — signature preserved for callers, implementation
-// swapped to NGX-direct. The old (apifyKey, alphaVantageKey) config
-// is ignored if passed; new callers should pass { validInstrumentIds }.
+// Aggregator — signature preserved for callers
 // --------------------------------------------------------------
 export async function fetchAllMarketData(config: {
   validInstrumentIds?: Set<string>
