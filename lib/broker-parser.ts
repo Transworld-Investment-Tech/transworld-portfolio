@@ -478,11 +478,18 @@ export async function parseStatementPdf(
     }
 
     // Balance / totals — tolerate the ₦ glyph or its absence.
-    // The number MUST have a decimal to be picked up (e.g. "59,956.50", ".00", "-295,625.00").
+    // The number MUST have a decimal to be picked up (e.g.
+    // "59,956.50", ".00", "-295,625.00").
     const amtRe = /(-?[\d,]*\.\d+)/
-    if (/^Opening Balance:/i.test(line)) {
-      const m = line.match(amtRe)
-      if (m) opening_balance = parseAmt(m[1])
+    // Opening Balance often appears MID-LINE because the broker's
+    // layout puts the account-holder name and opening balance on the
+    // same Y coordinate (hotfix-5). Match the label anywhere and
+    // pull the number that follows. [^\d-]* excludes the minus sign
+    // from the preamble so negative openings (e.g. CMFB 2022-23 at
+    // -295,625) parse correctly.
+    const openMatch = line.match(/Opening Balance:[^\d-]*(-?[\d,]*\.\d+)/i)
+    if (openMatch) {
+      opening_balance = parseAmt(openMatch[1])
       continue
     }
     if (/^Closing Balance:/i.test(line)) {
