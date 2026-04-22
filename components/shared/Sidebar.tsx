@@ -5,11 +5,10 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 
 // v20: Hybrid sidebar — navy #0a1f3a × muted gold text × Cormorant logo mark.
-// Replaces the legacy dark-purple sidebar. Structure matches
-// transworld-hybrid-design-v3-locked.html.
+// v21b-3b: Added "Broker files" entry to the admin section (/admin/broker).
 //
 // Footer shows a live staleness dot based on the most recent market_prices
-// row. "Fresh" if any price within 1 business day, "Stale" otherwise.
+// row. "Fresh" if any price within 3 days, "Stale" otherwise.
 
 interface SidebarProps {
   portfolioName?: string
@@ -66,6 +65,7 @@ export default function Sidebar({
     { href: '/', label: 'All portfolios', icon: '▦', exact: true },
     { href: '/admin', label: 'Admin panel', icon: '◉', exact: true },
     { href: '/admin/prices', label: 'Market prices', icon: '⟡' },
+    { href: '/admin/broker', label: 'Broker files', icon: '▣' },
     { href: '/watchlist', label: 'NGX Watchlist', icon: '❈' },
   ]
 

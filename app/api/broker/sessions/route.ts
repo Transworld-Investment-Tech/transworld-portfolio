@@ -1,5 +1,5 @@
 /**
- * app/api/broker/sessions/route.ts — v21b-3a
+ * app/api/broker/sessions/route.ts — v21b-3b
  *
  * GET /api/broker/sessions
  *   Returns recent broker upload sessions (grouped by upload_session_id)
@@ -9,24 +9,11 @@
  *     portfolio_id  (optional)  — filter to one portfolio
  *     limit         (optional)  — cap number of sessions returned (default 50)
  *
- * Response shape (success):
- *   {
- *     sessions: [
- *       {
- *         session_id: string,
- *         portfolio: { id, name, label, client: { code, name } } | null,
- *         upload_time: string (ISO, earliest created_at in the session),
- *         uploaded_by: string | null,
- *         file_count: number,
- *         kinds: { contract_notes: number, statement: number },
- *         parse_status: 'all_parsed' | 'mixed' | 'any_failed',
- *         all_balanced: boolean,  // true if every statement row audits clean
- *         staged_total: number,
- *         has_failed_audit: boolean,
- *       },
- *       ...
- *     ]
- *   }
+ * v21b-3b fix: staged_transactions.broker_file_id was erroneously
+ * referenced as source_file_id in v21b-3a (schema doc drift).
+ * Production column is broker_file_id. (transactions.source_file_id
+ * on the real transactions table IS correctly named — do not confuse
+ * the two.)
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -56,9 +43,6 @@ export async function GET(req: NextRequest) {
     const limitParam = url.searchParams.get('limit')
     const limit = limitParam ? Math.min(parseInt(limitParam, 10) || 50, 200) : 50
 
-    // Fetch recent broker_files with session_id, joined to portfolios + clients.
-    // We fetch more files than we need (limit*10) because each session may
-    // contain multiple files and we group client-side.
     let query = db
       .from('broker_files')
       .select(
@@ -91,12 +75,13 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ sessions: [] })
     }
 
-    // Fetch staged_transactions counts keyed by source_file_id, in a single call.
+    // Count staged rows per broker_file (column name is broker_file_id on
+    // staged_transactions — distinct from source_file_id on transactions).
     const allFileIds = fileList.map((f) => f.id)
     const { data: staged, error: stagedErr } = await db
       .from('staged_transactions')
-      .select('source_file_id')
-      .in('source_file_id', allFileIds)
+      .select('broker_file_id')
+      .in('broker_file_id', allFileIds)
     if (stagedErr) {
       return NextResponse.json(
         { error: `staged_transactions query: ${stagedErr.message}` },
@@ -106,12 +91,11 @@ export async function GET(req: NextRequest) {
 
     const stagedCountByFile = new Map<string, number>()
     for (const s of staged || []) {
-      const fid = (s as any).source_file_id as string | null
+      const fid = (s as any).broker_file_id as string | null
       if (!fid) continue
       stagedCountByFile.set(fid, (stagedCountByFile.get(fid) || 0) + 1)
     }
 
-    // Group by upload_session_id.
     type Session = {
       session_id: string
       portfolio: any
@@ -182,7 +166,6 @@ export async function GET(req: NextRequest) {
         }
       }
 
-      // upload_time is the EARLIEST created_at in the session
       if (new Date(f.created_at) < new Date(s.upload_time)) {
         s.upload_time = f.created_at
       }
@@ -190,7 +173,6 @@ export async function GET(req: NextRequest) {
       s.staged_total += stagedCountByFile.get(f.id) || 0
     }
 
-    // Sort sessions by upload_time desc, apply limit.
     const output = Array.from(sessions.values())
       .sort(
         (a, b) => new Date(b.upload_time).getTime() - new Date(a.upload_time).getTime()
@@ -206,9 +188,13 @@ export async function GET(req: NextRequest) {
         parse_status:
           s.parse_statuses.size === 1 && s.parse_statuses.has('parsed')
             ? 'all_parsed'
-            : s.parse_statuses.has('parse_failed')
-              ? 'any_failed'
-              : 'mixed',
+            : s.parse_statuses.size === 1 && s.parse_statuses.has('committed')
+              ? 'committed'
+              : s.parse_statuses.size === 1 && s.parse_statuses.has('rolled_back')
+                ? 'rolled_back'
+                : s.parse_statuses.has('parse_failed')
+                  ? 'any_failed'
+                  : 'mixed',
         all_balanced: s.has_audit_data ? s.all_balanced : true,
         staged_total: s.staged_total,
         has_failed_audit: s.has_failed_audit,

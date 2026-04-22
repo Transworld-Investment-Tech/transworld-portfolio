@@ -1,13 +1,22 @@
 /**
- * app/admin/broker/[sessionId]/page.tsx — v21b-3a
+ * app/admin/broker/[sessionId]/page.tsx — v21b-3b
  *
  * Full detail view for one upload session. Shows:
  *   - KPI tiles: file count, staged rows, audit status, parse status
+ *   - Commit + Rollback buttons with inline-confirm safety pattern
  *   - Files panel: every broker_file in the session with audit stats
- *   - Staged transactions table with recon_kind filter pills
+ *   - Staged transactions table with recon_kind filter pills,
+ *     per-row include_in_commit checkbox, audit warning banner
  *
- * Read-only in v21b-3a. Interactive controls (include_in_commit
- * toggle, commit, rollback) ship in v21b-3b.
+ * v21b-3b changes vs v21b-3a:
+ *   - TypeScript type renamed source_file_id → broker_file_id
+ *     (matches production column; v21b-3a docs drift fixed)
+ *   - Added include-in-commit checkboxes with PATCH optimistic UI
+ *   - Added Commit + Rollback buttons with 4-second inline confirm
+ *   - Disables Commit when session is already committed or when
+ *     parse failed on any file
+ *   - Disables Rollback unless session is committed
+ *   - Unbalanced-audit banner when any statement audit fails
  *
  * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
  * render its own (pitfall #38).
@@ -18,12 +27,12 @@
 
 'use client'
 
-import { use, useEffect, useMemo, useState } from 'react'
+import { use, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 
 type StagedRow = {
   id: string
-  source_file_id: string
+  broker_file_id: string
   trade_date: string | null
   settlement_date: string | null
   action: string
@@ -32,7 +41,6 @@ type StagedRow = {
   price: number | null
   gross_value: number | null
   amount: number | null
-  fees: number | null
   fee_commission: number | null
   fee_vat: number | null
   fee_contract_stamp: number | null
@@ -43,7 +51,6 @@ type StagedRow = {
   fee_management: number | null
   fee_demat: number | null
   fee_other: number | null
-  broker: string | null
   cn_number: string | null
   external_ref: string | null
   narration: string | null
@@ -51,7 +58,6 @@ type StagedRow = {
   recon_note: string | null
   dedup_status: string
   include_in_commit: boolean
-  notes: string | null
   created_at: string
 }
 
@@ -89,6 +95,7 @@ type SessionDetail = {
     } | null
     upload_time: string
     uploaded_by: string | null
+    status: 'parsed' | 'committed' | 'rolled_back' | 'parse_failed' | 'mixed'
   }
   files: FileRow[]
   staged: StagedRow[]
@@ -122,7 +129,6 @@ const RECON_KIND_LABELS: Record<string, string> = {
 function reconKindPillClass(kind: string): string {
   switch (kind) {
     case 'matched_exact':
-      return 'pill pill-ok'
     case 'matched_split':
       return 'pill pill-ok'
     case 'partial_mismatch':
@@ -203,8 +209,92 @@ function totalFee(row: StagedRow): number | null {
     row.fee_other,
   ]
   const nonNull = parts.filter((p): p is number => p !== null && p !== undefined)
-  if (nonNull.length === 0) return row.fees
+  if (nonNull.length === 0) return null
   return nonNull.reduce((a, b) => a + b, 0)
+}
+
+// ─── Inline confirm button ──────────────────────────────────────
+// Click once → "Click again to confirm" for 4s. Click within that
+// window → fire action. No modal, matches hybrid aesthetic.
+type ConfirmState = 'idle' | 'confirming' | 'running'
+
+function ConfirmButton({
+  label,
+  confirmLabel,
+  runningLabel,
+  onConfirm,
+  disabled,
+  disabledHint,
+  variant = 'primary',
+}: {
+  label: string
+  confirmLabel: string
+  runningLabel: string
+  onConfirm: () => Promise<void>
+  disabled?: boolean
+  disabledHint?: string
+  variant?: 'primary' | 'secondary' | 'danger'
+}) {
+  const [state, setState] = useState<ConfirmState>('idle')
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (timerRef.current) clearTimeout(timerRef.current)
+    }
+  }, [])
+
+  function handleClick() {
+    if (disabled || state === 'running') return
+    if (state === 'idle') {
+      setState('confirming')
+      timerRef.current = setTimeout(() => setState('idle'), 4000)
+      return
+    }
+    if (state === 'confirming') {
+      if (timerRef.current) clearTimeout(timerRef.current)
+      setState('running')
+      onConfirm().finally(() => setState('idle'))
+    }
+  }
+
+  const baseClass =
+    variant === 'primary'
+      ? 'btn-h btn-h-primary'
+      : variant === 'danger'
+        ? 'btn-h'
+        : 'btn-h'
+
+  const bg =
+    state === 'confirming'
+      ? variant === 'danger'
+        ? 'var(--neg)'
+        : 'var(--gold)'
+      : undefined
+  const color = state === 'confirming' ? '#fff' : undefined
+  const borderColor = state === 'confirming' ? 'transparent' : undefined
+
+  const text =
+    state === 'running' ? runningLabel : state === 'confirming' ? confirmLabel : label
+
+  return (
+    <button
+      className={baseClass}
+      onClick={handleClick}
+      disabled={disabled || state === 'running'}
+      title={disabled && disabledHint ? disabledHint : undefined}
+      style={{
+        background: bg,
+        color,
+        borderColor,
+        opacity: disabled ? 0.45 : 1,
+        cursor: disabled ? 'not-allowed' : state === 'running' ? 'wait' : 'pointer',
+        transition: 'background 0.15s, color 0.15s',
+      }}
+    >
+      {text}
+    </button>
+  )
 }
 
 export default function BrokerSessionDetailPage(props: {
@@ -214,28 +304,31 @@ export default function BrokerSessionDetailPage(props: {
   const [data, setData] = useState<SessionDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [filterKind, setFilterKind] = useState<string | 'all'>('all')
+  const [notice, setNotice] = useState<{
+    kind: 'ok' | 'error'
+    text: string
+  } | null>(null)
+
+  async function load() {
+    try {
+      const res = await fetch(`/api/broker/sessions/${sessionId}`, {
+        cache: 'no-store',
+      })
+      const j = await res.json()
+      if (!res.ok) {
+        setError(j.error || `HTTP ${res.status}`)
+        return
+      }
+      setData(j as SessionDetail)
+      setError(null)
+    } catch (err: any) {
+      setError(err.message || 'Network error')
+    }
+  }
 
   useEffect(() => {
-    let cancelled = false
-    async function load() {
-      try {
-        const res = await fetch(`/api/broker/sessions/${sessionId}`)
-        const j = await res.json()
-        if (cancelled) return
-        if (!res.ok) {
-          setError(j.error || `HTTP ${res.status}`)
-          return
-        }
-        setData(j as SessionDetail)
-      } catch (err: any) {
-        if (cancelled) return
-        setError(err.message || 'Network error')
-      }
-    }
     load()
-    return () => {
-      cancelled = true
-    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
 
   const filteredStaged = useMemo(() => {
@@ -243,6 +336,86 @@ export default function BrokerSessionDetailPage(props: {
     if (filterKind === 'all') return data.staged
     return data.staged.filter((s) => s.recon_kind === filterKind)
   }, [data, filterKind])
+
+  async function toggleRow(rowId: string, next: boolean) {
+    if (!data) return
+    // Optimistic update
+    const snapshot = data.staged
+    setData({
+      ...data,
+      staged: data.staged.map((s) =>
+        s.id === rowId ? { ...s, include_in_commit: next } : s
+      ),
+    })
+    try {
+      const res = await fetch(`/api/broker/staged/${rowId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ include_in_commit: next }),
+      })
+      if (!res.ok) {
+        const j = await res.json().catch(() => ({}))
+        throw new Error(j.error || `HTTP ${res.status}`)
+      }
+    } catch (err: any) {
+      // Revert on failure
+      setData((prev) =>
+        prev ? { ...prev, staged: snapshot } : prev
+      )
+      setNotice({ kind: 'error', text: `Toggle failed: ${err.message}` })
+      setTimeout(() => setNotice(null), 6000)
+    }
+  }
+
+  async function handleCommit() {
+    setNotice(null)
+    try {
+      const res = await fetch(`/api/broker/sessions/${sessionId}/commit`, {
+        method: 'POST',
+      })
+      const j = await res.json()
+      if (!res.ok) {
+        setNotice({ kind: 'error', text: j.error || `HTTP ${res.status}` })
+        setTimeout(() => setNotice(null), 8000)
+        return
+      }
+      setNotice({
+        kind: 'ok',
+        text: `Committed ${j.committed} transaction${j.committed === 1 ? '' : 's'}${
+          j.skipped > 0 ? ` · ${j.skipped} skipped` : ''
+        }`,
+      })
+      await load()
+      setTimeout(() => setNotice(null), 6000)
+    } catch (err: any) {
+      setNotice({ kind: 'error', text: err.message || 'Network error' })
+      setTimeout(() => setNotice(null), 8000)
+    }
+  }
+
+  async function handleRollback() {
+    setNotice(null)
+    try {
+      const res = await fetch(`/api/broker/sessions/${sessionId}/rollback`, {
+        method: 'POST',
+      })
+      const j = await res.json()
+      if (!res.ok) {
+        setNotice({ kind: 'error', text: j.error || `HTTP ${res.status}` })
+        setTimeout(() => setNotice(null), 8000)
+        return
+      }
+      setNotice({
+        kind: 'ok',
+        text: `Rolled back — ${j.transactions_deleted} transaction${j.transactions_deleted === 1 ? '' : 's'} deleted`,
+      })
+      await load()
+      setTimeout(() => setNotice(null), 6000)
+    } catch (err: any) {
+      setNotice({ kind: 'error', text: err.message || 'Network error' })
+      setTimeout(() => setNotice(null), 8000)
+    }
+  }
 
   if (error) {
     return (
@@ -281,10 +454,39 @@ export default function BrokerSessionDetailPage(props: {
     (f) => f.kind === 'statement' && f.audit
   )
 
+  const sessionStatus = data.session.status
+  const anyParseFailed = data.files.some((f) => f.parse_status === 'parse_failed')
+  const isCommitted = sessionStatus === 'committed'
+  const canCommit =
+    !isCommitted &&
+    !anyParseFailed &&
+    data.summary.staged_count > 0 &&
+    data.staged.some((s) => s.include_in_commit)
+  const canRollback = isCommitted
+
+  const commitDisabledHint = isCommitted
+    ? 'Already committed — rollback first to re-commit'
+    : anyParseFailed
+      ? 'At least one file failed to parse — fix or exclude before committing'
+      : data.summary.staged_count === 0
+        ? 'No staged rows to commit'
+        : !data.staged.some((s) => s.include_in_commit)
+          ? 'No rows are marked for commit'
+          : undefined
+
+  const rollbackDisabledHint = !isCommitted
+    ? 'Nothing to roll back — session is not committed'
+    : undefined
+
+  const includedCount = data.staged.filter((s) => s.include_in_commit).length
+
   return (
     <div className="hybrid-page">
-      <div className="page-head">
-        <div>
+      <div
+        className="page-head"
+        style={{ alignItems: 'flex-end', gap: 16 }}
+      >
+        <div style={{ flex: 1 }}>
           <div className="eyebrow">
             <Link
               href="/admin/broker"
@@ -314,7 +516,40 @@ export default function BrokerSessionDetailPage(props: {
             </span>
           </div>
         </div>
+        <div style={{ display: 'flex', gap: 8, flexShrink: 0 }}>
+          <ConfirmButton
+            label="Roll back"
+            confirmLabel="Click again to roll back"
+            runningLabel="Rolling back…"
+            onConfirm={handleRollback}
+            disabled={!canRollback}
+            disabledHint={rollbackDisabledHint}
+            variant="danger"
+          />
+          <ConfirmButton
+            label={`Commit ${includedCount || ''} to transactions`.trim()}
+            confirmLabel="Click again to commit"
+            runningLabel="Committing…"
+            onConfirm={handleCommit}
+            disabled={!canCommit}
+            disabledHint={commitDisabledHint}
+            variant="primary"
+          />
+        </div>
       </div>
+
+      {notice && (
+        <div
+          className={
+            notice.kind === 'ok'
+              ? 'alert-h alert-h-info'
+              : 'alert-h alert-h-critical'
+          }
+          style={{ marginBottom: 20 }}
+        >
+          {notice.text}
+        </div>
+      )}
 
       {/* KPI row */}
       <div
@@ -338,7 +573,9 @@ export default function BrokerSessionDetailPage(props: {
           <div className="h-kpi-value">
             {data.summary.staged_count.toLocaleString()}
           </div>
-          <div className="h-kpi-sub">Read-only preview</div>
+          <div className="h-kpi-sub">
+            {includedCount.toLocaleString()} marked for commit
+          </div>
         </div>
         <div className="h-kpi">
           <div className="h-kpi-label">Audit</div>
@@ -355,18 +592,29 @@ export default function BrokerSessionDetailPage(props: {
           </div>
         </div>
         <div className="h-kpi">
-          <div className="h-kpi-label">Parse status</div>
-          <div className="h-kpi-value">
-            {data.files.every((f) => f.parse_status === 'parsed')
-              ? 'All parsed'
-              : 'Mixed'}
+          <div className="h-kpi-label">Status</div>
+          <div className="h-kpi-value" style={{ textTransform: 'capitalize' }}>
+            {sessionStatus.replace('_', ' ')}
           </div>
           <div className="h-kpi-sub">
-            {data.files.filter((f) => f.parse_status === 'parse_failed').length}{' '}
-            failed
+            {isCommitted
+              ? 'Transactions live'
+              : anyParseFailed
+                ? 'Parse errors — review'
+                : 'Preview only'}
           </div>
         </div>
       </div>
+
+      {/* Unbalanced audit warning */}
+      {auditedStatements.length > 0 && !data.summary.all_balanced && (
+        <div className="alert-h alert-h-warn" style={{ marginBottom: 20 }}>
+          <strong>Audit unbalanced.</strong> At least one statement's computed
+          closing balance does not match its asserted closing balance. Review
+          the Files panel below before committing — discrepancies often
+          indicate a missing statement or unmapped cash event.
+        </div>
+      )}
 
       {/* Files panel */}
       <div className="panel" style={{ marginBottom: 20 }}>
@@ -472,6 +720,7 @@ export default function BrokerSessionDetailPage(props: {
           <div className="panel-meta">
             {filteredStaged.length.toLocaleString()} of{' '}
             {data.summary.staged_count.toLocaleString()} shown
+            {isCommitted && ' · read-only (committed)'}
           </div>
         </div>
 
@@ -524,6 +773,14 @@ export default function BrokerSessionDetailPage(props: {
             <table className="h-table">
               <thead>
                 <tr>
+                  <th style={{ width: 36 }}>
+                    <span
+                      style={{ fontSize: 10, color: 'var(--text-3)' }}
+                      title="Include in commit"
+                    >
+                      ✓
+                    </span>
+                  </th>
                   <th>Date</th>
                   <th>CN #</th>
                   <th>Action</th>
@@ -538,7 +795,31 @@ export default function BrokerSessionDetailPage(props: {
               </thead>
               <tbody>
                 {filteredStaged.map((s) => (
-                  <tr key={s.id}>
+                  <tr
+                    key={s.id}
+                    style={{
+                      opacity: s.include_in_commit ? 1 : 0.55,
+                    }}
+                  >
+                    <td style={{ textAlign: 'center' }}>
+                      <input
+                        type="checkbox"
+                        checked={s.include_in_commit}
+                        disabled={isCommitted}
+                        onChange={(e) => toggleRow(s.id, e.target.checked)}
+                        style={{
+                          cursor: isCommitted ? 'not-allowed' : 'pointer',
+                          accentColor: 'var(--gold)',
+                        }}
+                        title={
+                          isCommitted
+                            ? 'Session already committed'
+                            : s.include_in_commit
+                              ? 'Included — click to exclude'
+                              : 'Excluded — click to include'
+                        }
+                      />
+                    </td>
                     <td style={{ whiteSpace: 'nowrap' }}>{fmtDate(s.trade_date)}</td>
                     <td style={{ fontSize: 11, fontFamily: 'monospace' }}>
                       {s.cn_number ? (
@@ -567,9 +848,7 @@ export default function BrokerSessionDetailPage(props: {
                     <td className="num num-serif">
                       {s.price !== null ? fmtNum(s.price) : '—'}
                     </td>
-                    <td className="num num-serif">
-                      {fmtNum(totalFee(s))}
-                    </td>
+                    <td className="num num-serif">{fmtNum(totalFee(s))}</td>
                     <td className="num num-serif">
                       {s.amount !== null
                         ? fmtNaira(s.amount)

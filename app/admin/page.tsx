@@ -4,11 +4,11 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import {
   Users, BarChart3, FileText, Settings,
-  PlusCircle, ChevronRight, Upload, LineChart,
+  PlusCircle, ChevronRight, Upload, LineChart, Inbox,
 } from 'lucide-react'
 
 // v20e: Hybrid rewrite of the admin dashboard.
-// Stats cards, quick actions, and recent-reports list — preserves all links.
+// v21b-3b: Added "Broker files" card linking to /admin/broker.
 
 type QuickAction = {
   href: string
@@ -41,9 +41,10 @@ export default function AdminPage() {
     { href: '/admin/clients/new',    icon: <PlusCircle size={14} />, label: 'Add client',           sub: 'Onboard a new discretionary mandate',          accent: 'var(--gold)' },
     { href: '/admin/portfolios/new', icon: <BarChart3 size={14} />,  label: 'New portfolio',        sub: 'Create portfolio A/B/C/D for a client',        accent: 'var(--pos)' },
     { href: '/admin/prices',         icon: <LineChart size={14} />,  label: 'Market prices',        sub: 'View, refresh & manually override NGX prices', accent: 'var(--warn)' },
+    { href: '/admin/broker',         icon: <Inbox size={14} />,      label: 'Broker files',         sub: 'Review & commit monthly broker PDFs',          accent: 'var(--gold-bright)' },
     { href: '/admin/settings',       icon: <Settings size={14} />,   label: 'Settings',             sub: 'API keys, Apify, Anthropic',                   accent: 'var(--sidebar-bg)' },
     { href: '/admin/reports',        icon: <FileText size={14} />,   label: 'All reports',          sub: 'View & download generated reports',            accent: 'var(--neg)' },
-    { href: '/admin/import',         icon: <Upload size={14} />,     label: 'Import transactions',  sub: 'Upload CSV/Excel from broker system',          accent: 'var(--gold-bright)' },
+    { href: '/admin/import',         icon: <Upload size={14} />,     label: 'Import transactions',  sub: 'Upload CSV/Excel (historical reconstruction)', accent: 'var(--gold)' },
   ]
 
   const statCards = [

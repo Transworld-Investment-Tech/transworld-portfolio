@@ -1,40 +1,13 @@
 /**
- * app/api/broker/sessions/[id]/route.ts — v21b-3a
+ * app/api/broker/sessions/[id]/route.ts — v21b-3b
  *
  * GET /api/broker/sessions/[id]
- *   Returns full detail for a single upload session:
- *     - session metadata
- *     - all broker_files in the session (with parse results + audit stats)
- *     - all staged_transactions across those files
+ *   Returns full detail for a single upload session.
  *
- * Response shape (success):
- *   {
- *     session: {
- *       session_id,
- *       portfolio: { id, name, label, client },
- *       upload_time,
- *       uploaded_by,
- *     },
- *     files: [
- *       {
- *         id, kind, filename, parse_status, parse_error,
- *         account_holder, cscs_number,
- *         period_from, period_to,
- *         audit: { opening, closing, computed, passes } | null,
- *         size_bytes, created_at
- *       }
- *     ],
- *     staged: [
- *       { ...staged_transactions row, portfolio_id omitted }
- *     ],
- *     summary: {
- *       file_count,
- *       staged_count,
- *       by_recon_kind: { [kind]: number },
- *       by_action: { [action]: number },
- *       all_balanced: boolean,
- *     }
- *   }
+ * v21b-3b fix: staged_transactions.broker_file_id was erroneously
+ * referenced as source_file_id in v21b-3a. Production column is
+ * broker_file_id. The response shape now includes broker_file_id
+ * on each staged row (renamed from source_file_id).
  *
  * Next.js 15 note: params is a Promise — must await.
  */
@@ -70,7 +43,6 @@ export async function GET(
 
     const db = admin()
 
-    // 1. Fetch all broker_files in the session.
     const { data: filesData, error: filesErr } = await db
       .from('broker_files')
       .select(
@@ -105,7 +77,6 @@ export async function GET(
       )
     }
 
-    // Derive session metadata from the first file.
     const firstFile = files[0]
     const portfolio = firstFile.portfolios
       ? {
@@ -122,22 +93,22 @@ export async function GET(
 
     const fileIds = files.map((f) => f.id)
 
-    // 2. Fetch all staged_transactions for these files.
+    // staged_transactions links via broker_file_id (not source_file_id).
     const { data: stagedData, error: stagedErr } = await db
       .from('staged_transactions')
       .select(
-        `id, source_file_id, trade_date, settlement_date,
+        `id, broker_file_id, trade_date, settlement_date,
          action, instrument_id, quantity, price,
          gross_value, amount,
-         fees, fee_commission, fee_vat, fee_contract_stamp,
+         fee_commission, fee_vat, fee_contract_stamp,
          fee_exchange, fee_clearing, fee_sec, fee_sms,
          fee_management, fee_demat, fee_other,
-         broker, cn_number, external_ref, narration,
+         cn_number, external_ref, narration,
          recon_kind, recon_note,
          dedup_status, duplicate_of, include_in_commit,
-         notes, created_at`
+         created_at`
       )
-      .in('source_file_id', fileIds)
+      .in('broker_file_id', fileIds)
       .order('trade_date', { ascending: true })
       .order('created_at', { ascending: true })
 
@@ -150,7 +121,6 @@ export async function GET(
 
     const staged = (stagedData || []) as any[]
 
-    // 3. Build summary.
     const by_recon_kind: Record<string, number> = {}
     const by_action: Record<string, number> = {}
     for (const s of staged) {
@@ -165,7 +135,6 @@ export async function GET(
       statementsWithAudit.length === 0 ||
       statementsWithAudit.every((f) => f.audit_passes === true)
 
-    // 4. Shape file output.
     const filesOut = files.map((f) => ({
       id: f.id,
       kind: f.file_kind,
@@ -195,12 +164,27 @@ export async function GET(
       parsed_at: f.parsed_at,
     }))
 
+    // Derive session-level status from files' parse_status set.
+    const parseStatusSet = new Set(files.map((f) => f.parse_status))
+    let session_status: 'parsed' | 'committed' | 'rolled_back' | 'parse_failed' | 'mixed'
+    if (parseStatusSet.size === 1) {
+      const only = Array.from(parseStatusSet)[0]
+      if (only === 'parsed') session_status = 'parsed'
+      else if (only === 'committed') session_status = 'committed'
+      else if (only === 'rolled_back') session_status = 'rolled_back'
+      else if (only === 'parse_failed') session_status = 'parse_failed'
+      else session_status = 'mixed'
+    } else {
+      session_status = 'mixed'
+    }
+
     return NextResponse.json({
       session: {
         session_id,
         portfolio,
         upload_time: uploadTime,
         uploaded_by: firstFile.uploaded_by,
+        status: session_status,
       },
       files: filesOut,
       staged,
