@@ -409,7 +409,7 @@ export default function PortfolioOverviewPage() {
           <div className="panel-header">
             <div className="panel-title">Rebalancing Guide</div>
             <div className="panel-meta">
-              Based on targets · {fmt.date(portfolio.valuation_date ?? portfolio.start_date)}
+              Based on targets · {fmt.date((portfolio as any).valuation_date ?? portfolio.start_date)}
             </div>
           </div>
           <table className="h-table">
