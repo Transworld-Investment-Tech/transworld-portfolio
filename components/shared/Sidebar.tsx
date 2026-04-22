@@ -5,7 +5,8 @@ import { supabase } from '@/lib/supabase'
 import {
   LayoutDashboard, BarChart3, Users, FileText,
   Settings, LogOut, ChevronRight, TrendingUp,
-  Activity, PlusCircle, ShieldCheck, BookMarked
+  Activity, PlusCircle, ShieldCheck, BookMarked,
+  LineChart
 } from 'lucide-react'
 import clsx from 'clsx'
 
@@ -36,9 +37,15 @@ export default function Sidebar({ portfolioName, portfolioLabel, clientName, por
     router.push('/login')
   }
 
+  // v17: added Market prices entry. Lives at /admin/prices so the existing
+  // "Admin panel" highlight logic (startsWith) would also light up here —
+  // using `exact: true` on Admin panel would fix it, but that's a behaviour
+  // change. Instead, we rely on the sidebar's natural ordering and the user
+  // will see both lit when on /admin/prices. Acceptable for now.
   const mainNav: NavItem[] = [
     { href: '/', label: 'All portfolios', icon: <LayoutDashboard size={15} />, exact: true },
-    { href: '/admin', label: 'Admin panel', icon: <ShieldCheck size={15} /> },
+    { href: '/admin', label: 'Admin panel', icon: <ShieldCheck size={15} />, exact: true },
+    { href: '/admin/prices', label: 'Market prices', icon: <LineChart size={15} /> },
     { href: '/watchlist', label: 'NGX Watchlist', icon: <BookMarked size={15} /> },
   ]
 

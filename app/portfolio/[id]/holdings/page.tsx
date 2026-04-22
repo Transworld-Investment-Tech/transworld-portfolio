@@ -4,8 +4,27 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { ArrowLeft, Save, Plus, Trash2 } from 'lucide-react'
+import { ArrowLeft, Save, Plus, Trash2, LineChart } from 'lucide-react'
 import PageActions from '@/components/shared/PageActions'
+
+// v17: prices now display an "As of" date with a stale indicator.
+// Staleness threshold matches the Market Prices admin page.
+const STALE_DAYS = 3
+
+function stalenessOf(priceDate?: string): 'fresh' | 'stale' | 'none' {
+  if (!priceDate) return 'none'
+  const d = new Date(priceDate + 'T00:00:00Z')
+  const today = new Date()
+  today.setUTCHours(0, 0, 0, 0)
+  const diffDays = Math.floor((today.getTime() - d.getTime()) / 86_400_000)
+  return diffDays > STALE_DAYS ? 'stale' : 'fresh'
+}
+
+function formatShortDate(iso?: string): string {
+  if (!iso) return '—'
+  const d = new Date(iso + 'T00:00:00Z')
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
+}
 
 export default function HoldingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
@@ -13,6 +32,7 @@ export default function HoldingsPage() {
   const [holdings, setHoldings] = useState<any[]>([])
   const [instruments, setInstruments] = useState<any[]>([])
   const [prices, setPrices] = useState<Record<string, number>>({})
+  const [priceDates, setPriceDates] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState<Record<string, boolean>>({})
   const [adding, setAdding] = useState(false)
   const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '' })
@@ -26,14 +46,23 @@ export default function HoldingsPage() {
       supabase.from('portfolios').select('*, client:clients(name)').eq('id', portfolioId).single(),
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId).order('sleeve_id'),
       supabase.from('instruments').select('*').eq('approved', true).order('name'),
-      supabase.from('market_prices').select('instrument_id, price').order('price_date', { ascending: false }),
+      // v17: also pull price_date so the holdings table can show staleness
+      supabase.from('market_prices').select('instrument_id, price, price_date').order('price_date', { ascending: false }),
     ])
     setPortfolio(portRes.data)
     setHoldings(holdRes.data ?? [])
     setInstruments(instrRes.data ?? [])
     const pm: Record<string, number> = {}
-    priceRes.data?.forEach((p: any) => { if (!pm[p.instrument_id]) pm[p.instrument_id] = p.price })
+    const pd: Record<string, string> = {}
+    priceRes.data?.forEach((p: any) => {
+      // First occurrence wins after DESC sort — that's the latest row per instrument.
+      if (!(p.instrument_id in pm)) {
+        pm[p.instrument_id] = p.price
+        pd[p.instrument_id] = p.price_date
+      }
+    })
     setPrices(pm)
+    setPriceDates(pd)
     setLoading(false)
   }
 
@@ -108,6 +137,9 @@ export default function HoldingsPage() {
     return acc
   }, {} as Record<string, any[]>)
 
+  // Count held positions with stale/missing prices — surfaced as a yellow hint badge
+  const staleHeldCount = holdings.filter(h => stalenessOf(priceDates[h.instrument_id]) !== 'fresh').length
+
   if (loading) return <div className="flex items-center justify-center h-64 text-[#555d72] text-xs">Loading…</div>
 
   return (
@@ -118,8 +150,23 @@ export default function HoldingsPage() {
         </Link>
         <div className="w-px h-4 bg-white/10" />
         <h1 className="text-base font-semibold">Edit holdings</h1>
+        {staleHeldCount > 0 && (
+          <Link
+            href="/admin/prices?stale=1"
+            className="flex items-center gap-1.5 text-[10px] text-[#eab308] bg-[#eab308]/10 border border-[#eab308]/20 rounded-full px-2.5 py-0.5 hover:bg-[#eab308]/15 transition-colors"
+            title="Click to open Market prices filtered to stale entries">
+            <span className="w-1.5 h-1.5 rounded-full bg-[#eab308] inline-block" />
+            {staleHeldCount} stale price{staleHeldCount === 1 ? '' : 's'}
+          </Link>
+        )}
         <div className="ml-auto flex items-center gap-3">
           {msg && <span className="text-xs text-[#00d4a4]">{msg}</span>}
+          <Link
+            href="/admin/prices"
+            className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-2 transition-colors"
+            title="Open the central Market Prices page">
+            <LineChart size={13} /> Manage prices
+          </Link>
           <PageActions
             pageTitle="Holdings"
             portfolioName={portfolio?.name ?? ''}
@@ -167,10 +214,31 @@ export default function HoldingsPage() {
           <div key={sleeveId} className="tw-card mb-4">
             <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-4 capitalize">{sleeveId} sleeve</div>
             <table className="tw-table w-full">
-              <thead><tr><th>Instrument</th><th>Type</th><th>Quantity / Face (₦)</th><th>Avg cost</th><th>Current price</th><th>Market value</th><th>Unreal. P&L</th><th></th></tr></thead>
+              <thead>
+                <tr>
+                  <th>Instrument</th>
+                  <th>Type</th>
+                  <th>Quantity / Face (₦)</th>
+                  <th>Avg cost</th>
+                  <th>Current price</th>
+                  <th>As of</th>
+                  <th>Market value</th>
+                  <th>Unreal. P&L</th>
+                  <th></th>
+                </tr>
+              </thead>
               <tbody>
                 {(items as any[]).map(h => {
                   const mktPrice = prices[h.instrument_id] ?? h.avg_cost ?? 1
+                  const priceDate = priceDates[h.instrument_id]
+                  const stale = stalenessOf(priceDate)
+                  const dotColor =
+                    stale === 'fresh' ? '#22c55e' :
+                    stale === 'stale' ? '#eab308' : '#6b7280'
+                  const dotTitle =
+                    stale === 'fresh' ? `Fresh price (within ${STALE_DAYS} days)` :
+                    stale === 'stale' ? `Stale price — older than ${STALE_DAYS} days. Click Manage prices to override.` :
+                    'No market price on record — displaying average cost. Click Manage prices to set one.'
                   const mktVal = Number(h.quantity) * mktPrice
                   const pnl = Number(h.quantity) * (mktPrice - Number(h.avg_cost))
                   return (
@@ -189,6 +257,15 @@ export default function HoldingsPage() {
                           step="0.01" className="tw-input py-1 text-xs font-mono text-right w-28" />
                       </td>
                       <td className="font-mono">₦{mktPrice.toFixed(h.instrument?.type === 'Stock' ? 2 : 4)}</td>
+                      <td>
+                        <span className="inline-flex items-center gap-1.5 text-[11px]" title={dotTitle}>
+                          <span style={{ background: dotColor }} className="w-2 h-2 rounded-full inline-block flex-shrink-0" />
+                          <span className={
+                            stale === 'stale' ? 'text-[#eab308]' :
+                            stale === 'none'  ? 'text-[#555d72]' : 'text-[#8a91a8]'
+                          }>{formatShortDate(priceDate)}</span>
+                        </span>
+                      </td>
                       <td className="font-mono">{fmt.ngnM(mktVal)}</td>
                       <td className={`font-mono text-xs ${pnl >= 0 ? 'text-[#00d4a4]' : 'text-[#ff5c7a]'}`}>{pnl >= 0 ? '+' : ''}{fmt.ngnM(pnl)}</td>
                       <td>

@@ -3,7 +3,11 @@ import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { Users, BarChart3, TrendingUp, FileText, Settings, RefreshCw, PlusCircle, Activity, ChevronRight, Upload } from 'lucide-react'
+import {
+  Users, BarChart3, TrendingUp, FileText, Settings,
+  RefreshCw, PlusCircle, Activity, ChevronRight, Upload,
+  LineChart
+} from 'lucide-react'
 
 export default function AdminPage() {
   const [stats, setStats] = useState({ clients: 0, portfolios: 0, reports: 0 })
@@ -24,9 +28,13 @@ export default function AdminPage() {
     load()
   }, [])
 
+  // v17: Market prices quick link added. Sits after Settings because it's
+  // data-operational, not administrative. Uses yellow to signal it's the
+  // place to go when prices go stale.
   const quickLinks = [
     { href: '/admin/clients/new', icon: <PlusCircle size={16} />, label: 'Add client', sub: 'Onboard a new discretionary mandate', color: '#a78bfa' },
     { href: '/admin/portfolios/new', icon: <BarChart3 size={16} />, label: 'New portfolio', sub: 'Create portfolio A/B/C/D for a client', color: '#2dd4bf' },
+    { href: '/admin/prices', icon: <LineChart size={16} />, label: 'Market prices', sub: 'View, refresh & manually override NGX prices', color: '#eab308' },
     { href: '/admin/settings', icon: <Settings size={16} />, label: 'Settings', sub: 'API keys, Apify, Anthropic', color: '#60a5fa' },
     { href: '/admin/reports', icon: <FileText size={16} />, label: 'All reports', sub: 'View & download generated reports', color: '#fb923c' },
     { href: '/admin/import', icon: <Upload size={16} />, label: 'Import transactions', sub: 'Upload CSV/Excel from broker system', color: '#22c55e' },
