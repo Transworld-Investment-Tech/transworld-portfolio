@@ -1,18 +1,10 @@
 'use client'
 import { useRef, useEffect } from 'react'
 import { Chart, ArcElement, Tooltip, DoughnutController } from 'chart.js'
-import { fmt } from '@/lib/portfolio'
+import { fmt, colorForSleeve } from '@/lib/portfolio'
 
-// v20: Hybrid-palette composition donut. Hardcoded sleeve colors override
-// whatever SLEEVE_COLOURS in lib/portfolio ships with, so this component
-// always renders on-brand regardless of legacy values. When lib/portfolio
-// is rewritten in v20b/v20c, this map can be removed.
-const HYBRID_SLEEVE_COLORS: Record<string, string> = {
-  liq: '#0a1f3a', // navy
-  eq:  '#b08b3e', // muted gold
-  fi:  '#2d6e4e', // muted green
-}
-const FALLBACK_PALETTE = ['#b08b3e', '#0a1f3a', '#2d6e4e', '#a67c2a', '#c9a556']
+// v20g: Local HYBRID_SLEEVE_COLORS / FALLBACK_PALETTE constants removed.
+// Colours now come from lib/portfolio.ts (single source of truth).
 
 Chart.register(ArcElement, Tooltip, DoughnutController)
 
@@ -23,10 +15,6 @@ interface Sleeve {
   act: number
   target_pct: number
   status: string
-}
-
-function colorForSleeve(id: string, idx: number): string {
-  return HYBRID_SLEEVE_COLORS[id] ?? FALLBACK_PALETTE[idx % FALLBACK_PALETTE.length]
 }
 
 export default function AllocationDonut({

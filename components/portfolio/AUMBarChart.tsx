@@ -1,19 +1,10 @@
 'use client'
 import { useRef, useEffect } from 'react'
 import { Chart, BarElement, CategoryScale, LinearScale, Tooltip, BarController } from 'chart.js'
+import { HYBRID_PALETTE } from '@/lib/portfolio'
 
-// v20: Hybrid-palette AUM bar chart. Hardcoded gradient palette overrides
-// the legacy SLEEVE_COLOURS import so the chart always matches the
-// hybrid brand. Deletion candidate once all portfolio colors are
-// centralised in v20c.
-const HYBRID_PALETTE = [
-  '#b08b3e', // gold (primary brand)
-  '#0a1f3a', // navy
-  '#2d6e4e', // green
-  '#c9a556', // gold-bright
-  '#a67c2a', // warn gold
-  '#5c6573', // text-2 slate
-]
+// v20g: Local HYBRID_PALETTE constant removed — now imported from
+// lib/portfolio.ts (single source of truth alongside HYBRID_SLEEVE_COLORS).
 
 Chart.register(BarElement, CategoryScale, LinearScale, Tooltip, BarController)
 

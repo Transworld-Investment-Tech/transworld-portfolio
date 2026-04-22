@@ -4,6 +4,13 @@ import { computeNAV, computeSleeveData, complianceAlerts, fmt } from '@/lib/port
 import { calculateIRR, buildCashFlows, calcPeriodReturn, BENCHMARKS } from '@/lib/analytics'
 import { generateHTMLReport } from '@/lib/html-report'
 
+// v20g fix: complianceAlerts() was being called with arguments 2 and 3
+// swapped. The signature is (portfolio, holdings, sleeveData, totalNAV)
+// but this route was passing (portfolio, sleeveDefs, holdings, totalNAV).
+// Both loops inside complianceAlerts were iterating the wrong shape, so
+// the PDF export has been silently producing an empty alerts array for
+// as long as this code has existed. See pitfall #37 in 04_pitfalls.md.
+
 export async function GET(req: NextRequest) {
   const portfolioId = req.nextUrl.searchParams.get('portfolioId')
   if (!portfolioId) return new NextResponse('portfolioId required', { status: 400 })
@@ -38,7 +45,12 @@ export async function GET(req: NextRequest) {
   const sleeveDefs = sleeveRes.data ?? []
   const currentNAV = computeNAV(holdings)
   const sleeveData = computeSleeveData(holdings, sleeveDefs, currentNAV)
-  const alerts = complianceAlerts(portfolio as any, sleeveDefs, holdings, currentNAV)
+
+  // v20g: arg order is (portfolio, holdings, sleeveData, totalNAV).
+  // Previously this passed (portfolio, sleeveDefs, holdings, ...) which
+  // made both inner loops silently iterate the wrong collection.
+  const alerts = complianceAlerts(portfolio as any, holdings, sleeveData, currentNAV)
+
   const fxRate = fxRes?.rates?.NGN ?? 1665
 
   // IRR
@@ -53,9 +65,11 @@ export async function GET(req: NextRequest) {
   ].map(p => calcPeriodReturn(currentNAV, navWithCurrent, p.days, p.label))
 
   const totalReturn = currentNAV - portfolio.starting_nav
-  const totalReturnPct = totalReturn / portfolio.starting_nav
+  const totalReturnPct = portfolio.starting_nav > 0 ? totalReturn / portfolio.starting_nav : 0
   const daysInception = Math.round((Date.now() - new Date(portfolio.start_date).getTime()) / 86400000)
-  const annualisedReturn = daysInception > 0 ? Math.pow(1 + totalReturnPct, 365 / daysInception) - 1 : null
+  const annualisedReturn = daysInception > 0 && portfolio.starting_nav > 0
+    ? Math.pow(1 + totalReturnPct, 365 / daysInception) - 1
+    : null
 
   // Fee totals
   const fees = {
@@ -103,7 +117,7 @@ export async function GET(req: NextRequest) {
       currentPrice: h.latest_price,
       marketValue: h.quantity * h.latest_price,
       unrealisedPnL: h.quantity * (h.latest_price - h.avg_cost),
-      weight: (h.quantity * h.latest_price) / currentNAV,
+      weight: currentNAV > 0 ? (h.quantity * h.latest_price) / currentNAV : 0,
     })),
     fees,
     txSummary: {
