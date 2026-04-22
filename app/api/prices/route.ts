@@ -7,12 +7,16 @@ import { fetchAllMarketData } from '@/lib/market-data'
 // v20h: write richer per-day data (OHLC, volume, trades, value, change_ngn)
 //       plus per-security classification (sector, ngx_market). Use API's
 //       TradeDate for price_date so we don't drift across UTC midnight.
+// v20i: hotfix — the instruments metadata path now uses direct UPDATE
+//       instead of upsert. A batch upsert of {instrument_id, sector,
+//       ngx_market} onto a table with many NOT NULL columns would fail
+//       in the UPDATE branch because Supabase/PostgREST's default is to
+//       null-out columns not in the payload — violating NOT NULL on
+//       `name`, `sleeve_id`, `asset_class`, `type`. Direct UPDATE is
+//       partial by construction and leaves other columns untouched.
 export const maxDuration = 60
 
 // ─── Shared work: the actual price refresh ──────────────────────────
-// Extracted so POST (UI button) and GET (Vercel Cron) run the exact same
-// logic. Returns a uniform { status, body } envelope so both wrappers
-// can do NextResponse.json(body, { status }) consistently.
 async function runPriceRefresh() {
   const db = supabaseAdmin()
 
@@ -48,11 +52,11 @@ async function runPriceRefresh() {
 
   // ─── market_prices upsert ─────────────────────────────────────────
   // UNIQUE constraint on (instrument_id, price_date) exists — using
-  // onConflict here is correct (unlike nav_log per pitfall #3).
+  // onConflict here is correct and safe (unlike nav_log per pitfall #3).
   //
-  // v20h: use the API's TradeDate when present. It's the authoritative
-  // Lagos trading date. Server UTC `today` is the fallback for rows that
-  // arrive without TradeDate (shouldn't happen against the current
+  // Using the API's TradeDate when present. It's the authoritative
+  // Lagos trading date. Server UTC `today` is the fallback for rows
+  // that arrive without TradeDate (shouldn't happen against the current
   // endpoint, but keeps the route resilient to future API changes).
   const serverToday = new Date().toISOString().slice(0, 10)
 
@@ -78,40 +82,41 @@ async function runPriceRefresh() {
 
   if (priceErr) throw priceErr
 
-  // ─── instruments metadata upsert (v20h) ───────────────────────────
+  // ─── instruments metadata updates (v20i) ──────────────────────────
   // Sector and board classification (ngx_market) are per-security, not
-  // per-day. We upsert them on every refresh — it's cheap, keeps us
-  // aligned if NGX reclassifies something (Premium → Main, sector
-  // recategorisation), and acts as the backfill path on first run.
+  // per-day. We UPDATE (not upsert) because a partial upsert would
+  // either null out other NOT NULL columns or fail constraints (see
+  // v20i header comment). Parallel UPDATEs on ~140 rows complete in
+  // well under a second.
   //
-  // Only targets instruments that already exist (we filtered via
-  // validInstrumentIds above), so the upsert is effectively an UPDATE
-  // — partial payload leaves other columns (name, sleeve_id, type,
-  // notes, approved, dividend fields) untouched.
-  //
-  // Non-fatal on failure: if this upsert errors, the price refresh
-  // still completed successfully and we log + continue.
-  const metaUpdates = quotes
-    .filter((q) => q.sector !== undefined || q.ngx_market !== undefined)
-    .map((q) => ({
-      instrument_id: q.instrument_id,
-      sector:        q.sector     ?? null,
-      ngx_market:    q.ngx_market ?? null,
-    }))
-
+  // Non-fatal on failure: if metadata writes error, the price refresh
+  // still completed successfully — we record per-row errors and continue.
   let metaUpdated = 0
   const metaErrors: string[] = []
-  if (metaUpdates.length > 0) {
-    const { error: metaErr } = await db
-      .from('instruments')
-      .upsert(metaUpdates, { onConflict: 'instrument_id' })
 
-    if (metaErr) {
-      metaErrors.push(`instruments metadata upsert failed: ${metaErr.message}`)
-      console.warn('[prices] instruments metadata upsert failed:', metaErr.message)
-    } else {
-      metaUpdated = metaUpdates.length
-    }
+  await Promise.all(
+    quotes.map(async (q) => {
+      const { error } = await db
+        .from('instruments')
+        .update({
+          sector:     q.sector     ?? null,
+          ngx_market: q.ngx_market ?? null,
+        })
+        .eq('instrument_id', q.instrument_id)
+
+      if (error) {
+        metaErrors.push(`${q.instrument_id}: ${error.message}`)
+      } else {
+        metaUpdated += 1
+      }
+    })
+  )
+
+  if (metaErrors.length > 0) {
+    console.warn(
+      `[prices] ${metaErrors.length} metadata updates failed, ${metaUpdated} succeeded. First 3:`,
+      metaErrors.slice(0, 3),
+    )
   }
 
   return {
