@@ -1,40 +1,46 @@
 // ============================================================
-// MARKET DATA — DIRECT NGX SCRAPE + EXCHANGERATE
+// MARKET DATA — DIRECT NGX REST API + EXCHANGERATE
 // ============================================================
-// v16b fix: v16's single-regex approach had a lazy quantifier that
-// crossed ticker boundaries and also only accepted icon classes
-// `iconNull|iconUp|iconDown`. NGX actually uses `iconNull|iconGreen|
-// iconRed`, so every mover (gainer or loser) was rejected within its
-// own block, and the regex then consumed the next flat ticker's price
-// downstream. Result: FCMB stored at 146.14 instead of 13.50, etc.
+// v20f: NGX removed ticker data from their server-rendered HTML page
+// (the page at /exchange/data/equities-price-list/ is now a static
+// WordPress shell served by w3-total-cache; its Elementor ticker widget
+// fetches prices client-side from a REST API). The v16b HTML parser
+// returned 0 quotes against the new shell. Migrated to hit the same
+// REST endpoint the official widget uses:
 //
-// This rewrite splits the HTML into per-ticker chunks FIRST, then parses
-// each chunk in isolation. A chunk that doesn't yield a complete
-// (symbol, price, change) triple is discarded — it cannot contaminate
-// other tickers by construction.
+//   https://doclib.ngxgroup.com/REST/api/statistics/equities/
+//     ?market=&sector=&orderby=&pageSize=300&pageNo=0
 //
-// Source: https://ngxgroup.com/exchange/data/equities-price-list/
-// Each listing appears as:
-//   <span class="ticker__list__item">
-//     <a href="...?symbol=SYMBOL&directory=DIR">SYMBOL [FLAG]</a>
-//     NPRICE
-//     <span class="icon{Null|Green|Red}">PCT %</span>
-//   </span>
+// Returns a JSON array of equity rows. Observed fields (sample):
+//   Symbol            "ACCESSCORP"
+//   ClosePrice        31.0
+//   Change            1.05        (absolute NGN change vs prev close)
+//   PercChange        3.51        (percent change; nullable on untraded days)
+//   PrevClosingPrice  29.95
+//   OpeningPrice, HighPrice, LowPrice, Volume, Trades, Value
+//   Market            "Premium Board" | "Main Board" | ...
+//   Sector            "FINANCIAL SERVICES" | ...
+//   Company2          "ACCESSCORP [MRF]"  (display name + board flag)
+//   TradeDate         "2026-04-22T00:00:00"
 //
-// The same ticker can appear under three directories on this page:
-//   companydirectory   (equities — what we want)
-//   bonddirectory      (debt instruments; irrelevant for our equity holdings)
-//   etpdirectory       (exchange-traded products)
-// We restrict to `companydirectory` so an FCMB equity isn't
-// shadowed by an FCMB bond listing with a different price.
+// Behaviour / contract preserved from v16b:
+//   - Returns Quote[] with the same shape
+//   - source field still 'ngx'
+//   - day_change stores PERCENT change (historical convention;
+//     matches what the old HTML parser captured from `0.95 %` text)
+//   - NGX_TICKER_ALIASES still applied (MOBIL → MRS)
+//   - validInstrumentIds filter applied AFTER parse for diagnosability
+//   - Throws on empty results so /api/prices surfaces a clear error
+//
+// Advantages vs the old HTML scrape:
+//   - No chunking, no icon-class parsing, no directory disambiguation.
+//     The old 3-directory ambiguity (companydirectory vs bonddirectory
+//     vs etpdirectory) is gone: this endpoint only returns equities.
+//   - PercChange is available with full float precision (old HTML
+//     rounded to 2 decimals).
+//   - Symbol is already clean (no [MRF]/[DWL]/[MRS] bracket suffixes
+//     to strip — those now live in Company2, which we ignore).
 // ============================================================
-
-// v19c: FIRSTHOLDCO is now the canonical instrument_id (not FBNH).
-// The diagnostic showed FIRSTHOLDCO owned 73 transactions and 42 market_price
-// rows vs FBNH's 23 and 8, so we moved the canonical to match live usage.
-// The FBNH row and its data are merged into FIRSTHOLDCO via SQL migration
-// shipped alongside this deploy. Aliases below should now only contain
-// mappings where NGX publishes under a name different from our canonical.
 
 export interface Quote {
   instrument_id: string
@@ -45,78 +51,96 @@ export interface Quote {
 }
 
 // NGX's published ticker sometimes differs from our instrument_id.
-// Extend this map as new mismatches are discovered.
+// v19c note: previously aliased FIRSTHOLDCO → FBNH; that alias was
+// removed when FIRSTHOLDCO became canonical and FBNH was merged.
 const NGX_TICKER_ALIASES: Record<string, string> = {
-  MOBIL: 'MRS',          // MRS Oil Nigeria (historical Mobil ticker)
+  MOBIL: 'MRS', // MRS Oil Nigeria (historical Mobil ticker)
 }
 
-const NGX_EQUITIES_URL = 'https://ngxgroup.com/exchange/data/equities-price-list/'
+// pageSize=300 easily covers the ~148-row NGX equity universe.
+// Passing empty market/sector/orderby returns the full list.
+const NGX_API_URL =
+  'https://doclib.ngxgroup.com/REST/api/statistics/equities/' +
+  '?market=&sector=&orderby=&pageSize=300&pageNo=0'
 
-// User-Agent required — NGX returns 403 or a stripped page for default fetch UA.
+// The doclib subdomain appears to respond to a plain fetch, but keep
+// a realistic User-Agent as defence against future UA-based filtering.
 const BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-// Split the HTML into per-ticker chunks and parse each independently.
-// Returns only chunks that contain all three fields; silently drops malformed ones.
-function parseNGXChunks(html: string): Quote[] {
-  // Split on the opening <span class="ticker__list__item"> tag. The first
-  // element is the preamble (head, nav, etc.) and has no ticker; skip it.
-  const chunks = html.split(/<span\s+class="ticker__list__item">/i).slice(1)
+interface NGXApiRow {
+  Symbol?: string
+  ClosePrice?: number | null
+  Change?: number | null
+  PercChange?: number | null
+  TradeDate?: string
+  // Other fields (OpeningPrice, HighPrice, LowPrice, Volume, Trades,
+  // Value, Market, Sector, Company2, Id, $id) exist but we don't
+  // consume them here. Adding them would require market_prices
+  // schema changes.
+}
+
+// --------------------------------------------------------------
+// Primary: Direct JSON call to NGX statistics endpoint
+// --------------------------------------------------------------
+export async function fetchNGXPrices(
+  validInstrumentIds?: Set<string>
+): Promise<Quote[]> {
+  const res = await fetch(NGX_API_URL, {
+    headers: {
+      'User-Agent': BROWSER_UA,
+      Accept: 'application/json, text/plain, */*',
+    },
+    cache: 'no-store',
+  })
+
+  if (!res.ok) {
+    throw new Error(`NGX fetch failed: HTTP ${res.status} ${res.statusText}`)
+  }
+
+  const text = await res.text()
+  let rows: NGXApiRow[]
+  try {
+    const parsed = JSON.parse(text)
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `NGX API returned non-array (got ${typeof parsed}) — endpoint contract may have changed`
+      )
+    }
+    rows = parsed as NGXApiRow[]
+  } catch (e) {
+    throw new Error(
+      `NGX API response not valid JSON (${(e as Error).message}) — first 200 chars: ${text.slice(0, 200)}`
+    )
+  }
+
+  if (rows.length === 0) {
+    throw new Error('NGX API returned 0 rows — possibly a market holiday; check upstream')
+  }
 
   const fetchedAt = new Date().toISOString()
   const seen = new Map<string, Quote>()
 
-  for (const chunk of chunks) {
-    // Truncate at the next chunk boundary so we can't accidentally peek
-    // forward. (split() already did this, but belt-and-braces.)
-    const block = chunk.split('</span>')[0] + (chunk.includes('</span>') ? '</span>' : '')
+  for (const row of rows) {
+    const symbol = (row.Symbol || '').trim().toUpperCase()
+    if (!symbol) continue
 
-    // Extract the symbol from the ?symbol= URL param — always alphabetic,
-    // immune to bracket suffixes like "FCMB [MRF]" in the display text.
-    // The href looks like: ...?symbol=FCMB&directory=companydirectory
-    // value of `directory` is one of: companydirectory | bonddirectory | etpdirectory
-    const symbolMatch = /\?symbol=([A-Z0-9_]+)&directory=([a-z]+)directory/i.exec(chunk)
-    if (!symbolMatch) continue
-
-    const rawTicker = symbolMatch[1]
-    const directory = (symbolMatch[2] || '').toLowerCase()
-
-    // Restrict to equities. bond/etp entries for the same symbol are a
-    // different security and must not be upserted under the equity's ID.
-    if (directory !== 'company') continue
-
-    // Extract price: an `N` immediately followed by digits, after the </a>.
-    // Anchor to the start of the chunk so we don't match numbers inside
-    // other attributes or scripts that happen to start with N.
-    const priceMatch = /<\/a>\s*N([\d,]+\.?\d*)\s*<span\s+class="icon/.exec(chunk)
-    if (!priceMatch) continue
-    const price = parseFloat(priceMatch[1].replace(/,/g, ''))
+    // ClosePrice must be a positive number to be useful. Some rows for
+    // suspended or untraded equities come through with null ClosePrice.
+    const price = typeof row.ClosePrice === 'number' ? row.ClosePrice : NaN
     if (!Number.isFinite(price) || price <= 0) continue
 
-    // Extract direction + magnitude from the icon span. Accept ANY icon class
-    // (iconNull, iconGreen, iconRed, and any future variants).
-    const iconMatch = /<span\s+class="icon([A-Za-z]+)"[^>]*>\s*([-+]?\d+\.?\d*)\s*%/.exec(chunk)
-    if (!iconMatch) continue
+    // PercChange is nullable for zero-volume days (see ACADEMY, AFRINSURE
+    // in the observed response); treat null/NaN as 0% change.
+    const rawPct = typeof row.PercChange === 'number' ? row.PercChange : 0
+    const change = Number.isFinite(rawPct) ? rawPct : 0
 
-    const iconVariant = iconMatch[1].toLowerCase()
-    let change = parseFloat(iconMatch[2])
-    if (!Number.isFinite(change)) change = 0
+    const instrument_id = NGX_TICKER_ALIASES[symbol] || symbol
 
-    // Derive sign from class name. "null" = flat, "red"/"down" = negative,
-    // everything else (green/up) = positive.
-    if (iconVariant === 'null') {
-      change = 0
-    } else if (iconVariant === 'red' || iconVariant === 'down') {
-      if (change > 0) change = -change
-    }
-    // iconGreen/iconUp: leave as-is (already positive or parsed as-is)
-
-    const instrument_id = NGX_TICKER_ALIASES[rawTicker] || rawTicker
-
-    // Dedup by instrument_id. Since we've restricted to companydirectory,
-    // there should now be at most one equity entry per symbol on the page,
-    // but keep the dedup as defence in depth.
+    // Dedup by instrument_id. The API is a flat equity list so duplicates
+    // shouldn't occur, but keep the dedup as belt-and-braces in case a
+    // future API change introduces them.
     if (!seen.has(instrument_id)) {
       seen.set(instrument_id, {
         instrument_id,
@@ -128,50 +152,19 @@ function parseNGXChunks(html: string): Quote[] {
     }
   }
 
-  return [...seen.values()]
-}
-
-// --------------------------------------------------------------
-// Primary: Direct scrape of NGX equities price list
-// --------------------------------------------------------------
-export async function fetchNGXPrices(
-  validInstrumentIds?: Set<string>
-): Promise<Quote[]> {
-  const res = await fetch(NGX_EQUITIES_URL, {
-    headers: {
-      'User-Agent': BROWSER_UA,
-      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      'Accept-Language': 'en-US,en;q=0.9',
-    },
-    cache: 'no-store',
-  })
-
-  if (!res.ok) {
-    throw new Error(`NGX fetch failed: HTTP ${res.status} ${res.statusText}`)
-  }
-
-  const html = await res.text()
-  if (html.length < 5000) {
-    throw new Error(
-      `NGX returned unexpectedly short HTML (${html.length} bytes) — page structure may have changed`
-    )
-  }
-
-  const allQuotes = parseNGXChunks(html)
+  const allQuotes = [...seen.values()]
 
   if (allQuotes.length === 0) {
     throw new Error(
-      'NGX parse yielded 0 quotes — page structure may have changed, regex no longer matches'
+      'NGX API returned rows but none had a valid Symbol + ClosePrice — field names may have changed'
     )
   }
 
   // Apply caller-supplied whitelist AFTER parsing so the parse itself is
-  // independently diagnosable (count returned irrespective of holdings).
-  const filtered = validInstrumentIds
+  // independently diagnosable (raw count returned irrespective of holdings).
+  return validInstrumentIds
     ? allQuotes.filter((q) => validInstrumentIds.has(q.instrument_id))
     : allQuotes
-
-  return filtered
 }
 
 // --------------------------------------------------------------
