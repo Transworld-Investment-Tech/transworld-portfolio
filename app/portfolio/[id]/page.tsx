@@ -11,7 +11,10 @@ import {
   computeNAV, computeSleeveData, complianceAlerts, estimatedIncomePA,
   fmt, type Portfolio, type Holding, type SleeveTarget,
 } from '@/lib/portfolio'
-import Sidebar from '@/components/shared/Sidebar'
+
+// v20c: Sidebar is rendered by app/portfolio/[id]/layout.tsx. This page
+// only returns the <main> content that fills the layout's right column.
+// Previously rendered Sidebar locally, causing a double sidebar.
 
 // v20: Hybrid Portfolio Overview — single page, no internal tabs.
 // Holdings / Transactions / Reports / Settings now live solely on their
@@ -158,20 +161,18 @@ export default function PortfolioOverviewPage() {
 
   if (loading || !portfolio) {
     return (
-      <div className="hybrid-page flex">
-        <Sidebar />
-        <div
-          style={{
-            flex: 1,
-            display: 'flex',
-            alignItems: 'center',
-            justifyContent: 'center',
-            color: 'var(--text-3)',
-            fontSize: 14,
-          }}
-        >
-          Loading portfolio…
-        </div>
+      <div
+        className="hybrid-page"
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'center',
+          color: 'var(--text-3)',
+          fontSize: 14,
+          minHeight: '100vh',
+        }}
+      >
+        Loading portfolio…
       </div>
     )
   }
@@ -197,16 +198,10 @@ export default function PortfolioOverviewPage() {
   })()
 
   return (
-    <div className="hybrid-page flex">
-      <Sidebar
-        portfolioId={portfolioId}
-        portfolioName={portfolio.name}
-        portfolioLabel={portfolio.label}
-        clientName={(portfolio as any).client?.name}
-        clientType={(portfolio as any).client?.type}
-      />
-
-      <main style={{ flex: 1, padding: '32px 44px 64px', overflow: 'auto' }}>
+    <main
+      className="hybrid-page"
+      style={{ padding: '32px 44px 64px', minHeight: '100vh' }}
+    >
         {/* Page header — Image 1 preference: clean, no subtitle, full-width border */}
         <div className="page-head">
           <div>
@@ -635,6 +630,5 @@ export default function PortfolioOverviewPage() {
           </div>
         ) : null}
       </main>
-    </div>
   )
 }
