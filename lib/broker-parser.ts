@@ -159,21 +159,13 @@ export interface ParseOptions {
 const Y_TOLERANCE = 2
 
 async function extractLines(buffer: Buffer): Promise<string[]> {
-  // Dynamic import so this module stays lightweight at import time
-  // and pdfjs only loads when actually parsing a file.
-  // Legacy Node build ships an embedded worker — no worker config needed.
-  const pdfjs: any = await import('pdfjs-dist/legacy/build/pdf.mjs')
-  const getDocument = pdfjs.getDocument || pdfjs.default?.getDocument
-  if (!getDocument) throw new Error('Could not load pdfjs-dist getDocument')
-
-  const data = new Uint8Array(buffer)
-  const loadingTask = getDocument({
-    data,
-    useSystemFonts: true,
-    disableFontFace: true,
-    isEvalSupported: false,
-  })
-  const pdf = await loadingTask.promise
+  // Use unpdf instead of pdfjs-dist directly. unpdf ships a
+  // serverless-friendly pdfjs build with DOMMatrix / Path2D / other
+  // browser globals pre-polyfilled. Using pdfjs-dist legacy build
+  // directly on Vercel's Node runtime threw "DOMMatrix is not
+  // defined" in v21a — this swap is the fix.
+  const { getDocumentProxy } = await import('unpdf')
+  const pdf = await getDocumentProxy(new Uint8Array(buffer))
   const allLines: string[] = []
 
   for (let p = 1; p <= pdf.numPages; p++) {
