@@ -1,16 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 
-// Sources to scrape for Nigerian dividend data
-const SCRAPE_URLS = [
-  // NGX corporate actions - official dividend declarations
-  'https://ngxgroup.com/exchange/trade/equities/corporate-actions/',
-  // NGX issuer filings
-  'https://ngxgroup.com/exchange/trade/equities/company-financials/',
-]
+// v19 rewrite:
+//   - DELETED: Apify cheerio scrape path. It was dead code — the AI branch
+//     always overwrote its results (`if (aiEstimates.length > 0) dividends = aiEstimates`).
+//     And Apify's NGX page structure changes frequently, making parsing fragile.
+//   - ADDED: Anthropic web_search tool. The AI now fetches live dividend
+//     announcements from NGX corporate filings and Nigerian financial media
+//     instead of relying on training-data recall.
+//   - ADDED: batch processing. Previously capped at tickers.slice(0, 15) to
+//     avoid rate limits, which silently ignored ~28 instruments. Now chunks
+//     through every approved equity in groups of 10.
+//   - ADDED: div_last_refreshed_at column write (introduced by v19 migration).
+//     Lets the UI show a staleness indicator. v20 wires the UI.
+//   - ADDED: GET handler protected by CRON_SECRET so Vercel Cron can trigger
+//     a weekly refresh without exposing the endpoint publicly.
 
-// Known NGX ticker → company name map for matching scraped results
-const NGX_TICKERS: Record<string, string> = {
+export const maxDuration = 300
+
+const BATCH_SIZE = 10
+
+// Friendly-name fallback for tickers not in the database's `name` field.
+// Not authoritative — `instruments.name` wins when present.
+const NGX_TICKER_NAMES: Record<string, string> = {
   ACCESSCORP: 'Access Holdings',
   ARADEL:     'Aradel Holdings',
   FCMB:       'FCMB Group',
@@ -29,271 +41,239 @@ const NGX_TICKERS: Record<string, string> = {
   MTNN:       'MTN Nigeria',
 }
 
-interface ScrapedDividend {
-  ticker:      string
-  company:     string
-  divPerShare: number
-  divType:     string   // 'final' | 'interim' | 'special'
-  declaredDate: string
-  closureDate:  string | null
-  paymentDate:  string | null
-  source:       string
+interface DividendPayload {
+  ticker:       string
+  divPerShare:  number
+  divYieldPct:  number
+  divStatus:    string   // 'paying' | 'suspended' | 'none' | 'variable' | 'unknown'
+  divFrequency: string   // 'annual' | 'interim' | 'quarterly' | 'unknown'
+  lastDivDate:  string | null
+  nextDivDate:  string | null
+  divNotes:     string
 }
 
-async function scrapeWithApify(urls: string[], apifyKey: string): Promise<any[]> {
-  // Use Apify's cheerio-scraper for fast HTML extraction
-  const runRes = await fetch(
-    `https://api.apify.com/v2/acts/apify~cheerio-scraper/run-sync-get-dataset-items?token=${apifyKey}&timeout=60&memory=256`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        startUrls: urls.map(url => ({ url })),
-        pageFunction: `async function pageFunction({ $, request, log }) {
-          const results = []
-          const url = request.url
+// ─── Single batch call to Anthropic with web_search enabled ─────────
+async function refreshBatch(
+  batch: Array<{ instrument_id: string; name: string | null }>,
+  anthropicKey: string,
+): Promise<{ data: DividendPayload[]; error?: string }> {
+  const today = new Date().toISOString().slice(0, 10)
+  const tickerList = batch
+    .map(i => `- ${i.instrument_id} (${i.name || NGX_TICKER_NAMES[i.instrument_id] || i.instrument_id})`)
+    .join('\n')
 
-          // NGX Corporate Actions page
-          if (url.includes('corporate-actions')) {
-            $('table tr, .dividend-row, [class*="action"]').each((i, el) => {
-              const text = $(el).text().replace(/\\s+/g,' ').trim()
-              if (text.toLowerCase().includes('dividend') || text.toLowerCase().includes('dps')) {
-                results.push({ source: 'NGX Corporate Actions', raw: text, url })
-              }
-            })
-            // Also try to get table data
-            $('table').each((ti, table) => {
-              const headers = []
-              $(table).find('th').each((i, th) => headers.push($(th).text().trim()))
-              $(table).find('tr').each((ri, row) => {
-                if (ri === 0) return
-                const cells = []
-                $(row).find('td').each((i, td) => cells.push($(td).text().trim()))
-                if (cells.length > 0) results.push({ source: 'NGX Table', headers, cells, url })
-              })
-            })
-          }
+  const prompt = `You are a Nigerian capital markets research analyst. I need CURRENT dividend information for these NGX-listed stocks as of today (${today}).
 
-          return results
-        }`,
-        proxyConfiguration: { useApifyProxy: true },
-        maxRequestsPerCrawl: 5,
-      }),
-    }
-  )
+Stocks to research:
+${tickerList}
 
-  if (!runRes.ok) {
-    console.error('Apify run failed:', runRes.status, await runRes.text())
-    return []
-  }
+Use web search to find the most recent dividend declaration, DPS, yield, and payment dates for each. Prefer primary sources: NGX corporate disclosures, the issuer's investor relations page, or reputable Nigerian financial media (Nairametrics, Proshare, BusinessDay, CardinalStone, AFX / afx.kwayisi.org).
 
-  return runRes.json()
-}
+Respond with ONLY a JSON array — no preamble, no markdown fences, no commentary. Each entry must match this exact schema:
 
-// Parse scraped items to extract dividend data
-function parseDividendData(items: any[]): ScrapedDividend[] {
-  const dividends: ScrapedDividend[] = []
-
-  for (const item of items) {
-    const raw = (item.raw || '').toLowerCase()
-    const cells: string[] = item.cells || []
-    const text = cells.join(' ').toLowerCase() + raw
-
-    // Look for dividend-related content
-    if (!text.includes('dividend') && !text.includes('dps') && !text.includes('kobo')) continue
-
-    // Try to extract ticker
-    let ticker = ''
-    for (const [t] of Object.entries(NGX_TICKERS)) {
-      if (text.includes(t.toLowerCase()) || text.includes(NGX_TICKERS[t].toLowerCase())) {
-        ticker = t; break
-      }
-    }
-    if (!ticker) continue
-
-    // Try to extract DPS amount (look for ₦X.XX or X kobo patterns)
-    let divPerShare = 0
-    const nairaMatch = text.match(/[₦#]\s*(\d+\.?\d*)\s*(?:per share|\/share|kobo|k\b)?/)
-    const koboMatch  = text.match(/(\d+\.?\d*)\s*kobo/)
-    const dpsMatch   = text.match(/dps[:\s]+[₦#]?\s*(\d+\.?\d*)/)
-
-    if (nairaMatch) divPerShare = parseFloat(nairaMatch[1])
-    else if (koboMatch) divPerShare = parseFloat(koboMatch[1]) / 100
-    else if (dpsMatch) divPerShare = parseFloat(dpsMatch[1])
-
-    if (divPerShare === 0 && cells.length > 2) {
-      // Try to find a number in cells that looks like DPS
-      for (const cell of cells) {
-        const num = parseFloat(cell.replace(/[₦,]/g, ''))
-        if (!isNaN(num) && num > 0 && num < 1000) { divPerShare = num; break }
-      }
-    }
-
-    // Extract dates
-    const dateMatch = text.match(/\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}/)
-    const declaredDate = dateMatch ? dateMatch[0] : new Date().toISOString().slice(0, 10)
-
-    const divType = text.includes('interim') ? 'interim' : text.includes('special') ? 'special' : 'final'
-
-    dividends.push({
-      ticker,
-      company:      NGX_TICKERS[ticker],
-      divPerShare,
-      divType,
-      declaredDate,
-      closureDate:  null,
-      paymentDate:  null,
-      source:       item.source || item.url || 'NGX scrape',
-    })
-  }
-
-  return dividends
-}
-
-// Fallback: use Anthropic to get latest dividend data from training knowledge
-// supplemented with web search context
-async function getAIDividendEstimates(tickers: string[], anthropicKey: string): Promise<ScrapedDividend[]> {
-  const res = await fetch('https://api.anthropic.com/v1/messages', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1500,
-      messages: [{
-        role: 'user',
-        content: `You are a Nigerian capital markets expert. For these NGX-listed stocks, provide the most recent dividend information you know as of early 2026:
-
-${tickers.map(t => `- ${t} (${NGX_TICKERS[t] || t})`).join('\n')}
-
-For each stock respond in this EXACT JSON format only, no other text:
 [
   {
     "ticker": "ACCESSCORP",
-    "divPerShare": 0.70,
-    "divYieldPct": 0.028,
+    "divPerShare": 2.05,
+    "divYieldPct": 0.068,
     "divStatus": "paying",
     "divFrequency": "annual",
-    "lastDivDate": "2024-07-15",
-    "nextDivDate": "2025-07-01",
-    "divNotes": "FY2024 final dividend ₦0.70/share declared April 2024"
+    "lastDivDate": "2025-07-15",
+    "nextDivDate": "2026-07-01",
+    "divNotes": "FY2024 final dividend N2.05/share paid July 2025. Interim of N0.80 paid January 2026."
   }
 ]
 
-divStatus options: "paying" | "suspended" | "none"
-Use null for unknown dates. Be accurate — if dividend is suspended, set divPerShare to 0.
-Include any relevant notes about recapitalisation, forex impact, or dividend policy changes.`,
-      }],
+Field rules:
+- divPerShare: in Naira (e.g. 2.05 means N2.05/share). Use 0 if suspended or unknown.
+- divYieldPct: as a decimal (0.068 = 6.8%). Use 0 if unknown.
+- divStatus: "paying" | "suspended" | "none" | "variable" | "unknown"
+- divFrequency: "annual" | "interim" | "quarterly" | "unknown"
+- lastDivDate / nextDivDate: ISO YYYY-MM-DD. Use null if you cannot verify.
+- divNotes: brief plain-text context. Mention recapitalisation, policy changes, or anomalies.
+
+Accuracy matters. If you are not reasonably confident, set divStatus to "unknown" and explain in divNotes. Include exactly one entry per ticker I provided, even if you have no data for it.`
+
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method: 'POST',
+    headers: {
+      'Content-Type':      'application/json',
+      'x-api-key':         anthropicKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({
+      model:      'claude-sonnet-4-20250514',
+      max_tokens: 4000,
+      tools:      [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages:   [{ role: 'user', content: prompt }],
     }),
   })
 
+  if (!res.ok) {
+    const errText = await res.text().catch(() => '')
+    return { data: [], error: `Anthropic ${res.status}: ${errText.slice(0, 300)}` }
+  }
+
   const d = await res.json()
-  const text = d.content?.[0]?.text ?? '[]'
+
+  // With web_search enabled the content array contains a mix of blocks:
+  //   - server_tool_use    (the model calling web_search)
+  //   - web_search_tool_result (the tool's response)
+  //   - text               (the model's actual answer)
+  // We only care about text blocks for the final JSON payload.
+  const text = (d.content || [])
+    .filter((b: any) => b.type === 'text')
+    .map((b: any) => b.text as string)
+    .join('')
+
+  if (!text) {
+    return { data: [], error: 'No text content in Anthropic response' }
+  }
 
   try {
+    // Strip any accidental markdown fences and locate the JSON array.
     const clean = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim()
-    const parsed = JSON.parse(clean)
-    return parsed.map((item: any) => ({
-      ticker:       item.ticker,
-      company:      NGX_TICKERS[item.ticker] || item.ticker,
-      divPerShare:  item.divPerShare ?? 0,
-      divType:      'final',
-      declaredDate: item.lastDivDate ?? new Date().toISOString().slice(0, 10),
-      closureDate:  null,
-      paymentDate:  item.nextDivDate ?? null,
-      source:       'AI estimate (Claude knowledge base)',
-      // Extra fields for direct DB update
-      divYieldPct:  item.divYieldPct ?? 0,
-      divStatus:    item.divStatus ?? 'unknown',
-      divFrequency: item.divFrequency ?? 'annual',
-      lastDivDate:  item.lastDivDate ?? null,
-      nextDivDate:  item.nextDivDate ?? null,
-      divNotes:     item.divNotes ?? null,
-    }))
-  } catch {
-    return []
+    const start = clean.indexOf('[')
+    const end   = clean.lastIndexOf(']')
+    const slice = (start >= 0 && end > start) ? clean.slice(start, end + 1) : clean
+    const parsed = JSON.parse(slice)
+    if (!Array.isArray(parsed)) {
+      return { data: [], error: 'Response JSON was not an array' }
+    }
+    return { data: parsed as DividendPayload[] }
+  } catch (err) {
+    return { data: [], error: `JSON parse failed: ${(err as Error).message}` }
   }
 }
 
-export const maxDuration = 120
-
-export async function POST(req: NextRequest) {
-  const apifyKey    = process.env.APIFY_API_KEY
+// ─── Main work: iterate all equities through batched calls ──────────
+async function runDividendRefresh() {
   const anthropicKey = process.env.ANTHROPIC_API_KEY
-
-  if (!anthropicKey) return NextResponse.json({ error: 'ANTHROPIC_API_KEY not set' }, { status: 500 })
+  if (!anthropicKey) {
+    return { status: 500, body: { error: 'ANTHROPIC_API_KEY not set' } }
+  }
 
   const db = supabaseAdmin()
 
-  // Get all equity instruments
-  const { data: instruments } = await db
+  // v19: query ALL approved equity instruments — no more arbitrary 15-ticker slice.
+  const { data: instruments, error: instErr } = await db
     .from('instruments')
-    .select('instrument_id, name, div_per_share, div_status')
+    .select('instrument_id, name')
     .eq('type', 'Stock')
+    .eq('approved', true)
+    .order('instrument_id')
 
-  const tickers = (instruments ?? []).map((i: any) => i.instrument_id)
+  if (instErr) {
+    return { status: 500, body: { error: instErr.message } }
+  }
 
-  let dividends: ScrapedDividend[] = []
-  let method = 'ai'
-
-  // Try Apify scraping first if key available
-  if (apifyKey) {
-    try {
-      console.log('Attempting NGX scrape via Apify...')
-      const scraped = await scrapeWithApify(SCRAPE_URLS, apifyKey)
-      const parsed  = parseDividendData(scraped)
-      if (parsed.length > 0) {
-        dividends = parsed
-        method    = 'apify'
-        console.log(`Apify found ${parsed.length} dividend entries`)
-      }
-    } catch (err) {
-      console.error('Apify scrape failed, falling back to AI:', err)
+  const equities = (instruments || []) as Array<{ instrument_id: string; name: string | null }>
+  if (equities.length === 0) {
+    return {
+      status: 200,
+      body: { ok: true, message: 'No approved equity instruments to refresh', updated: 0 },
     }
   }
 
-  // Always use AI estimates as the primary/supplementary source
-  // (NGX page structure changes frequently; AI is more reliable for structured data)
-  const aiEstimates = await getAIDividendEstimates(tickers.slice(0, 15), anthropicKey)
-  if (aiEstimates.length > 0) {
-    dividends = aiEstimates
-    method = apifyKey && dividends.length > 0 ? 'apify+ai' : 'ai'
+  // Chunk the full list
+  const batches: Array<typeof equities> = []
+  for (let i = 0; i < equities.length; i += BATCH_SIZE) {
+    batches.push(equities.slice(i, i + BATCH_SIZE))
   }
 
-  // Update instruments table
-  const updates: string[] = []
-  const errors: string[] = []
+  const allDividends: DividendPayload[] = []
+  const batchErrors: string[] = []
 
-  for (const div of dividends) {
+  // Sequential batching. Parallel would trip Anthropic Tier 1 rate limits
+  // (30k tokens/min), and each batch also spawns several web_search calls
+  // internally which add latency and token pressure.
+  for (let idx = 0; idx < batches.length; idx++) {
+    const batch = batches[idx]
+    console.log(`[dividends/refresh] batch ${idx + 1}/${batches.length} (${batch.length} tickers)`)
+    const { data, error } = await refreshBatch(batch, anthropicKey)
+    if (error) batchErrors.push(`batch ${idx + 1}: ${error}`)
+    allDividends.push(...data)
+  }
+
+  // Update instruments table with what came back
+  const now = new Date().toISOString()
+  const updated: string[] = []
+  const updateErrors: string[] = []
+
+  for (const div of allDividends) {
+    if (!div.ticker) continue
+
     const updateData: any = {
-      div_per_share:  div.divPerShare ?? 0,
-      div_yield_pct:  (div as any).divYieldPct ?? 0,
-      div_status:     (div as any).divStatus ?? (div.divPerShare > 0 ? 'paying' : 'suspended'),
-      div_frequency:  (div as any).divFrequency ?? 'annual',
-      div_notes:      (div as any).divNotes ?? `Updated via ${method}. Source: ${div.source}`,
+      div_per_share: typeof div.divPerShare === 'number' ? div.divPerShare : 0,
+      div_yield_pct: typeof div.divYieldPct === 'number' ? div.divYieldPct : 0,
+      div_status:    div.divStatus    || 'unknown',
+      div_frequency: div.divFrequency || 'annual',
+      div_notes:     div.divNotes     || 'Refreshed via AI + web_search',
+      div_last_refreshed_at: now,
     }
-    if ((div as any).lastDivDate) updateData.last_div_date = (div as any).lastDivDate
-    if ((div as any).nextDivDate) updateData.next_div_date = (div as any).nextDivDate
+    if (div.lastDivDate) updateData.last_div_date = div.lastDivDate
+    if (div.nextDivDate) updateData.next_div_date = div.nextDivDate
 
-    const { error } = await db.from('instruments')
+    const { error: upErr } = await (db.from('instruments') as any)
       .update(updateData)
       .eq('instrument_id', div.ticker)
 
-    if (error) errors.push(`${div.ticker}: ${error.message}`)
-    else       updates.push(div.ticker)
+    if (upErr) updateErrors.push(`${div.ticker}: ${upErr.message}`)
+    else       updated.push(div.ticker)
   }
 
-  return NextResponse.json({
-    ok:      true,
-    method,
-    updated: updates,
-    errors,
-    total:   dividends.length,
-    message: `Updated ${updates.length} instruments via ${method}`,
-    data:    dividends.map(d => ({
-      ticker:      d.ticker,
-      divPerShare: d.divPerShare,
-      divStatus:   (d as any).divStatus,
-      source:      d.source,
-    })),
-  })
+  return {
+    status: 200,
+    body: {
+      ok:                      true,
+      method:                  'ai+web_search',
+      batches:                 batches.length,
+      totalInstruments:        equities.length,
+      dividendEntriesReturned: allDividends.length,
+      updated,
+      batchErrors,
+      updateErrors,
+      message:                 `Refreshed ${updated.length}/${equities.length} instruments via AI + web_search`,
+    },
+  }
+}
+
+// ─── POST — triggered by UI button ──────────────────────────────────
+export async function POST(_req: NextRequest) {
+  try {
+    const result = await runDividendRefresh()
+    return NextResponse.json(result.body, { status: result.status })
+  } catch (err) {
+    console.error('[/api/dividends/refresh] fatal:', err)
+    return NextResponse.json(
+      { error: (err as Error).message || 'Unknown error' },
+      { status: 500 }
+    )
+  }
+}
+
+// ─── GET — Vercel Cron (weekly Sunday 08:00 UTC, per vercel.json) ───
+export async function GET(req: NextRequest) {
+  const expected = `Bearer ${process.env.CRON_SECRET ?? ''}`
+  const got      = req.headers.get('authorization') ?? ''
+  if (!process.env.CRON_SECRET || got !== expected) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  try {
+    const result = await runDividendRefresh()
+    console.log('[cron /api/dividends/refresh]', JSON.stringify({
+      ok:                     result.status === 200,
+      updated:                (result.body as any).updated?.length ?? 0,
+      totalInstruments:       (result.body as any).totalInstruments,
+      batchErrorsCount:       (result.body as any).batchErrors?.length ?? 0,
+    }))
+    return NextResponse.json(result.body, { status: result.status })
+  } catch (err) {
+    console.error('[cron /api/dividends/refresh] fatal:', err)
+    return NextResponse.json(
+      { error: (err as Error).message || 'Unknown error' },
+      { status: 500 }
+    )
+  }
 }

@@ -11,6 +11,19 @@
     },
     "app/api/prices/route.ts": {
       "maxDuration": 60
+    },
+    "app/api/dividends/refresh/route.ts": {
+      "maxDuration": 300
     }
-  }
+  },
+  "crons": [
+    {
+      "path": "/api/prices",
+      "schedule": "0 16 * * 1-5"
+    },
+    {
+      "path": "/api/dividends/refresh",
+      "schedule": "0 8 * * 0"
+    }
+  ]
 }
