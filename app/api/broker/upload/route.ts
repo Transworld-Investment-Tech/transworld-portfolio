@@ -412,6 +412,22 @@ function sanitize(s: string): string {
   return s.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200)
 }
 
+// Maps the parser's internal TradeMatch.kind values to the
+// staged_transactions.recon_kind check-constraint values.
+// The parser uses terse names ('exact', 'split') while the DB
+// uses 'matched_exact' / 'matched_split' for clarity when
+// reading recon_kind alongside 'cash_event_auto' etc. v21b-2-hotfix-2.
+function mapReconKind(
+  k: 'exact' | 'split' | 'partial_mismatch' | 'unmatched'
+): 'matched_exact' | 'matched_split' | 'partial_mismatch' | 'unmatched' {
+  switch (k) {
+    case 'exact': return 'matched_exact'
+    case 'split': return 'matched_split'
+    case 'partial_mismatch': return 'partial_mismatch'
+    case 'unmatched': return 'unmatched'
+  }
+}
+
 function extractReference(narration: string): string | null {
   const m = narration.match(/\b(NIBSS|CHEQUE|TRANSFER)\s+([A-Za-z0-9.-]+)/i)
   if (!m) return null
@@ -474,7 +490,7 @@ function buildStagedRows(
       fee_sms: cnRow.fee_sms,
       cn_number: cnNumbers || null,
       narration,
-      recon_kind: match.kind,
+      recon_kind: mapReconKind(match.kind),
       recon_note: match.note || null,
       dedup_status: 'new',
       include_in_commit: true,
