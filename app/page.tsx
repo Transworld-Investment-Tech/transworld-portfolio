@@ -307,10 +307,12 @@ export default function HomePage() {
 
                   <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-3">
                     {(client.portfolios || []).map((p: any) => {
-                      const currentNAV    = navMap[p.id] ?? 0
-                      const hasCurrentNAV = currentNAV > 0
-                      const gain          = currentNAV - p.starting_nav
-                      const gainPct       = p.starting_nav > 0 ? gain / p.starting_nav : 0
+                      const currentNAV     = navMap[p.id] ?? 0
+                      const hasCurrentNAV  = currentNAV > 0
+                      // v19d: portfolios may have starting_nav = 0 if built from transactions
+                      const hasStartingNav = p.starting_nav > 0
+                      const gain           = currentNAV - p.starting_nav
+                      const gainPct        = hasStartingNav ? gain / p.starting_nav : 0
 
                       return (
                         <div key={p.id} className="relative group">
@@ -329,7 +331,9 @@ export default function HomePage() {
                                 {p.name}
                               </div>
 
-                              {hasCurrentNAV ? (
+                              {/* v19d: four display states depending on (hasCurrentNAV, hasStartingNav) */}
+                              {hasCurrentNAV && hasStartingNav ? (
+                                // Normal case: show current value + gain with %
                                 <>
                                   <div className="text-base font-bold font-mono text-[#e8eaf0]">
                                     {fmt.ngnM(currentNAV)}
@@ -343,9 +347,30 @@ export default function HomePage() {
                                     from {fmt.ngnM(p.starting_nav)} start
                                   </div>
                                 </>
-                              ) : (
+                              ) : hasCurrentNAV && !hasStartingNav ? (
+                                // Built from transactions: show current value + absolute gain, no %
+                                <>
+                                  <div className="text-base font-bold font-mono text-[#e8eaf0]">
+                                    {fmt.ngnM(currentNAV)}
+                                  </div>
+                                  <div className="flex items-center gap-1.5 mt-1">
+                                    <span className="text-[10px] font-mono text-[#22c55e]">
+                                      +{fmt.ngnM(currentNAV)}
+                                    </span>
+                                  </div>
+                                  <div className="text-[10px] text-[#555d72] mt-0.5">
+                                    built from transactions
+                                  </div>
+                                </>
+                              ) : !hasCurrentNAV && hasStartingNav ? (
+                                // Starting NAV set but no holdings priced yet
                                 <div className="text-[11px] font-mono text-[#555d72] mt-1">
                                   {fmt.ngnM(p.starting_nav)} start
+                                </div>
+                              ) : (
+                                // Nothing yet: empty portfolio, no transactions imported
+                                <div className="text-[11px] text-[#555d72] mt-1 italic">
+                                  Awaiting transactions
                                 </div>
                               )}
 

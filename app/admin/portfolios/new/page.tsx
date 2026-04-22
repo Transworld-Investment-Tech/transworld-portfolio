@@ -9,20 +9,17 @@ import {
 } from 'lucide-react'
 
 // v18: portfolio creation form.
+// v19d: starting NAV can be 0 or blank — the portfolio can be built up via
+//       TRANSFER_IN transactions instead of deploying capital up-front.
 //
 // The form writes three things atomically via POST /api/portfolios:
 //   1. `portfolios` row
 //   2. Three `sleeve_targets` rows (liq / eq / fi)
 //   3. An initial `nav_log` row at `start_date` with `nav_value = starting_nav`
-//
-// The preset picker (Conservative / Balanced / Growth / Custom) fills
-// the 7 mandate numerics AND the 3 sleeve targets. Any manual edit flips
-// the active preset to 'custom' automatically.
+//      (starting_nav may be 0; IRR math handles it — the −0 cash flow at t=0
+//      is a no-op and TRANSFER_IN events carry the real capital flows.)
 
 // ─── Preset definitions ─────────────────────────────────────────────
-// Each preset supplies a complete set of mandate thresholds + sleeve
-// allocations. Min/max widths around each target are heuristics — the
-// user can tighten or loosen them per portfolio.
 const MANDATE_PRESETS = {
   conservative: {
     label: 'Conservative',
@@ -89,8 +86,6 @@ interface Client {
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────
-// All percentage inputs are strings-in-the-UI / decimals-in-the-DB.
-// The user types "10" for 10%, and we store 0.10.
 function pctToStr(v: number): string {
   return (v * 100).toFixed(2).replace(/\.?0+$/, '') || '0'
 }
@@ -180,8 +175,6 @@ function NewPortfolioInner() {
           setName(`Portfolio ${next}`)
         }
       })
-    // nameEditedManually intentionally excluded — we only want to auto-rename
-    // based on label changes, not re-run when the user edits the name.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clientId])
 
@@ -202,7 +195,7 @@ function NewPortfolioInner() {
   // ─── Preset helpers ───
   function applyPreset(key: PresetKey) {
     setPreset(key)
-    if (key === 'custom') return // leave current values
+    if (key === 'custom') return
     const p = MANDATE_PRESETS[key]
     setMandate({
       income_target: pctToStr(p.income_target),
@@ -220,7 +213,6 @@ function NewPortfolioInner() {
     })
   }
 
-  // Any manual edit to mandate / sleeves flips preset → 'custom'
   function updateMandate(field: keyof typeof mandate, val: string) {
     setMandate(m => ({ ...m, [field]: val }))
     if (preset !== 'custom') setPreset('custom')
@@ -240,13 +232,27 @@ function NewPortfolioInner() {
   const sleeveSumPct = sleeveSum * 100
   const sumValid = Math.abs(sleeveSumPct - 100) < 0.01
 
-  const navNum = Number(startingNav)
-  const navValid = navNum > 0 && !isNaN(navNum)
+  // v19d: NAV is optional. Empty string → 0 (portfolio built from transactions).
+  //       Any non-negative number is valid. Negatives and non-numeric are not.
+  const navIsEmpty = startingNav.trim() === ''
+  const navNum = navIsEmpty ? 0 : Number(startingNav)
+  const navValid = !isNaN(navNum) && navNum >= 0
 
   const labelConflict = existingLabels.includes(label)
 
   const canSubmit =
-    clientId && label && name.trim() && navValid && sumValid && !labelConflict && !saving
+    !!clientId && !!label && !!name.trim() && navValid && sumValid && !labelConflict && !saving
+
+  // v19d: surface a friendly "here's what's still missing" hint when the button
+  // is disabled, so users don't have to guess why. This would have saved the
+  // debug session where "Create portfolio" sat greyed out with no explanation.
+  const missingReasons: string[] = []
+  if (!clientId) missingReasons.push('select a client')
+  if (!label.trim()) missingReasons.push('enter a label')
+  else if (labelConflict) missingReasons.push(`label "${label}" already used for this client`)
+  if (!name.trim()) missingReasons.push('enter a portfolio name')
+  if (!navValid) missingReasons.push('starting NAV must be 0 or positive')
+  if (!sumValid) missingReasons.push(`sleeve targets must sum to 100% (now ${sleeveSumPct.toFixed(1)}%)`)
 
   // ─── Submit ───
   async function handleSubmit() {
@@ -255,7 +261,7 @@ function NewPortfolioInner() {
     if (!label) return setError('Label is required')
     if (labelConflict) return setError(`Label "${label}" is already used for this client`)
     if (!name.trim()) return setError('Name is required')
-    if (!navValid) return setError('Starting NAV must be a positive number')
+    if (!navValid) return setError('Starting NAV must be 0 or a positive number')
     if (!sumValid) {
       return setError(
         `Sleeve targets must sum to 100% (currently ${sleeveSumPct.toFixed(2)}%)`,
@@ -269,7 +275,7 @@ function NewPortfolioInner() {
         label,
         name: name.trim(),
         currency: 'NGN',
-        starting_nav: navNum,
+        starting_nav: navNum,   // 0 is allowed; API will seed nav_log with nav_value=0
         start_date: startDate,
         income_target: strToPct(mandate.income_target),
         cap_target: strToPct(mandate.cap_target),
@@ -299,7 +305,6 @@ function NewPortfolioInner() {
         setSaving(false)
         return
       }
-      // Done — land on the portfolio's overview page.
       router.push(`/portfolio/${data.portfolio.id}`)
     } catch (e) {
       setError((e as Error).message)
@@ -420,22 +425,31 @@ function NewPortfolioInner() {
 
             <div>
               <label className="block text-xs text-[#8a91a8] mb-1.5">
-                Starting NAV (₦)
+                Starting NAV (₦) <span className="text-[#555d72] font-normal">— optional</span>
               </label>
               <input
                 type="number"
                 value={startingNav}
                 onChange={e => setStartingNav(e.target.value)}
-                placeholder="e.g. 50000000"
+                placeholder="Leave blank to build from transactions"
                 min="0"
                 step="0.01"
                 className="tw-input font-mono"
               />
-              {navValid && (
-                <div className="mt-1.5 text-[11px] text-[#555d72]">
-                  ₦{navNum.toLocaleString('en-NG', { maximumFractionDigits: 2 })}
-                </div>
-              )}
+              {/* v19d: context-aware helper text */}
+              <div className="mt-1.5 text-[11px] min-h-[14px]">
+                {!navValid ? (
+                  <span className="text-[#ef4444]">Must be 0 or a positive number</span>
+                ) : navIsEmpty || navNum === 0 ? (
+                  <span className="text-[#555d72]">
+                    Built from transaction history — initial NAV seeded as ₦0
+                  </span>
+                ) : (
+                  <span className="text-[#555d72]">
+                    ₦{navNum.toLocaleString('en-NG', { maximumFractionDigits: 2 })}
+                  </span>
+                )}
+              </div>
             </div>
           </div>
         </div>
@@ -670,6 +684,16 @@ function NewPortfolioInner() {
             </div>
           )}
         </div>
+
+        {/* v19d: tell the user why the button is greyed out */}
+        {!canSubmit && !saving && missingReasons.length > 0 && (
+          <div className="mt-3 text-[11px] text-[#eab308] flex items-start gap-2">
+            <AlertCircle size={11} className="mt-0.5 flex-shrink-0" />
+            <span>
+              Before creating: {missingReasons.join(' · ')}
+            </span>
+          </div>
+        )}
 
         <div className="mt-4 text-[11px] text-[#555d72] flex items-start gap-2">
           <Info size={11} className="mt-0.5 flex-shrink-0" />

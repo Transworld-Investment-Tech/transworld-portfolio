@@ -6,6 +6,13 @@ export const maxDuration = 30
 
 // POST /api/portfolios — create a new portfolio + sleeve_targets + initial nav_log row
 // Performs a best-effort rollback if sleeve_targets insertion fails.
+//
+// v19d: starting_nav can now be 0 (for portfolios built up via TRANSFER_IN
+//       transactions rather than up-front capital deployment). Negatives are
+//       still rejected. The initial nav_log row is still written; nav_value
+//       will just be 0. The IRR Newton-Raphson solver handles this correctly —
+//       the −0 cash flow at t=0 is a no-op and subsequent TRANSFER_IN events
+//       become the real capital-in cash flows.
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json()
@@ -37,8 +44,18 @@ export async function POST(req: NextRequest) {
     if (!name || typeof name !== 'string') {
       return NextResponse.json({ error: 'name is required' }, { status: 400 })
     }
-    if (!starting_nav || typeof starting_nav !== 'number' || starting_nav <= 0) {
-      return NextResponse.json({ error: 'starting_nav must be a positive number' }, { status: 400 })
+    // v19d: allow 0. Reject undefined/null/NaN/negatives/non-numbers.
+    if (
+      starting_nav === undefined ||
+      starting_nav === null ||
+      typeof starting_nav !== 'number' ||
+      isNaN(starting_nav) ||
+      starting_nav < 0
+    ) {
+      return NextResponse.json(
+        { error: 'starting_nav must be 0 or a positive number' },
+        { status: 400 }
+      )
     }
     if (!start_date || typeof start_date !== 'string') {
       return NextResponse.json({ error: 'start_date is required' }, { status: 400 })
@@ -139,15 +156,19 @@ export async function POST(req: NextRequest) {
     // ─── Insert initial nav_log row ─────────────────────────────────
     // nav_log has NO unique constraint on (portfolio_id, nav_date), so plain INSERT.
     // Never use ON CONFLICT here — see pitfall #3.
+    // v19d: nav_value may be 0 for transaction-built portfolios.
+    const initialNote =
+      starting_nav === 0
+        ? 'Initial NAV at portfolio inception — to be built from transactions'
+        : 'Initial NAV at portfolio inception'
     const { error: navErr } = await (db.from('nav_log') as any).insert({
       portfolio_id: portfolio.id,
       nav_date: start_date,
       nav_value: starting_nav,
-      notes: 'Initial NAV at portfolio inception',
+      notes: initialNote,
     })
     if (navErr) {
       // Non-fatal — portfolio works without it, but IRR baseline won't be seeded.
-      // Surface it in the response so the UI can optionally warn, but succeed.
       return NextResponse.json({
         portfolio,
         warning: `Portfolio created but initial NAV log insert failed: ${navErr.message}`,
