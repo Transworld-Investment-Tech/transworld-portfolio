@@ -69,6 +69,7 @@ export type StatementRowKind =
   | 'deposit'
   | 'withdrawal'
   | 'management_fee'
+  | 'demat_fee'
   | 'bank_charge'
   | 'refund'
   | 'unknown'
@@ -779,7 +780,7 @@ function classifyStatementRow(row: StatementRow): void {
       row.kind = 'bank_charge'; return
     }
     if (/(demat|verification|consolidation of shares)/i.test(narr)) {
-      row.kind = 'bank_charge'; return
+      row.kind = 'demat_fee'; return
     }
     if (/refund/i.test(narr)) {
       row.kind = 'refund'; return
@@ -902,6 +903,7 @@ export function reconcile(
         case 'deposit':        proposed = 'TRANSFER_IN';  break
         case 'withdrawal':     proposed = 'TRANSFER_OUT'; break
         case 'management_fee': proposed = 'FEE';          break
+        case 'demat_fee':      proposed = 'FEE';          break
         case 'bank_charge':    proposed = 'FEE';          break
         case 'refund':         proposed = 'TRANSFER_OUT'; break
         default: proposed = null
