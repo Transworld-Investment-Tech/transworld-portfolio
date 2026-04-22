@@ -1,70 +1,63 @@
 // ============================================================
 // MARKET DATA — DIRECT NGX REST API + EXCHANGERATE
 // ============================================================
-// v20f: NGX removed ticker data from their server-rendered HTML page
-// (the page at /exchange/data/equities-price-list/ is now a static
-// WordPress shell served by w3-total-cache; its Elementor ticker widget
-// fetches prices client-side from a REST API). The v16b HTML parser
-// returned 0 quotes against the new shell. Migrated to hit the same
-// REST endpoint the official widget uses:
+// v20h: Richer data capture. The /statistics/equities/ endpoint returns
+// a lot more than price + change — OHLC, prev close, volume, trades
+// count, value traded (₦), sector, board classification, and the real
+// trade date. v20f was reading only price + PercChange out of the
+// response; v20h surfaces the rest through Quote.
 //
+// Also fixes a timezone-adjacent drift: /api/prices previously wrote
+// price_date = server UTC today. When refreshes fired near UTC midnight
+// (i.e. early WAT morning), that could record a Lagos trade as the
+// "previous" day. We now use the API's TradeDate authoritatively and
+// fall back to server today only if missing.
+//
+// Endpoint:
 //   https://doclib.ngxgroup.com/REST/api/statistics/equities/
 //     ?market=&sector=&orderby=&pageSize=300&pageNo=0
 //
-// Returns a JSON array of equity rows. Observed fields (sample):
-//   Symbol            "ACCESSCORP"
-//   ClosePrice        31.0
-//   Change            1.05        (absolute NGN change vs prev close)
-//   PercChange        3.51        (percent change; nullable on untraded days)
-//   PrevClosingPrice  29.95
-//   OpeningPrice, HighPrice, LowPrice, Volume, Trades, Value
-//   Market            "Premium Board" | "Main Board" | ...
-//   Sector            "FINANCIAL SERVICES" | ...
-//   Company2          "ACCESSCORP [MRF]"  (display name + board flag)
-//   TradeDate         "2026-04-22T00:00:00"
-//
-// Behaviour / contract preserved from v16b:
-//   - Returns Quote[] with the same shape
-//   - source field still 'ngx'
-//   - day_change stores PERCENT change (historical convention;
-//     matches what the old HTML parser captured from `0.95 %` text)
+// Contract preserved from v20f:
+//   - Quote.source still 'ngx'
+//   - Quote.day_change still stores PERCENT change (historical semantic)
 //   - NGX_TICKER_ALIASES still applied (MOBIL → MRS)
 //   - validInstrumentIds filter applied AFTER parse for diagnosability
 //   - Throws on empty results so /api/prices surfaces a clear error
 //
-// Advantages vs the old HTML scrape:
-//   - No chunking, no icon-class parsing, no directory disambiguation.
-//     The old 3-directory ambiguity (companydirectory vs bonddirectory
-//     vs etpdirectory) is gone: this endpoint only returns equities.
-//   - PercChange is available with full float precision (old HTML
-//     rounded to 2 decimals).
-//   - Symbol is already clean (no [MRF]/[DWL]/[MRS] bracket suffixes
-//     to strip — those now live in Company2, which we ignore).
+// New fields on Quote are all optional, so any caller written against
+// the v20f shape continues to compile and run unchanged.
 // ============================================================
 
 export interface Quote {
   instrument_id: string
-  price: number
-  day_change: number
+  price: number             // API.ClosePrice
+  day_change: number        // API.PercChange (percent; historical semantic preserved)
   source: string
   fetched_at: string
+
+  // v20h additions — all optional, all nullable in the DB
+  change_ngn?: number | null      // API.Change (absolute NGN change)
+  open_price?: number | null      // API.OpeningPrice
+  high_price?: number | null      // API.HighPrice
+  low_price?: number | null       // API.LowPrice
+  prev_close?: number | null      // API.PrevClosingPrice
+  volume?: number | null          // API.Volume
+  trades?: number | null          // API.Trades (count)
+  value_ngn?: number | null       // API.Value (₦ traded)
+  sector?: string | null          // API.Sector
+  ngx_market?: string | null      // API.Market ("Premium Board" / "Main Board" / …)
+  trade_date?: string | null      // YYYY-MM-DD parsed from API.TradeDate
 }
 
 // NGX's published ticker sometimes differs from our instrument_id.
-// v19c note: previously aliased FIRSTHOLDCO → FBNH; that alias was
-// removed when FIRSTHOLDCO became canonical and FBNH was merged.
 const NGX_TICKER_ALIASES: Record<string, string> = {
   MOBIL: 'MRS', // MRS Oil Nigeria (historical Mobil ticker)
 }
 
-// pageSize=300 easily covers the ~148-row NGX equity universe.
-// Passing empty market/sector/orderby returns the full list.
 const NGX_API_URL =
   'https://doclib.ngxgroup.com/REST/api/statistics/equities/' +
   '?market=&sector=&orderby=&pageSize=300&pageNo=0'
 
-// The doclib subdomain appears to respond to a plain fetch, but keep
-// a realistic User-Agent as defence against future UA-based filtering.
 const BROWSER_UA =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
@@ -74,11 +67,40 @@ interface NGXApiRow {
   ClosePrice?: number | null
   Change?: number | null
   PercChange?: number | null
-  TradeDate?: string
-  // Other fields (OpeningPrice, HighPrice, LowPrice, Volume, Trades,
-  // Value, Market, Sector, Company2, Id, $id) exist but we don't
-  // consume them here. Adding them would require market_prices
-  // schema changes.
+  OpeningPrice?: number | null
+  HighPrice?: number | null
+  LowPrice?: number | null
+  PrevClosingPrice?: number | null
+  Volume?: number | null
+  Trades?: number | null
+  Value?: number | null
+  Market?: string | null
+  Sector?: string | null
+  TradeDate?: string | null
+  // Also present on the wire but not consumed: $id, Id, Company2.
+  // CalculateChangePercent duplicates PercChange; we prefer the latter.
+}
+
+// Extract a finite number or null — mirrors "null-safe number" semantics.
+function num(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null
+}
+
+// Extract YYYY-MM-DD directly from the TradeDate string to avoid any
+// Date() object timezone shifting. The API returns formats like
+// "2026-04-22T00:00:00" with no TZ suffix; treating it as a naive local
+// date and slicing the first 10 chars is the safest read.
+function parseTradeDate(s: unknown): string | null {
+  if (typeof s !== 'string' || s.length < 10) return null
+  const d = s.slice(0, 10)
+  // Basic shape check: YYYY-MM-DD
+  return /^\d{4}-\d{2}-\d{2}$/.test(d) ? d : null
+}
+
+function cleanText(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  const t = v.trim()
+  return t.length > 0 ? t : null
 }
 
 // --------------------------------------------------------------
@@ -126,28 +148,37 @@ export async function fetchNGXPrices(
     const symbol = (row.Symbol || '').trim().toUpperCase()
     if (!symbol) continue
 
-    // ClosePrice must be a positive number to be useful. Some rows for
-    // suspended or untraded equities come through with null ClosePrice.
-    const price = typeof row.ClosePrice === 'number' ? row.ClosePrice : NaN
-    if (!Number.isFinite(price) || price <= 0) continue
+    // ClosePrice must be a positive number. Suspended / untraded equities
+    // come through with null or zero ClosePrice and are skipped.
+    const price = num(row.ClosePrice)
+    if (price === null || price <= 0) continue
 
-    // PercChange is nullable for zero-volume days (see ACADEMY, AFRINSURE
-    // in the observed response); treat null/NaN as 0% change.
-    const rawPct = typeof row.PercChange === 'number' ? row.PercChange : 0
-    const change = Number.isFinite(rawPct) ? rawPct : 0
+    // PercChange is nullable on zero-volume days; treat as 0.
+    const pct = num(row.PercChange)
+    const day_change = pct === null ? 0 : pct
 
     const instrument_id = NGX_TICKER_ALIASES[symbol] || symbol
 
-    // Dedup by instrument_id. The API is a flat equity list so duplicates
-    // shouldn't occur, but keep the dedup as belt-and-braces in case a
-    // future API change introduces them.
     if (!seen.has(instrument_id)) {
       seen.set(instrument_id, {
         instrument_id,
         price,
-        day_change: change,
+        day_change,
         source: 'ngx',
         fetched_at: fetchedAt,
+
+        // v20h additions
+        change_ngn: num(row.Change),
+        open_price: num(row.OpeningPrice),
+        high_price: num(row.HighPrice),
+        low_price:  num(row.LowPrice),
+        prev_close: num(row.PrevClosingPrice),
+        volume:     num(row.Volume),
+        trades:     num(row.Trades),
+        value_ngn:  num(row.Value),
+        sector:     cleanText(row.Sector),
+        ngx_market: cleanText(row.Market),
+        trade_date: parseTradeDate(row.TradeDate),
       })
     }
   }

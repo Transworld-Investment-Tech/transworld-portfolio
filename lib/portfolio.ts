@@ -1,24 +1,18 @@
 // ============================================================
 // PORTFOLIO CALCULATION ENGINE
 // ============================================================
-// v20g: Two changes vs prior:
-//   1. Portfolio and Instrument interfaces refreshed to match the
-//      live Supabase schema (pitfall #36). Several (portfolio as any)
-//      casts elsewhere in the codebase become superfluous after this;
-//      they remain harmless until opportunistically removed.
-//   2. Hybrid chart palette (HYBRID_SLEEVE_COLORS, HYBRID_PALETTE,
-//      colorForSleeve) is now exported from here rather than
-//      duplicated in AllocationDonut.tsx and AUMBarChart.tsx.
-//
-// Legacy SLEEVE_COLOURS is preserved unchanged because phase-2 pages
-// (Holdings, Transactions, Reports, Settings, Admin, Import) still
-// use the dark-theme palette. Delete only after every page migrates.
+// v20g: Portfolio + Instrument interfaces refreshed against live
+// Supabase schema; hybrid chart palette centralised here.
+// v20h: Instrument gains `sector` and `ngx_market` optional fields to
+// match the schema migration that adds those columns on `instruments`.
+// Populated by /api/prices on every refresh (derived from NGX's
+// Sector / Market fields).
 // ============================================================
 
 // ─── Instrument ─────────────────────────────────────────────────
 // Mirrors the `instruments` table in Supabase. Dividend fields are
-// intentionally omitted from this interface — they're only consumed
-// on the dividend refresh path, not in core NAV / sleeve calculations.
+// intentionally omitted — they're consumed only on the dividend refresh
+// path, not in core NAV / sleeve calculations.
 export interface Instrument {
   instrument_id: string
   name: string
@@ -29,6 +23,9 @@ export interface Instrument {
   coupon_pct: number
   approved?: boolean
   ngx_symbol?: string
+  // v20h additions — per-security classification from NGX
+  sector?: string | null
+  ngx_market?: string | null
   // Computed / joined at query time:
   latest_price?: number
   day_change?: number
@@ -189,11 +186,6 @@ export const SLEEVE_COLOURS: Record<string, { hex: string; bg: string; text: str
 // ─── Hybrid (v20+) palette ─────────────────────────────────────
 // Single source of truth for all v20+ chart components. Mirrors
 // the CSS custom properties in globals.css.
-//
-// HYBRID_SLEEVE_COLORS maps a sleeve_id to its brand colour.
-// HYBRID_PALETTE is an ordered list used for positional assignment
-// when rendering charts that aren't sleeve-specific (e.g. AUM bar
-// chart per portfolio).
 export const HYBRID_SLEEVE_COLORS: Record<string, string> = {
   liq: '#0a1f3a', // navy        (--sidebar-bg)
   eq:  '#b08b3e', // muted gold  (--gold)
