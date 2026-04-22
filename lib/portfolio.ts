@@ -77,6 +77,10 @@ export interface Portfolio {
   max_eq_sleeve: number
   status?: string              // 'active' | 'archived'
   notes?: string | null
+  // v21b-1: portfolio-level CSCS identifier. Display-only — not
+  // used for auto-matching (a client can have multiple portfolios,
+  // each with its own CSCS account).
+  cscs_number?: string | null
   created_at?: string
   updated_at?: string
   client?: {
@@ -84,6 +88,155 @@ export interface Portfolio {
     code: string
     type?: string              // 'discretionary' | 'advisory' | 'internal'
   }
+}
+
+// ─── Transaction ────────────────────────────────────────────────
+// Mirrors the `transactions` table per 03_schema.md. Most fields
+// are optional because different action types populate different
+// subsets:
+//   BUY / SELL:    trade-fee columns, cn_number, settlement_date
+//   TRANSFER_IN:   amount, external_ref, notes
+//   TRANSFER_OUT:  amount, external_ref, notes (also used for
+//                  refunds — narration in `notes` preserves context)
+//   FEE:           amount + exactly one of fee_management,
+//                  fee_demat, fee_other, plus notes
+//   INCOME:        amount, instrument_id (dividends), notes
+// v21b-1 adds: cn_number, settlement_date, fee_sec, fee_management,
+// fee_demat, fee_other, external_ref, source_file_id.
+export interface Transaction {
+  id: string
+  portfolio_id: string
+  trade_date: string
+  action: 'BUY' | 'SELL' | 'INCOME' | 'FEE' | 'TRANSFER_IN' | 'TRANSFER_OUT'
+  instrument_id?: string | null
+  quantity?: number | null
+  price?: number | null
+  gross_value?: number | null
+  amount?: number | null
+
+  // Trade fees (from contract notes — populated on BUY / SELL)
+  fees?: number | null
+  fee_commission?: number | null
+  fee_vat?: number | null
+  fee_exchange?: number | null
+  fee_clearing?: number | null
+  fee_sec?: number | null
+  fee_contract_stamp?: number | null
+  fee_sms?: number | null
+
+  // Non-trade fee breakdown (populated on FEE — exactly one)
+  fee_management?: number | null
+  fee_demat?: number | null
+  fee_other?: number | null
+
+  // Broker metadata
+  cn_number?: string | null
+  settlement_date?: string | null
+  external_ref?: string | null
+  broker?: string | null
+  notes?: string | null
+
+  // Traceability — which uploaded broker file this row came from.
+  // NULL for historical rows imported pre-v21.
+  source_file_id?: string | null
+
+  created_at?: string
+}
+
+// ─── BrokerFile ─────────────────────────────────────────────────
+// Mirrors the `broker_files` table. One row per uploaded PDF —
+// either a contract-notes export or a statement-of-account export.
+// PDF bytes live in Supabase Storage; this row is the catalog
+// entry that ties staged_transactions and committed transactions
+// back to their source. v21b-1.
+export interface BrokerFile {
+  id: string
+  portfolio_id: string
+  file_kind: 'contract_notes' | 'statement'
+  original_filename: string
+  storage_path: string
+  size_bytes?: number | null
+
+  // Parse metadata
+  parsed_at?: string | null
+  parse_status: 'pending' | 'parsed' | 'parse_failed' | 'committed' | 'rolled_back'
+  parse_error?: string | null
+
+  // Content metadata (filled by parser)
+  account_holder?: string | null
+  cscs_number?: string | null
+  period_from?: string | null
+  period_to?: string | null
+
+  // Statement-only: running-balance audit result
+  audit_opening?: number | null
+  audit_closing?: number | null
+  audit_computed?: number | null
+  audit_passes?: boolean | null
+
+  uploaded_by?: string | null
+  created_at: string
+  updated_at: string
+}
+
+// ─── StagedTransaction ──────────────────────────────────────────
+// Mirrors `staged_transactions` — parsed-but-not-yet-committed
+// rows from a broker file. Promoted to `transactions` by the
+// commit flow in v21c. recon_* fields carry the reconciliation
+// status from the parser so the inbox UI can preview what would
+// be imported. v21b-1.
+export interface StagedTransaction {
+  id: string
+  broker_file_id: string
+  portfolio_id: string
+
+  trade_date: string
+  settlement_date?: string | null
+  action: string
+  instrument_id?: string | null
+  quantity?: number | null
+  price?: number | null
+  gross_value?: number | null
+  amount?: number | null
+
+  // Trade fees
+  fee_commission?: number | null
+  fee_vat?: number | null
+  fee_exchange?: number | null
+  fee_clearing?: number | null
+  fee_sec?: number | null
+  fee_contract_stamp?: number | null
+  fee_sms?: number | null
+
+  // Non-trade fee breakdown
+  fee_management?: number | null
+  fee_demat?: number | null
+  fee_other?: number | null
+
+  // Broker metadata
+  cn_number?: string | null
+  external_ref?: string | null
+  narration?: string | null
+
+  // Reconciliation state from the parser
+  recon_kind?:
+    | 'matched_exact'
+    | 'matched_split'
+    | 'partial_mismatch'
+    | 'unmatched'
+    | 'cash_event_auto'
+    | 'cash_event_unknown'
+    | null
+  recon_note?: string | null
+
+  // Dedup flags set by ingestion at upload time
+  dedup_status: 'new' | 'duplicate_cn' | 'duplicate_fingerprint'
+  duplicate_of?: string | null
+
+  // User-driven staging flow
+  include_in_commit: boolean
+
+  created_at: string
 }
 
 // ---- Compute NAV ----
