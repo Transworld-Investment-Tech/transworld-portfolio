@@ -1,5 +1,10 @@
-// Generates a self-contained HTML report combining portfolio data + AI analysis
-// Opens in a new window — user can Cmd+P → Save as PDF, or Cmd+S to save HTML
+// v20: Hybrid-style HTML report for the Download Report button.
+// Opens in a new window — user Cmd+P → Save as PDF, or Cmd+S to save HTML.
+//
+// Palette: navy #0a1f3a × cream #f5efe0/#fffbf2 × muted gold #b08b3e.
+// Typography: Cormorant Garamond (display) + DM Sans (body).
+// Structure unchanged from v19: KPI strip → Allocation → Holdings →
+// Performance/Benchmarks → Fees → Mandate → AI analysis.
 
 export interface ReportData {
   portfolioName: string
@@ -7,14 +12,12 @@ export interface ReportData {
   reportDate: string
   generatedAt: string
   currency: string
-  // Performance
   currentNAV: number
   startingNAV: number
   startDate: string
   totalReturn: number
   totalReturnPct: number
   fxRate: number
-  // Sleeves
   sleeves: Array<{
     name: string
     targetPct: number
@@ -22,7 +25,6 @@ export interface ReportData {
     value: number
     status: string
   }>
-  // Holdings
   holdings: Array<{
     instrumentId: string
     name: string
@@ -35,7 +37,6 @@ export interface ReportData {
     unrealisedPnL: number
     weight: number
   }>
-  // Fee summary
   fees: {
     commission: number
     vat: number
@@ -46,7 +47,6 @@ export interface ReportData {
     management: number
     total: number
   }
-  // Transaction counts
   txSummary: {
     total: number
     buys: number
@@ -54,7 +54,6 @@ export interface ReportData {
     buyGross: number
     sellGross: number
   }
-  // Mandate
   mandate: {
     incomeTarget: number
     capTarget: number
@@ -63,7 +62,6 @@ export interface ReportData {
     ddAlert: number
     ddAction: number
   }
-  // Analytics
   irr: number | null
   annualisedReturn: number | null
   periodReturns: Array<{
@@ -77,13 +75,11 @@ export interface ReportData {
     annualised: number
     type: string
   }>
-  // AI report
   aiReport?: {
     type: string
     content: string
     date: string
   }
-  // Compliance alerts
   alerts: Array<{
     level: string
     message: string
@@ -100,6 +96,8 @@ function fmtPct(n: number | null, decimals = 1): string {
   if (n === null || isNaN(n as number)) return 'N/A'
   return (n >= 0 ? '+' : '') + fmt((n as number) * 100, decimals) + '%'
 }
+
+// Lightweight markdown converter for the AI report section
 function markdownToHTML(md: string): string {
   const lines = md.split('\n')
   const out: string[] = []
@@ -108,11 +106,12 @@ function markdownToHTML(md: string): string {
     const line = lines[i]
     if (line.startsWith('| ')) {
       if (line.replace(/[\s\-|]/g, '') === '') continue
-      if (!tbuf) tbuf = ''
       const cells = line.split('|').filter(c => c.trim())
       const isHeader = lines[i + 1]?.replace(/[\s\-|]/g, '') === ''
       const tag = isHeader ? 'th' : 'td'
-      tbuf += '<tr>' + cells.map(c => '<' + tag + '>' + c.trim().replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') + '</' + tag + '>').join('') + '</tr>'
+      tbuf += '<tr>' + cells.map(c =>
+        '<' + tag + '>' + c.trim().replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>') + '</' + tag + '>'
+      ).join('') + '</tr>'
       continue
     } else if (tbuf) {
       out.push('<table>' + tbuf + '</table>')
@@ -138,119 +137,378 @@ export function generateHTMLReport(data: ReportData): string {
   const pnlSign = data.totalReturn >= 0 ? '+' : ''
   const portfolioIRR = data.irr ?? data.annualisedReturn ?? 0
 
+  // ═══════════════════════════════════════════════════════════
+  // Hybrid CSS — navy × cream × gold × Cormorant + DM Sans
+  // ═══════════════════════════════════════════════════════════
   const CSS = `
+    @import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;0,700;1,400;1,500&family=DM+Sans:wght@300;400;500;600;700&display=swap');
+
+    :root {
+      --bg: #f5efe0;
+      --bg-soft: #faf5ea;
+      --card: #fffbf2;
+      --sidebar-bg: #0a1f3a;
+      --text: #0f2947;
+      --text-2: #5c6573;
+      --text-3: #8a8f9a;
+      --border: rgba(15, 41, 71, 0.14);
+      --border-soft: rgba(15, 41, 71, 0.07);
+      --gold: #b08b3e;
+      --gold-bright: #c9a556;
+      --gold-soft: rgba(176, 139, 62, 0.12);
+      --pos: #2d6e4e;
+      --neg: #a63b3b;
+      --warn: #a67c2a;
+    }
+
     * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', Arial, sans-serif; background: #f0f2f5; color: #111; font-size: 10pt; line-height: 1.6; }
-    .page { max-width: 960px; margin: 0 auto; background: white; }
+    body {
+      font-family: 'DM Sans', 'Segoe UI', sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 10pt;
+      line-height: 1.55;
+    }
+    .page { max-width: 960px; margin: 0 auto; background: var(--card); border: 1px solid var(--border); }
 
     /* Header */
-    .header { background: #0f1923; color: white; padding: 32px 48px 28px; border-bottom: 4px solid #c9a84c; }
-    .header-top { display: flex; justify-content: space-between; align-items: flex-start; }
-    .firm { font-size: 9pt; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #c9a84c; margin-bottom: 8px; }
-    .port-name { font-size: 22pt; font-weight: 700; color: white; margin-bottom: 4px; }
-    .client-name { font-size: 12pt; color: #8a91a8; }
+    .header {
+      background: var(--sidebar-bg);
+      color: #e8d9b5;
+      padding: 32px 48px 26px;
+      border-bottom: 1px solid var(--gold);
+    }
+    .header-top {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      gap: 20px;
+    }
+    .firm {
+      font-size: 9pt;
+      font-weight: 600;
+      letter-spacing: 0.2em;
+      text-transform: uppercase;
+      color: var(--gold);
+      margin-bottom: 10px;
+    }
+    .port-name {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 30pt;
+      font-weight: 500;
+      color: #e8d9b5;
+      letter-spacing: -0.005em;
+      line-height: 1;
+      margin-bottom: 6px;
+    }
+    .client-name {
+      font-size: 11pt;
+      color: rgba(232, 217, 181, 0.7);
+      font-weight: 400;
+    }
     .header-right { text-align: right; }
-    .report-date { font-size: 11pt; color: #8a91a8; }
-    .confidential { background: #c9a84c; color: #0f1923; font-size: 8pt; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; padding: 3px 10px; border-radius: 4px; display: inline-block; margin-top: 8px; }
+    .report-date {
+      font-size: 10pt;
+      color: rgba(232, 217, 181, 0.7);
+    }
+    .confidential {
+      background: var(--gold);
+      color: var(--sidebar-bg);
+      font-size: 8pt;
+      font-weight: 700;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      padding: 3px 10px;
+      border-radius: 2px;
+      display: inline-block;
+      margin-top: 10px;
+    }
 
     /* Alerts */
-    .alert-breach { background: #fee2e2; border-left: 4px solid #ef4444; padding: 10px 16px; margin: 0; font-size: 9.5pt; font-weight: 600; color: #7f1d1d; }
-    .alert-warning { background: #fef3c7; border-left: 4px solid #f59e0b; padding: 10px 16px; margin: 0; font-size: 9.5pt; font-weight: 600; color: #78350f; }
+    .alert-breach {
+      background: rgba(166, 59, 59, 0.08);
+      border-left: 3px solid var(--neg);
+      padding: 10px 18px;
+      font-size: 10pt;
+      font-weight: 500;
+      color: var(--neg);
+    }
+    .alert-warning {
+      background: rgba(166, 124, 42, 0.1);
+      border-left: 3px solid var(--warn);
+      padding: 10px 18px;
+      font-size: 10pt;
+      font-weight: 500;
+      color: var(--warn);
+    }
 
     /* Content */
-    .content { padding: 32px 48px; }
-    .section { margin-bottom: 32px; page-break-inside: avoid; }
-    .section-title { font-size: 9pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #c9a84c; border-bottom: 1px solid #e5e7eb; padding-bottom: 6px; margin-bottom: 16px; }
+    .content { padding: 36px 48px; }
+    .section { margin-bottom: 34px; page-break-inside: avoid; }
+    .section-title {
+      font-size: 10pt;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.14em;
+      color: var(--text-3);
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 8px;
+      margin-bottom: 18px;
+    }
 
     /* KPI strip */
-    .kpi-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 28px; }
-    .kpi { background: #f9fafb; border-radius: 8px; padding: 16px; border-top: 3px solid #e5e7eb; }
-    .kpi-gold { border-top-color: #c9a84c; }
-    .kpi-green { border-top-color: #22c55e; }
-    .kpi-red { border-top-color: #ef4444; }
-    .kpi-purple { border-top-color: #8b5cf6; }
-    .kpi-label { font-size: 8.5pt; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: #6b7280; margin-bottom: 6px; }
-    .kpi-value { font-size: 20pt; font-weight: 700; font-family: monospace; color: #111; }
-    .kpi-sub { font-size: 8.5pt; color: #9ca3af; margin-top: 4px; }
+    .kpi-row {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 14px;
+      margin-bottom: 32px;
+    }
+    .kpi {
+      background: var(--bg-soft);
+      border: 1px solid var(--border-soft);
+      border-radius: 4px;
+      padding: 18px 20px;
+      position: relative;
+      overflow: hidden;
+    }
+    .kpi::before {
+      content: '';
+      position: absolute;
+      top: 0;
+      left: 0;
+      width: 32px;
+      height: 2px;
+      background: var(--gold);
+    }
+    .kpi-label {
+      font-size: 8.5pt;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      color: var(--text-3);
+      margin-bottom: 12px;
+    }
+    .kpi-value {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 26pt;
+      font-weight: 500;
+      letter-spacing: -0.015em;
+      line-height: 1;
+      color: var(--text);
+    }
+    .kpi-value.pos { color: var(--pos); }
+    .kpi-value.neg { color: var(--neg); }
+    .kpi-value.gold { color: var(--gold); }
+    .kpi-sub {
+      font-size: 9pt;
+      color: var(--text-2);
+      margin-top: 8px;
+    }
 
     /* Tables */
-    table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 9pt; }
-    th { background: #f3f4f6; font-weight: 700; text-align: left; padding: 8px 10px; border-bottom: 2px solid #e5e7eb; color: #374151; font-size: 8.5pt; text-transform: uppercase; letter-spacing: 0.04em; }
-    td { padding: 7px 10px; border-bottom: 1px solid #f3f4f6; vertical-align: top; color: #374151; }
+    table { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: 9.5pt; }
+    th {
+      font-weight: 600;
+      text-align: left;
+      padding: 9px 12px;
+      border-bottom: 1px solid var(--border);
+      color: var(--text-3);
+      font-size: 9pt;
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+    }
+    td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border-soft);
+      vertical-align: top;
+      color: var(--text);
+    }
     tr:last-child td { border-bottom: none; }
-    .mono { font-family: monospace; }
-    .green { color: #15803d; font-weight: 600; }
-    .red { color: #dc2626; font-weight: 600; }
-    .badge { display: inline-block; padding: 2px 7px; border-radius: 4px; font-size: 8pt; font-weight: 700; }
-    .badge-ok { background: #dcfce7; color: #15803d; }
-    .badge-breach { background: #fee2e2; color: #dc2626; }
-    .badge-warn { background: #fef9c3; color: #854d0e; }
-    .badge-buy { background: #dbeafe; color: #1d4ed8; }
-    .badge-sell { background: #fce7f3; color: #be185d; }
-    .badge-eq { background: #ede9fe; color: #6d28d9; }
-    .badge-fi { background: #d1fae5; color: #065f46; }
+    tr:hover td { background: rgba(15, 41, 71, 0.02); }
+    .mono { font-family: 'DM Sans', 'SF Mono', monospace; font-variant-numeric: tabular-nums; }
+    .serif {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 11.5pt;
+      font-weight: 500;
+      letter-spacing: -0.005em;
+    }
+    .green { color: var(--pos); font-weight: 500; }
+    .red   { color: var(--neg); font-weight: 500; }
+
+    /* Pills */
+    .badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 2px;
+      font-size: 8pt;
+      font-weight: 600;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+    .badge-ok     { background: rgba(45, 110, 78, 0.12); color: var(--pos); }
+    .badge-breach { background: rgba(166, 59, 59, 0.12); color: var(--neg); }
+    .badge-warn   { background: rgba(166, 124, 42, 0.14); color: var(--warn); }
+    .badge-buy    { background: rgba(45, 110, 78, 0.12); color: var(--pos); }
+    .badge-sell   { background: rgba(166, 59, 59, 0.12); color: var(--neg); }
+    .badge-eq     { background: var(--gold-soft); color: var(--gold); }
+    .badge-fi     { background: rgba(45, 110, 78, 0.12); color: var(--pos); }
 
     /* Allocation bars */
-    .sleeve-row { margin-bottom: 16px; }
-    .sleeve-header { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 9pt; font-weight: 600; }
-    .bar-bg { background: #f3f4f6; border-radius: 4px; height: 8px; position: relative; }
-    .bar-fill { height: 8px; border-radius: 4px; }
-    .bar-green { background: #22c55e; }
-    .bar-red { background: #ef4444; }
-    .bar-amber { background: #f59e0b; }
+    .sleeve-row { margin-bottom: 18px; }
+    .sleeve-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+      margin-bottom: 7px;
+      font-size: 10pt;
+    }
+    .sleeve-header .label { font-weight: 500; color: var(--text); }
+    .sleeve-header .meta { color: var(--text-2); font-size: 9pt; }
+    .sleeve-header .meta .serif { color: var(--text); }
+    .bar-bg {
+      background: rgba(15, 41, 71, 0.08);
+      border-radius: 3px;
+      height: 6px;
+      position: relative;
+    }
+    .bar-fill {
+      height: 6px;
+      border-radius: 3px;
+    }
+    .bar-green { background: var(--pos); }
+    .bar-red   { background: var(--neg); }
+    .bar-amber { background: var(--warn); }
+    .bar-gold  { background: linear-gradient(90deg, var(--gold), var(--gold-bright)); }
+    .bar-navy  { background: var(--sidebar-bg); }
 
-    /* AI report section */
-    .ai-section { border-top: 2px solid #c9a84c; margin-top: 32px; padding-top: 28px; }
-    .ai-section h2 { font-size: 11pt; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #0f1923; border-bottom: 1px solid rgba(201,168,76,0.3); padding-bottom: 6px; margin: 24px 0 8px; }
-    .ai-section h3 { font-size: 10.5pt; font-weight: 600; color: #5b21b6; margin: 16px 0 6px; }
-    .ai-section p { margin: 5px 0; color: #222; line-height: 1.7; }
-    .ai-section strong { color: #0f1923; font-weight: 700; }
-    .ai-section em { color: #555; }
-    .ai-section hr { border: none; border-top: 1px solid #e5e7eb; margin: 18px 0; }
-    .ai-section table { font-size: 9pt; }
+    /* AI analysis */
+    .ai-section {
+      border-top: 1px solid var(--gold);
+      margin-top: 36px;
+      padding-top: 28px;
+    }
+    .ai-section h2 {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 15pt;
+      font-weight: 500;
+      color: var(--text);
+      border-bottom: 1px solid var(--border-soft);
+      padding-bottom: 6px;
+      margin: 24px 0 10px;
+    }
+    .ai-section h3 {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-style: italic;
+      font-size: 12pt;
+      font-weight: 500;
+      color: var(--gold);
+      margin: 18px 0 6px;
+    }
+    .ai-section p {
+      margin: 5px 0;
+      color: var(--text);
+      line-height: 1.7;
+    }
+    .ai-section strong { color: var(--text); font-weight: 600; }
+    .ai-section em { color: var(--text-2); }
+    .ai-section hr { border: none; border-top: 1px solid var(--border-soft); margin: 20px 0; }
+    .ai-section table { font-size: 9pt; margin: 12px 0; }
     .ai-section .gap { height: 6px; }
-    .ai-section code { background: #f3f4f6; padding: 1px 4px; border-radius: 3px; font-size: 8.5pt; }
+    .ai-section code {
+      background: var(--bg-soft);
+      padding: 1px 5px;
+      border-radius: 2px;
+      font-size: 8.5pt;
+      color: var(--gold);
+    }
 
-    /* Benchmark table */
-    .port-row { background: #f5f3ff !important; }
-    .port-row td { font-weight: 600; }
+    /* Benchmark portfolio row */
+    .port-row { background: var(--gold-soft) !important; }
+    .port-row td { font-weight: 600; color: var(--text); }
 
     /* Footer */
-    .footer { background: #f9fafb; padding: 20px 48px; border-top: 1px solid #e5e7eb; font-size: 8pt; color: #6b7280; line-height: 1.6; }
+    .footer {
+      background: var(--bg-soft);
+      padding: 24px 48px;
+      border-top: 1px solid var(--border);
+      font-size: 8.5pt;
+      color: var(--text-2);
+      line-height: 1.7;
+    }
+    .footer strong { color: var(--text); }
 
     /* Print */
     @media print {
       @page { size: A4; margin: 12mm; }
       body { background: white; }
-      .page { max-width: 100%; }
+      .page { max-width: 100%; border: none; }
       .no-print { display: none !important; }
       .section { page-break-inside: avoid; }
-      .header { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-      .kpi { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-      th { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-      .badge { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-      .bar-fill { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .header,
+      .kpi,
+      th,
+      .badge,
+      .bar-fill,
+      .confidential,
+      .port-row {
+        -webkit-print-color-adjust: exact;
+        print-color-adjust: exact;
+      }
     }
 
-    /* Print button */
-    .print-bar { position: fixed; bottom: 24px; right: 24px; display: flex; gap: 10px; z-index: 100; }
-    .btn { padding: 12px 22px; border: none; border-radius: 8px; font-size: 12px; font-weight: 600; cursor: pointer; font-family: inherit; }
-    .btn-primary { background: #a78bfa; color: white; }
-    .btn-secondary { background: #374151; color: white; }
-    .btn:hover { opacity: 0.9; }
+    /* Print button bar */
+    .print-bar {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      display: flex;
+      gap: 10px;
+      z-index: 100;
+    }
+    .btn {
+      padding: 10px 18px;
+      border: none;
+      border-radius: 3px;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      font-family: 'DM Sans', sans-serif;
+    }
+    .btn-primary {
+      background: var(--sidebar-bg);
+      color: var(--gold-bright);
+    }
+    .btn-primary:hover { background: #081a30; color: #e8d9b5; }
+    .btn-secondary {
+      background: transparent;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .btn-secondary:hover { background: var(--bg-soft); }
   `
 
+  // ─── Render sleeves as bars ──────────────────────────────────
   const sleeveRows = data.sleeves.map(s => {
-    const barColor = s.status === 'BREACH' ? 'bar-red' : s.status === 'OVER' ? 'bar-amber' : 'bar-green'
-    const badgeClass = s.status === 'BREACH' ? 'badge-breach' : s.status === 'OVER' ? 'badge-warn' : 'badge-ok'
+    const barColor =
+      s.status === 'BREACH' ? 'bar-red'
+      : s.status === 'OVER' ? 'bar-amber'
+      : s.name.toLowerCase().includes('equit') ? 'bar-gold'
+      : s.name.toLowerCase().includes('cash') || s.name.toLowerCase().includes('liquid') ? 'bar-navy'
+      : 'bar-green'
+    const badgeClass =
+      s.status === 'BREACH' ? 'badge-breach'
+      : s.status === 'OVER' ? 'badge-warn'
+      : 'badge-ok'
     const barWidth = Math.min(100, s.actualPct * 100).toFixed(1)
-    const targetWidth = Math.min(100, s.targetPct * 100).toFixed(1)
     return `
       <div class="sleeve-row">
         <div class="sleeve-header">
-          <span>${s.name}</span>
-          <span class="mono">${(s.actualPct * 100).toFixed(1)}% actual &nbsp;·&nbsp; ${(s.targetPct * 100).toFixed(1)}% target &nbsp;·&nbsp; ${fmtM(s.value)} &nbsp;
-            <span class="badge ${badgeClass}">${s.status}</span>
+          <span class="label">${s.name}</span>
+          <span class="meta">
+            <span class="serif">${(s.actualPct * 100).toFixed(1)}%</span> actual ·
+            <span class="serif">${(s.targetPct * 100).toFixed(1)}%</span> target ·
+            <span class="serif">${fmtM(s.value)}</span>
+            &nbsp;<span class="badge ${badgeClass}">${s.status}</span>
           </span>
         </div>
         <div class="bar-bg">
@@ -259,41 +517,48 @@ export function generateHTMLReport(data: ReportData): string {
       </div>`
   }).join('')
 
+  // ─── Holdings rows ──────────────────────────────────
   const holdingsRows = data.holdings.map(h => {
     const pnlClass = h.unrealisedPnL >= 0 ? 'green' : 'red'
     const pnlSign2 = h.unrealisedPnL >= 0 ? '+' : ''
     return `<tr>
-      <td><strong>${h.name}</strong><br><span style="color:#9ca3af;font-size:8pt">${h.instrumentId}</span></td>
+      <td><strong>${h.name}</strong><br><span style="color:var(--text-3);font-size:8.5pt;font-family:DM Sans,monospace">${h.instrumentId}</span></td>
       <td><span class="badge ${h.type === 'Stock' ? 'badge-eq' : 'badge-fi'}">${h.type}</span></td>
       <td class="mono">${h.quantity.toLocaleString()}</td>
       <td class="mono">₦${fmt(h.avgCost)}</td>
       <td class="mono">₦${fmt(h.currentPrice)}</td>
-      <td class="mono">${fmtM(h.marketValue)}</td>
-      <td class="mono ${pnlClass}">${pnlSign2}${fmtM(h.unrealisedPnL)}</td>
+      <td class="serif">${fmtM(h.marketValue)}</td>
+      <td class="serif ${pnlClass}">${pnlSign2}${fmtM(h.unrealisedPnL)}</td>
       <td class="mono">${(h.weight * 100).toFixed(1)}%</td>
     </tr>`
   }).join('')
 
+  // ─── Period returns ──────────────────────────────────
   const periodRows = data.periodReturns.map(pr => {
     const cls = (pr.percentReturn ?? 0) >= 0 ? 'green' : 'red'
     return `<tr>
       <td>${pr.label}</td>
-      <td class="mono ${cls}">${fmtPct(pr.percentReturn)}</td>
+      <td class="serif ${cls}">${fmtPct(pr.percentReturn)}</td>
       <td class="mono">${pr.annualisedReturn !== null ? fmtPct(pr.annualisedReturn) : '—'}</td>
       <td class="mono">${pr.daysHeld ?? '—'}</td>
     </tr>`
   }).join('')
 
+  // ─── Benchmarks ──────────────────────────────────
   const benchmarkRows = data.benchmarks.map(b => {
     const diff = portfolioIRR - b.annualised
     const diffClass = diff >= 0 ? 'green' : 'red'
-    const typeBadge = b.type === 'equity' ? 'badge-eq' : b.type === 'inflation' ? 'badge-breach' : 'badge-fi'
-    const typeLabel = b.type === 'equity' ? 'Equity' : b.type === 'inflation' ? 'Inflation' : 'Fixed Income'
+    const typeBadge = b.type === 'equity' ? 'badge-eq'
+      : b.type === 'inflation' ? 'badge-breach'
+      : 'badge-fi'
+    const typeLabel = b.type === 'equity' ? 'Equity'
+      : b.type === 'inflation' ? 'Inflation'
+      : 'Fixed Income'
     return `<tr>
       <td>${b.name}</td>
       <td><span class="badge ${typeBadge}">${typeLabel}</span></td>
       <td class="mono">${(b.annualised * 100).toFixed(1)}%</td>
-      <td class="mono ${diffClass}">${diff >= 0 ? '+' : ''}${(diff * 100).toFixed(1)}pp</td>
+      <td class="serif ${diffClass}">${diff >= 0 ? '+' : ''}${(diff * 100).toFixed(1)}pp</td>
     </tr>`
   }).join('')
 
@@ -303,7 +568,7 @@ export function generateHTMLReport(data: ReportData): string {
 
   const aiSection = data.aiReport ? `
     <div class="ai-section">
-      <div class="section-title">AI Portfolio Intelligence — ${data.aiReport.type.toUpperCase()} Report · ${data.aiReport.date}</div>
+      <div class="section-title">AI Portfolio Intelligence — ${data.aiReport.type.toUpperCase()} · ${data.aiReport.date}</div>
       ${markdownToHTML(data.aiReport.content)}
     </div>` : ''
 
@@ -322,50 +587,49 @@ export function generateHTMLReport(data: ReportData): string {
   <div class="header">
     <div class="header-top">
       <div>
-        <div class="firm">Transworld Asset Management — Portfolio Intelligence</div>
+        <div class="firm">Transworld Asset Management · Portfolio Intelligence</div>
         <div class="port-name">${data.portfolioName}</div>
         <div class="client-name">${data.clientName}</div>
       </div>
       <div class="header-right">
         <div class="report-date">As at ${data.reportDate}</div>
-        <div class="report-date" style="font-size:9pt;margin-top:4px;">Generated ${data.generatedAt}</div>
+        <div class="report-date" style="font-size:8.5pt;margin-top:4px;">Generated ${data.generatedAt}</div>
         <div class="confidential">Confidential</div>
       </div>
     </div>
   </div>
 
-  <!-- Compliance alerts -->
   ${alertBars}
 
   <div class="content">
 
-    <!-- KPI Strip -->
+    <!-- KPI strip -->
     <div class="kpi-row">
-      <div class="kpi kpi-gold">
+      <div class="kpi">
         <div class="kpi-label">Current NAV</div>
-        <div class="kpi-value" style="font-size:18pt">${fmtM(data.currentNAV)}</div>
+        <div class="kpi-value">${fmtM(data.currentNAV)}</div>
         <div class="kpi-sub">Currency: ${data.currency} · Rate ₦${Math.round(data.fxRate).toLocaleString()}/USD</div>
       </div>
-      <div class="kpi ${data.totalReturn >= 0 ? 'kpi-green' : 'kpi-red'}">
+      <div class="kpi">
         <div class="kpi-label">Total P&amp;L vs Start</div>
-        <div class="kpi-value" style="font-size:18pt;color:${data.totalReturn >= 0 ? '#15803d' : '#dc2626'}">${pnlSign}${fmtM(data.currentNAV - data.startingNAV)}</div>
+        <div class="kpi-value ${data.totalReturn >= 0 ? 'pos' : 'neg'}">${pnlSign}${fmtM(data.currentNAV - data.startingNAV)}</div>
         <div class="kpi-sub">From ${fmtM(data.startingNAV)} · ${data.startDate}</div>
       </div>
-      <div class="kpi ${data.totalReturn >= 0 ? 'kpi-green' : 'kpi-red'}">
+      <div class="kpi">
         <div class="kpi-label">Total Return</div>
-        <div class="kpi-value" style="color:${data.totalReturn >= 0 ? '#15803d' : '#dc2626'}">${pnlSign}${(data.totalReturnPct * 100).toFixed(1)}%</div>
+        <div class="kpi-value ${data.totalReturn >= 0 ? 'pos' : 'neg'}">${pnlSign}${(data.totalReturnPct * 100).toFixed(1)}%</div>
         <div class="kpi-sub">IRR: ${data.irr !== null ? (data.irr * 100).toFixed(1) + '%' : 'N/A'} annualised</div>
       </div>
-      <div class="kpi kpi-purple">
+      <div class="kpi">
         <div class="kpi-label">Income Target</div>
-        <div class="kpi-value" style="color:#7c3aed">${(data.mandate.incomeTarget * 100).toFixed(0)}% p.a.</div>
+        <div class="kpi-value gold">${(data.mandate.incomeTarget * 100).toFixed(0)}% p.a.</div>
         <div class="kpi-sub">Cap target: ${(data.mandate.capTarget * 100).toFixed(0)}% p.a.</div>
       </div>
     </div>
 
-    <!-- Allocation vs Targets -->
+    <!-- Allocation -->
     <div class="section">
-      <div class="section-title">Portfolio Allocation vs Targets</div>
+      <div class="section-title">Portfolio allocation vs targets</div>
       ${sleeveRows}
     </div>
 
@@ -378,27 +642,27 @@ export function generateHTMLReport(data: ReportData): string {
       </table>
     </div>
 
-    <!-- Performance & Benchmarks -->
+    <!-- Performance -->
     <div class="section">
-      <div class="section-title">Performance &amp; Benchmarks</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:24px;">
+      <div class="section-title">Performance &amp; benchmarks</div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:28px;">
         <div>
-          <div style="font-size:8.5pt;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-bottom:8px;">Period Returns</div>
+          <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-3);margin-bottom:10px;">Period returns</div>
           <table>
             <thead><tr><th>Period</th><th>Return</th><th>Annualised</th><th>Days</th></tr></thead>
             <tbody>${periodRows}</tbody>
           </table>
         </div>
         <div>
-          <div style="font-size:8.5pt;font-weight:700;text-transform:uppercase;letter-spacing:.05em;color:#6b7280;margin-bottom:8px;">vs Benchmarks (annualised)</div>
+          <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-3);margin-bottom:10px;">vs benchmarks (annualised)</div>
           <table>
             <thead><tr><th>Benchmark</th><th>Type</th><th>Return</th><th>vs Portfolio</th></tr></thead>
             <tbody>
               <tr class="port-row">
                 <td><strong>This Portfolio</strong></td>
                 <td><span class="badge badge-eq">Discretionary</span></td>
-                <td class="mono green">${(portfolioIRR * 100).toFixed(1)}%</td>
-                <td class="mono" style="color:#9ca3af">—</td>
+                <td class="serif green">${(portfolioIRR * 100).toFixed(1)}%</td>
+                <td class="mono" style="color:var(--text-3)">—</td>
               </tr>
               ${benchmarkRows}
             </tbody>
@@ -407,44 +671,44 @@ export function generateHTMLReport(data: ReportData): string {
       </div>
     </div>
 
-    <!-- Fee Summary -->
+    <!-- Fees -->
     <div class="section">
-      <div class="section-title">Transaction &amp; Fee Summary</div>
-      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:16px;">
+      <div class="section-title">Transaction &amp; fee summary</div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px;">
         ${[
-          { label: 'Total Transactions', value: data.txSummary.total.toString(), color: '#374151' },
-          { label: 'Brokerage Commission', value: '₦' + fmt(data.fees.commission), color: '#7c3aed' },
-          { label: 'Statutory Charges', value: '₦' + fmt(data.fees.vat + data.fees.stamp + data.fees.exchange + data.fees.clearing + data.fees.sms), color: '#d97706' },
-          { label: 'Total Fees Paid', value: '₦' + fmt(data.fees.total), color: '#dc2626' },
+          { label: 'Total transactions', value: data.txSummary.total.toString(), tone: 'var(--text)' },
+          { label: 'Brokerage commission', value: '₦' + fmt(data.fees.commission), tone: 'var(--gold)' },
+          { label: 'Statutory charges', value: '₦' + fmt(data.fees.vat + data.fees.stamp + data.fees.exchange + data.fees.clearing + data.fees.sms), tone: 'var(--warn)' },
+          { label: 'Total fees paid', value: '₦' + fmt(data.fees.total), tone: 'var(--neg)' },
         ].map(item => `
-          <div style="background:#f9fafb;border-radius:6px;padding:12px;border-top:2px solid ${item.color}">
-            <div style="font-size:8pt;text-transform:uppercase;letter-spacing:.06em;color:#6b7280;margin-bottom:4px;">${item.label}</div>
-            <div style="font-family:monospace;font-size:12pt;font-weight:700;color:${item.color}">${item.value}</div>
+          <div style="background:var(--bg-soft);border-radius:4px;padding:14px;border-top:2px solid ${item.tone}">
+            <div style="font-size:8pt;text-transform:uppercase;letter-spacing:0.14em;color:var(--text-3);margin-bottom:6px;font-weight:600">${item.label}</div>
+            <div style="font-family:Cormorant Garamond,Georgia,serif;font-size:18pt;font-weight:500;color:${item.tone};line-height:1;letter-spacing:-0.01em">${item.value}</div>
           </div>`).join('')}
       </div>
       <table>
-        <thead><tr><th>Fee Type</th><th>Amount</th><th>Notes</th></tr></thead>
+        <thead><tr><th>Fee type</th><th>Amount</th><th>Notes</th></tr></thead>
         <tbody>
-          <tr><td>Brokerage commission</td><td class="mono">₦${fmt(data.fees.commission)}</td><td style="color:#6b7280">1.5% of gross transaction value</td></tr>
-          <tr><td>VAT on commission</td><td class="mono">₦${fmt(data.fees.vat)}</td><td style="color:#6b7280">7.5% of commission</td></tr>
-          <tr><td>Contract stamp duty</td><td class="mono">₦${fmt(data.fees.stamp)}</td><td style="color:#6b7280">0.08% of gross value</td></tr>
-          <tr><td>NGX exchange levy</td><td class="mono">₦${fmt(data.fees.exchange)}</td><td style="color:#6b7280">0.3% of gross value (sells only)</td></tr>
-          <tr><td>CSCS clearing fee</td><td class="mono">₦${fmt(data.fees.clearing)}</td><td style="color:#6b7280">0.3% of gross value (sells only)</td></tr>
-          <tr><td>SMS charges</td><td class="mono">₦${fmt(data.fees.sms)}</td><td style="color:#6b7280">Per transaction notification</td></tr>
-          <tr><td>Management fees</td><td class="mono">₦${fmt(data.fees.management)}</td><td style="color:#6b7280">Annual discretionary management fee</td></tr>
-          <tr style="background:#f9fafb"><td><strong>Total</strong></td><td class="mono"><strong>₦${fmt(data.fees.total)}</strong></td><td style="color:#6b7280">Buys: ${data.txSummary.buys} (${fmtM(data.txSummary.buyGross)}) · Sells: ${data.txSummary.sells} (${fmtM(data.txSummary.sellGross)})</td></tr>
+          <tr><td>Brokerage commission</td><td class="mono">₦${fmt(data.fees.commission)}</td><td style="color:var(--text-2)">1.5% of gross transaction value</td></tr>
+          <tr><td>VAT on commission</td><td class="mono">₦${fmt(data.fees.vat)}</td><td style="color:var(--text-2)">7.5% of commission</td></tr>
+          <tr><td>Contract stamp duty</td><td class="mono">₦${fmt(data.fees.stamp)}</td><td style="color:var(--text-2)">0.08% of gross value</td></tr>
+          <tr><td>NGX exchange levy</td><td class="mono">₦${fmt(data.fees.exchange)}</td><td style="color:var(--text-2)">0.3% of gross value (sells only)</td></tr>
+          <tr><td>CSCS clearing fee</td><td class="mono">₦${fmt(data.fees.clearing)}</td><td style="color:var(--text-2)">0.3% of gross value (sells only)</td></tr>
+          <tr><td>SMS charges</td><td class="mono">₦${fmt(data.fees.sms)}</td><td style="color:var(--text-2)">Per transaction notification</td></tr>
+          <tr><td>Management fees</td><td class="mono">₦${fmt(data.fees.management)}</td><td style="color:var(--text-2)">Annual discretionary management fee</td></tr>
+          <tr style="background:var(--bg-soft)"><td><strong>Total</strong></td><td class="serif"><strong>₦${fmt(data.fees.total)}</strong></td><td style="color:var(--text-2)">Buys: ${data.txSummary.buys} (${fmtM(data.txSummary.buyGross)}) · Sells: ${data.txSummary.sells} (${fmtM(data.txSummary.sellGross)})</td></tr>
         </tbody>
       </table>
     </div>
 
     <!-- Mandate -->
     <div class="section">
-      <div class="section-title">Portfolio Mandate &amp; Risk Limits</div>
+      <div class="section-title">Portfolio mandate &amp; risk limits</div>
       <table>
         <thead><tr><th>Parameter</th><th>Limit</th><th>Current</th><th>Status</th></tr></thead>
         <tbody>
           <tr><td>Income target</td><td class="mono">${(data.mandate.incomeTarget * 100).toFixed(0)}% p.a.</td><td class="mono">—</td><td><span class="badge badge-warn">Tracking</span></td></tr>
-          <tr><td>Capital appreciation target</td><td class="mono">${(data.mandate.capTarget * 100).toFixed(0)}% p.a.</td><td class="mono green">${fmtPct(data.annualisedReturn)}</td><td><span class="badge badge-ok">Exceeded</span></td></tr>
+          <tr><td>Capital appreciation target</td><td class="mono">${(data.mandate.capTarget * 100).toFixed(0)}% p.a.</td><td class="serif green">${fmtPct(data.annualisedReturn)}</td><td><span class="badge badge-ok">Exceeded</span></td></tr>
           <tr><td>Max single equity</td><td class="mono">${(data.mandate.maxSingleEq * 100).toFixed(0)}%</td><td class="mono">Per holdings above</td><td><span class="badge badge-warn">Monitor</span></td></tr>
           <tr><td>Max equity sleeve</td><td class="mono">${(data.mandate.maxEqSleeve * 100).toFixed(0)}%</td><td class="mono">${((data.sleeves.find(s => s.name.toLowerCase().includes('equit'))?.actualPct ?? 0) * 100).toFixed(1)}%</td><td><span class="badge badge-ok">Within limit</span></td></tr>
           <tr><td>Drawdown alert</td><td class="mono">${(data.mandate.ddAlert * 100).toFixed(0)}%</td><td class="mono green">N/A — Positive returns</td><td><span class="badge badge-ok">OK</span></td></tr>
@@ -452,12 +716,10 @@ export function generateHTMLReport(data: ReportData): string {
       </table>
     </div>
 
-    <!-- AI Analysis -->
     ${aiSection}
 
   </div>
 
-  <!-- Footer -->
   <div class="footer">
     <strong>Transworld Asset Management</strong> — Portfolio Intelligence Report<br>
     This report was generated on ${data.generatedAt} for ${data.clientName}. It is prepared for the exclusive use of the named client and contains confidential information.
@@ -468,7 +730,6 @@ export function generateHTMLReport(data: ReportData): string {
 
 </div>
 
-<!-- Print controls -->
 <div class="print-bar no-print">
   <button class="btn btn-secondary" onclick="window.close()">✕ Close</button>
   <button class="btn btn-primary" onclick="window.print()">🖨 Print / Save PDF</button>
