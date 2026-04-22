@@ -503,12 +503,10 @@ export async function parseStatementPdf(
   }
 
   // ── Ledger body ───────────────────────────────────
-  const merged = mergeLedgerRows(lines)
-  const rows: StatementRow[] = []
-  for (const block of merged) {
-    const r = tryParseStatementRow(block)
-    if (r) rows.push(r)
-  }
+  // State-machine merger — handles 1-, 2-, and 3-visual-line rows
+  // produced by the broker's narrow narration column. See the
+  // buildStatementRows comment for layout details.
+  const rows: StatementRow[] = buildStatementRows(lines)
 
   // ── Running-balance audit ─────────────────────────
   // Start from 0 and process every ledger row, including
@@ -544,44 +542,37 @@ export async function parseStatementPdf(
   }
 }
 
-// Merge visually-wrapped continuation lines into single logical rows.
-// A new row starts when a line begins with two DASH dates
-// (TRANSDATE POSTDATE). Everything until the next such line — minus
-// obvious header/footer junk — is the narration continuation.
-function mergeLedgerRows(lines: string[]): string[] {
-  const merged: string[] = []
-  let current = ''
+// Merge visually-wrapped continuation lines into single logical rows
+// using a state machine. The broker's narration column is narrow, so
+// one logical row can span 1, 2, or 3 visual lines:
+//   1-line: dates + narration + amounts all on one Y    (ANCHOR only)
+//   2-line: narration above, dates+amounts below        (PRE + ANCHOR)
+//   3-line: narration / dates+middle-narr+amounts / narration
+//                                                       (PRE + ANCHOR-with-inline + POST)
+//
+// We classify each extracted line as ANCHOR (has 2 dates + 3 trailing
+// amounts), ROW_STARTER (narration fragment that opens a new row —
+// "Sale of…", "Purchase of…", "Being…", "1 year…"), JUNK
+// (header/footer/totals), or CONTINUATION (anything else). A single
+// walk attaches pre-fragments before an anchor is seen and
+// post-fragments after; a new ROW_STARTER or ANCHOR emits the
+// current row. This replaced the forward-only merger from v21a that
+// silently dropped every multi-line row — see hotfix-3 notes.
 
-  const JUNK = /^(Account|Statement|Opening|Closing|Total|DCS|Is Custodian|Contact|TRANSDATE|Totals for|Checked|Approved|about:blank|\d{1,2}\/\d{1,2}\/\d{2,4},|!|STATEMENT OF ACCOUNT|Transworld Investment)/i
-
-  for (const line of lines) {
-    const tokens = line.split(/\s+/)
-    const startsAsRow =
-      tokens.length >= 2 &&
-      DASH_DATE_RE.test(tokens[0]) &&
-      DASH_DATE_RE.test(tokens[1])
-
-    if (startsAsRow) {
-      if (current) merged.push(current)
-      current = line
-    } else if (current) {
-      if (JUNK.test(line)) {
-        merged.push(current)
-        current = ''
-      } else {
-        current += ' ' + line
-      }
-    }
-  }
-  if (current) merged.push(current)
-  return merged
+type AnchorParts = {
+  trans_date: string
+  post_date: string
+  inline_narration: string
+  debit: number
+  credit: number
+  balance: number
+  raw: string
 }
 
-function tryParseStatementRow(line: string): StatementRow | null {
+function tryParseAnchor(line: string): AnchorParts | null {
   const tokens = line.split(/\s+/)
   if (tokens.length < 5) return null
   if (!DASH_DATE_RE.test(tokens[0]) || !DASH_DATE_RE.test(tokens[1])) return null
-
   const n = tokens.length
   if (
     !AMOUNT_RE.test(tokens[n - 1]) ||
@@ -590,28 +581,138 @@ function tryParseStatementRow(line: string): StatementRow | null {
   ) {
     return null
   }
-
   const trans_date = toIsoFromDashed(tokens[0])
-  const post_date = toIsoFromDashed(tokens[1])
   if (!trans_date) return null
-
-  const narration = tokens.slice(2, n - 3).join(' ').trim()
-  const debit = parseAmt(tokens[n - 3])
-  const credit = parseAmt(tokens[n - 2])
-  const balance = parseAmt(tokens[n - 1])
-
-  const row: StatementRow = {
+  const post_date = toIsoFromDashed(tokens[1]) || trans_date
+  return {
     trans_date,
-    post_date: post_date || trans_date,
-    narration,
-    debit,
-    credit,
-    balance,
-    kind: 'unknown',
-    raw_line: line,
+    post_date,
+    inline_narration: tokens.slice(2, n - 3).join(' ').trim(),
+    debit: parseAmt(tokens[n - 3]),
+    credit: parseAmt(tokens[n - 2]),
+    balance: parseAmt(tokens[n - 1]),
+    raw: line,
   }
-  classifyStatementRow(row)
-  return row
+}
+
+// Lines that open a new row's narration. Empirically enumerated from
+// Transworld broker statements for both OOO and CMFB portfolios.
+const ROW_STARTER_RE =
+  /^(Sale|Purchase)\s+of\s+[\d,]+\s+unit\(s\)\s+of\s|^Being\s|^being\s|^Balance\s+Brought\s+Forward|^1\s+year\s+subscription|^[Dd]eposit\s+by|^[Pp]ayment\s+NIBSS/i
+
+function isRowStarter(line: string): boolean {
+  return ROW_STARTER_RE.test(line)
+}
+
+// Header / footer / totals lines that are never part of any row.
+// Some are "contaminated" (e.g. "OFOEGBU… Opening Balance: …" on one
+// Y because pdfjs merged two columns) — we match on any occurrence
+// of a header label, not just line-start, to catch them.
+function isJunkLine(line: string): boolean {
+  return (
+    /^\d+\/\d+\/\d+,\s/.test(line) ||                    // "4/22/26, 3:20 PM about:blank"
+    /^about:blank/.test(line) ||
+    /^STATEMENT OF ACCOUNT\b/.test(line) ||
+    /^Transworld Investment/.test(line) ||
+    /^\d+(st|nd|rd|th)\s+Floor/.test(line) ||
+    /^\+\d{2,}/.test(line) ||                            // phone header
+    /^\d{4}\/\d{2}\/\d{2}\s+\d/.test(line) ||            // "22/04/2026 20:20:29"
+    /Opening\s+Balance:/.test(line) ||                   // anywhere in line
+    /Closing\s+Balance:/.test(line) ||
+    /Total\s+Credit:/.test(line) ||
+    /Total\s+Debit:/.test(line) ||
+    /Uncleared\s+Credit:/.test(line) ||
+    /Cleared\s+Balance:/.test(line) ||
+    /^Account:/.test(line) ||
+    /^Account\s+Type:/.test(line) ||
+    /^DCS\s+Enrolled/.test(line) ||
+    /^Is\s+Custodian/.test(line) ||
+    /^Contact\s+Info:/.test(line) ||
+    /^Statement\s+Period:/.test(line) ||
+    /^TRANSDATE\s/.test(line) ||
+    /^Totals\s+for/.test(line) ||
+    /^Checked\s+By/.test(line) ||
+    /^Approved\s+By/.test(line) ||
+    /@[\w.-]+\.\w/.test(line) ||                         // email
+    /^\[\d+\]\[\d+\]$/.test(line) ||                     // "[127466][14561345]"
+    /^0\d{9,10}$/.test(line)                             // NG phone starting with 0
+  )
+}
+
+function buildStatementRows(lines: string[]): StatementRow[] {
+  type PartialRow = {
+    pre: string[]
+    anchor: AnchorParts | null
+    post: string[]
+  }
+
+  const rows: StatementRow[] = []
+  let current: PartialRow | null = null
+
+  const emit = () => {
+    if (!current || !current.anchor) return
+    const narrationParts = [
+      ...current.pre,
+      current.anchor.inline_narration,
+      ...current.post,
+    ]
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0)
+    const narration = narrationParts.join(' ').replace(/\s+/g, ' ').trim()
+
+    const row: StatementRow = {
+      trans_date: current.anchor.trans_date,
+      post_date: current.anchor.post_date,
+      narration,
+      debit: current.anchor.debit,
+      credit: current.anchor.credit,
+      balance: current.anchor.balance,
+      kind: 'unknown',
+      raw_line: [
+        current.pre.length ? `[pre] ${current.pre.join(' | ')}` : '',
+        `[anchor] ${current.anchor.raw}`,
+        current.post.length ? `[post] ${current.post.join(' | ')}` : '',
+      ]
+        .filter(Boolean)
+        .join('  '),
+    }
+    classifyStatementRow(row)
+    rows.push(row)
+    current = null
+  }
+
+  for (const line of lines) {
+    if (isJunkLine(line)) {
+      // Junk mid-flow terminates the current row — almost always a
+      // page-break like "about:blank 2/5" splitting a row's
+      // post-narration from its pre-narration on the next page.
+      if (current && current.anchor) emit()
+      continue
+    }
+
+    const anchor = tryParseAnchor(line)
+    if (anchor) {
+      if (current && current.anchor) emit()
+      if (!current) current = { pre: [], anchor: null, post: [] }
+      current.anchor = anchor
+      continue
+    }
+
+    // Narration fragment (non-anchor, non-junk).
+    if (isRowStarter(line)) {
+      if (current && current.anchor) emit()
+      current = { pre: [line], anchor: null, post: [] }
+      continue
+    }
+
+    // Continuation fragment.
+    if (!current) continue // junk before first row; drop silently
+    if (current.anchor) current.post.push(line)
+    else current.pre.push(line)
+  }
+
+  if (current && current.anchor) emit()
+  return rows
 }
 
 function classifyStatementRow(row: StatementRow): void {
