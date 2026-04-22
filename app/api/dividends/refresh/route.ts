@@ -20,6 +20,19 @@ export const maxDuration = 300
 
 const BATCH_SIZE = 10
 
+// v19b: Vercel Pro caps function execution at 300s. Each batch of 10 tickers
+// with web_search takes ~40-60s. Refreshing all ~70 approved equities in one
+// run reliably hits the timeout (confirmed: v19 first cron run returned 504
+// after timing out mid-batch 6). Cap per-run scope so we always fit under the
+// limit, and use the `div_last_refreshed_at` column to cycle through the
+// remainder on subsequent runs (nulls-first ordering guarantees fairness).
+//
+// With MAX_INSTRUMENTS_PER_RUN = 30 and BATCH_SIZE = 10:
+//   - 3 batches per run × ~50s = ~150s (well under 300s)
+//   - ~70 total equities cycle through in roughly 2-3 weekly cron runs
+//   - Instruments that failed a run stay at the top of the queue (nulls-first)
+const MAX_INSTRUMENTS_PER_RUN = 30
+
 // Friendly-name fallback for tickers not in the database's `name` field.
 // Not authoritative — `instruments.name` wins when present.
 const NGX_TICKER_NAMES: Record<string, string> = {
@@ -155,13 +168,34 @@ async function runDividendRefresh() {
 
   const db = supabaseAdmin()
 
-  // v19: query ALL approved equity instruments — no more arbitrary 15-ticker slice.
-  const { data: instruments, error: instErr } = await db
+  // Count total approved equities — used in the response so callers can see
+  // how many are in scope vs how many got processed this run.
+  const { count: totalCount, error: countErr } = await db
     .from('instruments')
-    .select('instrument_id, name')
+    .select('instrument_id', { count: 'exact', head: true })
     .eq('type', 'Stock')
     .eq('approved', true)
-    .order('instrument_id')
+
+  if (countErr) {
+    return { status: 500, body: { error: countErr.message } }
+  }
+  const totalApproved = totalCount ?? 0
+
+  // v19b: query the stalest MAX_INSTRUMENTS_PER_RUN only.
+  //
+  //   order by div_last_refreshed_at ASC NULLS FIRST
+  //
+  // Nulls-first means instruments that have never been refreshed get priority,
+  // then we work through the least-recently-refreshed ones. Over successive
+  // weekly cron runs, everything cycles through.
+  const { data: instruments, error: instErr } = await db
+    .from('instruments')
+    .select('instrument_id, name, div_last_refreshed_at')
+    .eq('type', 'Stock')
+    .eq('approved', true)
+    .order('div_last_refreshed_at', { ascending: true, nullsFirst: true })
+    .order('instrument_id', { ascending: true })  // stable tiebreaker
+    .limit(MAX_INSTRUMENTS_PER_RUN)
 
   if (instErr) {
     return { status: 500, body: { error: instErr.message } }
@@ -222,18 +256,25 @@ async function runDividendRefresh() {
     else       updated.push(div.ticker)
   }
 
+  const remaining = Math.max(0, totalApproved - updated.length)
+  const summary = totalApproved > MAX_INSTRUMENTS_PER_RUN
+    ? `Refreshed ${updated.length}/${equities.length} processed this run (${totalApproved} approved equities total; ${remaining} pending future runs)`
+    : `Refreshed ${updated.length}/${equities.length} approved equities`
+
   return {
     status: 200,
     body: {
       ok:                      true,
       method:                  'ai+web_search',
       batches:                 batches.length,
-      totalInstruments:        equities.length,
+      scopeThisRun:            equities.length,
+      totalApprovedEquities:   totalApproved,
+      remaining,
       dividendEntriesReturned: allDividends.length,
       updated,
       batchErrors,
       updateErrors,
-      message:                 `Refreshed ${updated.length}/${equities.length} instruments via AI + web_search`,
+      message:                 summary,
     },
   }
 }
@@ -263,10 +304,12 @@ export async function GET(req: NextRequest) {
   try {
     const result = await runDividendRefresh()
     console.log('[cron /api/dividends/refresh]', JSON.stringify({
-      ok:                     result.status === 200,
-      updated:                (result.body as any).updated?.length ?? 0,
-      totalInstruments:       (result.body as any).totalInstruments,
-      batchErrorsCount:       (result.body as any).batchErrors?.length ?? 0,
+      ok:                  result.status === 200,
+      updated:             (result.body as any).updated?.length ?? 0,
+      scopeThisRun:        (result.body as any).scopeThisRun,
+      totalApproved:       (result.body as any).totalApprovedEquities,
+      remaining:           (result.body as any).remaining,
+      batchErrorsCount:    (result.body as any).batchErrors?.length ?? 0,
     }))
     return NextResponse.json(result.body, { status: result.status })
   } catch (err) {
