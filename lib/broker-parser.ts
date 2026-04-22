@@ -509,11 +509,20 @@ export async function parseStatementPdf(
   const rows: StatementRow[] = buildStatementRows(lines)
 
   // ── Running-balance audit ─────────────────────────
-  // Start from 0 and process every ledger row, including
-  // "Balance Brought Forward" (whose CREDIT equals opening_balance).
-  // Final running total should equal printed closing_balance.
-  let running = 0
-  for (const r of rows) running += r.credit - r.debit
+  // Start from the statement's printed opening balance and skip the
+  // "Balance Brought Forward" row (which is a display-only carry,
+  // not a ledger movement). This handles both conventions the
+  // broker uses:
+  //   - Positive/zero opening: BBF written as CREDIT = opening
+  //   - Negative opening:      BBF written as DEBIT = opening
+  //     (broker puts the literal negative number in the debit
+  //      column, which breaks the credit-debit convention — so we
+  //      skip BBF entirely and just trust opening_balance)
+  let running = opening_balance
+  for (const r of rows) {
+    if (r.kind === 'balance_brought_forward') continue
+    running += r.credit - r.debit
+  }
   const computed_closing = round2(running)
   const printed_closing = round2(closing_balance)
   const diff = round2(computed_closing - printed_closing)
@@ -597,8 +606,16 @@ function tryParseAnchor(line: string): AnchorParts | null {
 
 // Lines that open a new row's narration. Empirically enumerated from
 // Transworld broker statements for both OOO and CMFB portfolios.
+// NOTE (hotfix-4): earlier versions required whitespace after the
+// trailing "of" (e.g. "Purchase of N unit(s) of\s") but some
+// narrations wrap exactly AT "of" with the ticker on the post line:
+//     Purchase of 100000 unit(s) of     <- pre ends here, no trailing space
+//     22-Jul-2022 22-Jul-2022 ...       <- anchor
+//     ACCESSCORP @ 9.10; CN# 3942       <- post
+// So the match now ends at "unit(s)" — anything after is narration
+// content that belongs to post-fragments.
 const ROW_STARTER_RE =
-  /^(Sale|Purchase)\s+of\s+[\d,]+\s+unit\(s\)\s+of\s|^Being\s|^being\s|^Balance\s+Brought\s+Forward|^1\s+year\s+subscription|^[Dd]eposit\s+by|^[Pp]ayment\s+NIBSS/i
+  /^(Sale|Purchase)\s+of\s+[\d,]+\s+unit\(s\)|^Being\s|^being\s|^Balance\s+Brought\s+Forward|^1\s+year\s+subscription|^[Dd]eposit\s+by|^[Pp]ayment\s+NIBSS/i
 
 function isRowStarter(line: string): boolean {
   return ROW_STARTER_RE.test(line)
