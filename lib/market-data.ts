@@ -29,6 +29,13 @@
 // shadowed by an FCMB bond listing with a different price.
 // ============================================================
 
+// v19c: FIRSTHOLDCO is now the canonical instrument_id (not FBNH).
+// The diagnostic showed FIRSTHOLDCO owned 73 transactions and 42 market_price
+// rows vs FBNH's 23 and 8, so we moved the canonical to match live usage.
+// The FBNH row and its data are merged into FIRSTHOLDCO via SQL migration
+// shipped alongside this deploy. Aliases below should now only contain
+// mappings where NGX publishes under a name different from our canonical.
+
 export interface Quote {
   instrument_id: string
   price: number
@@ -40,7 +47,6 @@ export interface Quote {
 // NGX's published ticker sometimes differs from our instrument_id.
 // Extend this map as new mismatches are discovered.
 const NGX_TICKER_ALIASES: Record<string, string> = {
-  FIRSTHOLDCO: 'FBNH',   // First HoldCo (was First Bank of Nigeria Holdings)
   MOBIL: 'MRS',          // MRS Oil Nigeria (historical Mobil ticker)
 }
 

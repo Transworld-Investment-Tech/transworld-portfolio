@@ -256,10 +256,21 @@ async function runDividendRefresh() {
     else       updated.push(div.ticker)
   }
 
-  const remaining = Math.max(0, totalApproved - updated.length)
-  const summary = totalApproved > MAX_INSTRUMENTS_PER_RUN
-    ? `Refreshed ${updated.length}/${equities.length} processed this run (${totalApproved} approved equities total; ${remaining} pending future runs)`
-    : `Refreshed ${updated.length}/${equities.length} approved equities`
+  // v19c: `remaining` was previously a static `totalApproved - updated.length`
+  // which lied — it always showed 38 even after every instrument had been
+  // refreshed. Replace with a real post-update DB query for "how many
+  // instruments still have a NULL refresh timestamp" (= truly untouched).
+  const { count: neverRefreshedCount } = await db
+    .from('instruments')
+    .select('instrument_id', { count: 'exact', head: true })
+    .eq('type', 'Stock')
+    .eq('approved', true)
+    .is('div_last_refreshed_at', null)
+
+  const neverRefreshed = neverRefreshedCount ?? 0
+  const summary = neverRefreshed > 0
+    ? `Refreshed ${updated.length}/${equities.length} this run. ${neverRefreshed} approved equities still have never been refreshed.`
+    : `Refreshed ${updated.length}/${equities.length} this run. All ${totalApproved} approved equities have been refreshed at least once — weekly cron now rotates through oldest-first.`
 
   return {
     status: 200,
@@ -269,7 +280,7 @@ async function runDividendRefresh() {
       batches:                 batches.length,
       scopeThisRun:            equities.length,
       totalApprovedEquities:   totalApproved,
-      remaining,
+      neverRefreshed,
       dividendEntriesReturned: allDividends.length,
       updated,
       batchErrors,
@@ -308,7 +319,7 @@ export async function GET(req: NextRequest) {
       updated:             (result.body as any).updated?.length ?? 0,
       scopeThisRun:        (result.body as any).scopeThisRun,
       totalApproved:       (result.body as any).totalApprovedEquities,
-      remaining:           (result.body as any).remaining,
+      neverRefreshed:      (result.body as any).neverRefreshed,
       batchErrorsCount:    (result.body as any).batchErrors?.length ?? 0,
     }))
     return NextResponse.json(result.body, { status: result.status })
