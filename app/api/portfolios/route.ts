@@ -1,89 +1,161 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 
-// GET all portfolios (optionally filtered by client)
-export async function GET(req: NextRequest) {
-  const clientId = req.nextUrl.searchParams.get('clientId')
-  const db = supabaseAdmin()
+export const dynamic = 'force-dynamic'
+export const maxDuration = 30
 
-  let query = db.from('portfolios')
-    .select('*, client:clients(name,code), sleeve_targets(*)')
-    .order('created_at', { ascending: true })
-
-  if (clientId) query = query.eq('client_id', clientId)
-
-  const { data, error } = await query
-  if (error) return NextResponse.json({ error: error.message }, { status: 500 })
-  return NextResponse.json({ portfolios: data })
-}
-
-// POST — create a new portfolio with default sleeves and holdings
+// POST /api/portfolios — create a new portfolio + sleeve_targets + initial nav_log row
+// Performs a best-effort rollback if sleeve_targets insertion fails.
 export async function POST(req: NextRequest) {
-  const body = await req.json()
-  const db = supabaseAdmin()
+  try {
+    const body = await req.json()
+    const {
+      client_id,
+      label,
+      name,
+      currency,
+      starting_nav,
+      start_date,
+      income_target,
+      cap_target,
+      liq_min,
+      dd_alert,
+      dd_action,
+      max_eq_single,
+      max_eq_sleeve,
+      notes,
+      sleeves,
+    } = body
 
-  const {
-    client_id, label, name, currency = 'NGN',
-    starting_nav, start_date, income_target = 0.15, cap_target = 0.30,
-    liq_min = 0.05, dd_alert = -0.07, dd_action = -0.10,
-    max_eq_single = 0.07, max_eq_sleeve = 0.35,
-    notes = '',
-    // Optional: sleeve targets override
-    sleeves,
-    // Optional: seed holdings from Excel defaults
-    seedHoldings = false,
-  } = body
+    // ─── Validation ──────────────────────────────────────────────────
+    if (!client_id || typeof client_id !== 'string') {
+      return NextResponse.json({ error: 'client_id is required' }, { status: 400 })
+    }
+    if (!label || typeof label !== 'string') {
+      return NextResponse.json({ error: 'label is required' }, { status: 400 })
+    }
+    if (!name || typeof name !== 'string') {
+      return NextResponse.json({ error: 'name is required' }, { status: 400 })
+    }
+    if (!starting_nav || typeof starting_nav !== 'number' || starting_nav <= 0) {
+      return NextResponse.json({ error: 'starting_nav must be a positive number' }, { status: 400 })
+    }
+    if (!start_date || typeof start_date !== 'string') {
+      return NextResponse.json({ error: 'start_date is required' }, { status: 400 })
+    }
+    if (!Array.isArray(sleeves) || sleeves.length !== 3) {
+      return NextResponse.json({ error: 'sleeves must be an array of exactly 3 entries' }, { status: 400 })
+    }
+    const sleeveIds = new Set(sleeves.map((s: any) => s.sleeve_id))
+    if (!sleeveIds.has('liq') || !sleeveIds.has('eq') || !sleeveIds.has('fi')) {
+      return NextResponse.json({ error: 'sleeves must cover liq, eq, and fi' }, { status: 400 })
+    }
+    const targetSum = sleeves.reduce((acc: number, s: any) => acc + Number(s.target_pct || 0), 0)
+    if (Math.abs(targetSum - 1) > 0.0005) {
+      return NextResponse.json(
+        { error: `Sleeve targets must sum to 1.0 (got ${targetSum.toFixed(4)})` },
+        { status: 400 }
+      )
+    }
 
-  if (!client_id || !label || !name || !starting_nav || !start_date) {
-    return NextResponse.json({ error: 'Missing required fields: client_id, label, name, starting_nav, start_date' }, { status: 400 })
+    const db = supabaseAdmin()
+
+    // Verify client exists
+    const { data: client } = await db
+      .from('clients')
+      .select('id, name')
+      .eq('id', client_id)
+      .maybeSingle()
+    if (!client) {
+      return NextResponse.json({ error: 'Client not found' }, { status: 404 })
+    }
+
+    // Label uniqueness within active portfolios for this client
+    const { data: existingLabel } = await db
+      .from('portfolios')
+      .select('id')
+      .eq('client_id', client_id)
+      .eq('label', label)
+      .eq('status', 'active')
+      .maybeSingle()
+    if (existingLabel) {
+      return NextResponse.json(
+        { error: `Label "${label}" is already used for this client — pick another letter` },
+        { status: 409 }
+      )
+    }
+
+    // ─── Insert portfolio ───────────────────────────────────────────
+    const { data: portfolio, error: pErr } = await (db.from('portfolios') as any)
+      .insert({
+        client_id,
+        label: label.toUpperCase(),
+        name: name.trim(),
+        currency: currency || 'NGN',
+        starting_nav,
+        start_date,
+        valuation_date: start_date,
+        income_target: income_target ?? null,
+        cap_target: cap_target ?? null,
+        liq_min: liq_min ?? null,
+        dd_alert: dd_alert ?? null,
+        dd_action: dd_action ?? null,
+        max_eq_single: max_eq_single ?? null,
+        max_eq_sleeve: max_eq_sleeve ?? null,
+        status: 'active',
+        notes: notes || null,
+      })
+      .select()
+      .single()
+
+    if (pErr || !portfolio) {
+      return NextResponse.json(
+        { error: pErr?.message || 'Failed to create portfolio' },
+        { status: 500 }
+      )
+    }
+
+    // ─── Insert sleeve_targets ──────────────────────────────────────
+    const sleeveRows = sleeves.map((s: any) => ({
+      portfolio_id: portfolio.id,
+      sleeve_id: s.sleeve_id,
+      name: s.name,
+      target_pct: Number(s.target_pct),
+      min_pct: Number(s.min_pct ?? 0),
+      max_pct: Number(s.max_pct ?? 1),
+      sort_order: Number(s.sort_order ?? 0),
+    }))
+
+    const { error: sErr } = await (db.from('sleeve_targets') as any).insert(sleeveRows)
+    if (sErr) {
+      // Rollback: the portfolio shouldn't live without sleeve_targets
+      await db.from('portfolios').delete().eq('id', portfolio.id)
+      return NextResponse.json(
+        { error: `Failed to create sleeve targets (portfolio rolled back): ${sErr.message}` },
+        { status: 500 }
+      )
+    }
+
+    // ─── Insert initial nav_log row ─────────────────────────────────
+    // nav_log has NO unique constraint on (portfolio_id, nav_date), so plain INSERT.
+    // Never use ON CONFLICT here — see pitfall #3.
+    const { error: navErr } = await (db.from('nav_log') as any).insert({
+      portfolio_id: portfolio.id,
+      nav_date: start_date,
+      nav_value: starting_nav,
+      notes: 'Initial NAV at portfolio inception',
+    })
+    if (navErr) {
+      // Non-fatal — portfolio works without it, but IRR baseline won't be seeded.
+      // Surface it in the response so the UI can optionally warn, but succeed.
+      return NextResponse.json({
+        portfolio,
+        warning: `Portfolio created but initial NAV log insert failed: ${navErr.message}`,
+      })
+    }
+
+    return NextResponse.json({ portfolio })
+  } catch (e) {
+    return NextResponse.json({ error: (e as Error).message }, { status: 500 })
   }
-
-  // Check capacity (max 25 portfolios)
-  const { count } = await db.from('portfolios').select('*', { count: 'exact', head: true })
-  if ((count ?? 0) >= 25) {
-    return NextResponse.json({ error: 'Maximum 25 portfolios reached.' }, { status: 400 })
-  }
-
-  // Create portfolio
-  const { data: portfolio, error: portErr } = await db.from('portfolios').insert({
-    client_id, label, name, currency, starting_nav: Number(starting_nav),
-    start_date, valuation_date: start_date, income_target, cap_target,
-    liq_min, dd_alert, dd_action, max_eq_single, max_eq_sleeve, notes,
-    status: 'active',
-  }).select().single()
-
-  if (portErr || !portfolio) {
-    return NextResponse.json({ error: portErr?.message || 'Failed to create portfolio' }, { status: 500 })
-  }
-
-  // Create sleeve targets (use defaults if not provided)
-  const defaultSleeves = [
-    { sleeve_id: 'liq', name: 'Liquidity (≤7 days)',         target_pct: 0.05, min_pct: 0.05, max_pct: 0.10, sort_order: 0 },
-    { sleeve_id: 'ntb', name: 'NTB ladder (income core)',     target_pct: 0.40, min_pct: 0.30, max_pct: 0.55, sort_order: 1 },
-    { sleeve_id: 'fgn', name: 'FGN bonds (rate-cut upside)',  target_pct: 0.25, min_pct: 0.15, max_pct: 0.35, sort_order: 2 },
-    { sleeve_id: 'eq',  name: 'Equities (total return)',      target_pct: 0.30, min_pct: 0.20, max_pct: 0.35, sort_order: 3 },
-  ]
-  const sleevesToInsert = (sleeves || defaultSleeves).map((s: any) => ({ ...s, portfolio_id: portfolio.id }))
-  await db.from('sleeve_targets').insert(sleevesToInsert)
-
-  // Optionally seed default holdings from Portfolio A Excel data
-  if (seedHoldings) {
-    const seedData = [
-      { instrument_id: 'CASH_NGN', sleeve_id: 'liq', quantity: starting_nav * 0.05,  avg_cost: 1 },
-      { instrument_id: 'NTB_91',   sleeve_id: 'ntb', quantity: starting_nav * 0.133, avg_cost: 1 },
-      { instrument_id: 'NTB_182',  sleeve_id: 'ntb', quantity: starting_nav * 0.133, avg_cost: 1 },
-      { instrument_id: 'NTB_364',  sleeve_id: 'ntb', quantity: starting_nav * 0.134, avg_cost: 1 },
-      { instrument_id: 'FGN_5_7',  sleeve_id: 'fgn', quantity: starting_nav * 0.133, avg_cost: 1 },
-      { instrument_id: 'FGN_10',   sleeve_id: 'fgn', quantity: starting_nav * 0.117, avg_cost: 1 },
-      { instrument_id: 'UBA',      sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 27.50),  avg_cost: 27.50 },
-      { instrument_id: 'GTCO',     sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 58.30),  avg_cost: 58.30 },
-      { instrument_id: 'ZENITH',   sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 47.80),  avg_cost: 47.80 },
-      { instrument_id: 'DANGCEM',  sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 335.00), avg_cost: 335.00 },
-      { instrument_id: 'STANBIC',  sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 82.50),  avg_cost: 82.50 },
-      { instrument_id: 'SEPLAT',   sleeve_id: 'eq',  quantity: Math.floor(starting_nav * 0.05  / 4850),   avg_cost: 4850 },
-    ]
-    await db.from('holdings').insert(seedData.map(h => ({ ...h, portfolio_id: portfolio.id, as_of_date: start_date })))
-  }
-
-  return NextResponse.json({ portfolio }, { status: 201 })
 }

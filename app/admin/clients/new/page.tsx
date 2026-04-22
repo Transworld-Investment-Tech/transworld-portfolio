@@ -1,99 +1,211 @@
 'use client'
-import { useState } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useEffect } from 'react'
 import Link from 'next/link'
+import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
-import { ArrowLeft, Save } from 'lucide-react'
+import { ArrowLeft, Save, AlertCircle, CheckCircle2, Info, Users } from 'lucide-react'
+
+// v18: client creation form. Styling mirrors /admin/prices (v17).
+// On success we hand off to /admin/portfolios/new?client=<id> so the
+// user immediately creates the client's first portfolio — per the
+// agreed scope, these are two separate trips rather than a combined form.
+
+type CodeCheckState = 'idle' | 'checking' | 'available' | 'taken'
 
 export default function NewClientPage() {
   const router = useRouter()
+  const [code, setCode] = useState('')
+  const [name, setName] = useState('')
+  const [type, setType] = useState<'discretionary' | 'advisory' | 'internal'>('discretionary')
+
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [form, setForm] = useState({
-    code: '', name: '', type: 'discretionary',
-    contact_name: '', contact_email: '', notes: ''
-  })
+  const [codeCheck, setCodeCheck] = useState<CodeCheckState>('idle')
 
-  const set = (k: string) => (e: React.ChangeEvent<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>) =>
-    setForm(f => ({ ...f, [k]: e.target.value }))
+  // Debounced uniqueness check
+  useEffect(() => {
+    if (!code || code.length < 2) {
+      setCodeCheck('idle')
+      return
+    }
+    setCodeCheck('checking')
+    const t = setTimeout(async () => {
+      const { data } = await supabase
+        .from('clients')
+        .select('id')
+        .eq('code', code)
+        .maybeSingle()
+      setCodeCheck(data ? 'taken' : 'available')
+    }, 400)
+    return () => clearTimeout(t)
+  }, [code])
 
-  async function handleSubmit(e: React.FormEvent) {
-    e.preventDefault()
-    setSaving(true)
-    setError('')
-    const { data: user } = await supabase.auth.getUser()
-    const { data, error: err } = await supabase.from('clients').insert({
-      ...form, status: 'active', created_by: user.user?.id
-    }).select().single()
-    if (err) { setError(err.message); setSaving(false) }
-    else router.push(`/admin/clients/${data.id}`)
+  function handleCodeChange(val: string) {
+    const sanitised = val.toUpperCase().replace(/[^A-Z0-9]/g, '').slice(0, 10)
+    setCode(sanitised)
   }
+
+  async function handleSubmit() {
+    setError('')
+    if (!code) return setError('Code is required')
+    if (code.length < 2) return setError('Code must be at least 2 characters')
+    if (!name.trim()) return setError('Name is required')
+    if (codeCheck === 'taken') return setError(`Code "${code}" is already in use`)
+    if (codeCheck === 'checking') return setError('Still checking code availability…')
+
+    setSaving(true)
+    try {
+      const res = await fetch('/api/clients', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ code, name: name.trim(), type }),
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setError(data.error || 'Failed to create client')
+        setSaving(false)
+        return
+      }
+      // Hand off to portfolio creation with this client preselected.
+      router.push(`/admin/portfolios/new?client=${data.client.id}`)
+    } catch (e) {
+      setError((e as Error).message)
+      setSaving(false)
+    }
+  }
+
+  const canSubmit =
+    code.length >= 2 &&
+    name.trim().length > 0 &&
+    codeCheck === 'available' &&
+    !saving
 
   return (
     <div>
-      <div className="px-8 py-5 border-b border-white/[0.07] bg-[#13161d] flex items-center gap-4">
-        <Link href="/admin/clients" className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-          <ArrowLeft size={13} /> Clients
-        </Link>
-        <div className="w-px h-4 bg-white/10" />
-        <h1 className="text-base font-semibold">Add new client</h1>
+      {/* Header */}
+      <div className="px-8 py-6 border-b border-white/[0.07] bg-[#13161d]">
+        <div className="flex items-center gap-3">
+          <Link
+            href="/admin"
+            className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+            <ArrowLeft size={13} /> Admin panel
+          </Link>
+          <div className="w-px h-4 bg-white/10" />
+          <h1 className="text-xl font-semibold">Add client</h1>
+        </div>
+        <p className="text-xs text-[#555d72] mt-2">
+          Create a new client entity. Afterwards you&apos;ll be taken to the portfolio creation form.
+        </p>
       </div>
 
       <div className="px-8 py-6 max-w-xl">
-        <form onSubmit={handleSubmit} className="space-y-5">
-          <div className="tw-card space-y-4">
-            <div className="text-xs font-semibold uppercase tracking-widest text-[#555d72] pb-2 border-b border-white/[0.07]">Client details</div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Client code <span className="text-[#ff5c7a]">*</span></label>
-                <input value={form.code} onChange={set('code')} placeholder="e.g. TWI, ACME_A" required className="tw-input font-mono" maxLength={20} />
-                <p className="text-[10px] text-[#555d72] mt-1">Unique short identifier</p>
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Client type <span className="text-[#ff5c7a]">*</span></label>
-                <select value={form.type} onChange={set('type')} className="tw-select">
-                  <option value="discretionary">Discretionary</option>
-                  <option value="advisory">Advisory</option>
-                  <option value="internal">Internal (Transworld)</option>
-                </select>
-              </div>
+        <div className="tw-card">
+          <div className="flex items-center gap-3 mb-5">
+            <div className="w-9 h-9 rounded-xl bg-[#a78bfa]/10 border border-[#a78bfa]/20 flex items-center justify-center flex-shrink-0">
+              <Users size={16} className="text-[#a78bfa]" />
             </div>
-
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Full client name <span className="text-[#ff5c7a]">*</span></label>
-              <input value={form.name} onChange={set('name')} placeholder="e.g. Transworld Asset Management" required className="tw-input" />
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Contact name</label>
-                <input value={form.contact_name} onChange={set('contact_name')} placeholder="John Adeyemi" className="tw-input" />
-              </div>
-              <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">Contact email</label>
-                <input type="email" value={form.contact_email} onChange={set('contact_email')} placeholder="john@company.com" className="tw-input" />
-              </div>
-            </div>
-
-            <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Notes</label>
-              <textarea value={form.notes} onChange={set('notes')} rows={2} placeholder="Any notes about this client…" className="tw-input resize-none" />
+              <div className="text-sm font-semibold">Client details</div>
+              <div className="text-[11px] text-[#555d72]">Basic information for the new mandate</div>
             </div>
           </div>
 
-          {error && <div className="alert alert-critical">{error}</div>}
+          <div className="space-y-4">
+            {/* Code */}
+            <div>
+              <label className="block text-xs text-[#8a91a8] mb-1.5">Client code</label>
+              <input
+                type="text"
+                value={code}
+                onChange={e => handleCodeChange(e.target.value)}
+                placeholder="e.g. ADE, DON, CMFB"
+                maxLength={10}
+                className="tw-input font-mono uppercase"
+                autoFocus
+              />
+              <div className="mt-1.5 text-[11px] min-h-[14px]">
+                {codeCheck === 'checking' && (
+                  <span className="text-[#555d72]">Checking availability…</span>
+                )}
+                {codeCheck === 'available' && (
+                  <span className="text-[#22c55e] inline-flex items-center gap-1">
+                    <CheckCircle2 size={10} /> Available
+                  </span>
+                )}
+                {codeCheck === 'taken' && (
+                  <span className="text-[#ef4444] inline-flex items-center gap-1">
+                    <AlertCircle size={10} /> Already in use
+                  </span>
+                )}
+                {codeCheck === 'idle' && (
+                  <span className="text-[#555d72]">
+                    2-10 uppercase letters or digits. Used as short identifier.
+                  </span>
+                )}
+              </div>
+            </div>
 
-          <div className="flex gap-3">
-            <button type="submit" disabled={saving}
-              className="flex items-center gap-2 bg-[#a78bfa] text-white px-5 py-2.5 rounded-lg text-sm font-medium hover:bg-[#9b87e8] disabled:opacity-50 transition-colors">
-              <Save size={14} /> {saving ? 'Saving…' : 'Create client'}
-            </button>
-            <Link href="/admin/clients" className="flex items-center gap-2 border border-white/10 px-5 py-2.5 rounded-lg text-sm text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-              Cancel
-            </Link>
+            {/* Name */}
+            <div>
+              <label className="block text-xs text-[#8a91a8] mb-1.5">Client name</label>
+              <input
+                type="text"
+                value={name}
+                onChange={e => setName(e.target.value)}
+                placeholder="e.g. Adolphus Estate"
+                className="tw-input"
+              />
+            </div>
+
+            {/* Type */}
+            <div>
+              <label className="block text-xs text-[#8a91a8] mb-1.5">Type</label>
+              <select
+                value={type}
+                onChange={e => setType(e.target.value as any)}
+                className="tw-select">
+                <option value="discretionary">Discretionary</option>
+                <option value="advisory">Advisory</option>
+                <option value="internal">Internal</option>
+              </select>
+              <div className="mt-1.5 text-[11px] text-[#555d72]">
+                {type === 'discretionary' && 'Transworld manages the portfolio with full authority.'}
+                {type === 'advisory' && 'Client makes final decisions; Transworld advises.'}
+                {type === 'internal' && "Transworld's own portfolio."}
+              </div>
+            </div>
+
+            {error && (
+              <div className="text-xs text-[#ef4444] bg-[#ef4444]/10 rounded-lg px-3 py-2 border border-[#ef4444]/20">
+                <AlertCircle size={11} className="inline mr-1 -mt-0.5" />
+                {error}
+              </div>
+            )}
+
+            <div className="flex gap-2 pt-2">
+              <button
+                onClick={handleSubmit}
+                disabled={!canSubmit}
+                className="flex-1 flex items-center justify-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                <Save size={12} /> {saving ? 'Creating…' : 'Create client & continue'}
+              </button>
+              <Link
+                href="/admin"
+                className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+                Cancel
+              </Link>
+            </div>
           </div>
-        </form>
+        </div>
+
+        <div className="mt-4 text-[11px] text-[#555d72] flex items-start gap-2">
+          <Info size={11} className="mt-0.5 flex-shrink-0" />
+          <span>
+            The client code must be unique across the system. Existing codes include{' '}
+            <span className="font-mono">TW, CMFB, ADE, DON, OPC</span>. After saving, you&apos;ll be
+            taken to the portfolio creation form with this client preselected.
+          </span>
+        </div>
       </div>
     </div>
   )
