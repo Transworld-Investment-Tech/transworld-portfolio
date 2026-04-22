@@ -1,15 +1,21 @@
 // ============================================================
-// MARKET DATA — APIFY (TradingView) + FMDQ + EXCHANGERATE
+// MARKET DATA — DIRECT NGX SCRAPE + EXCHANGERATE
 // ============================================================
-
-interface ApifyQuote {
-  symbol: string
-  close?: number
-  last?: number
-  changePercent?: number
-  change?: number
-  volume?: number
-}
+// v16: The Apify actor `apify/trading-view-scraper` was removed
+// from the Apify Store, causing silent 502s on Live Prices refresh.
+// We now scrape NGX's own equities price list page directly. No
+// third-party API key is required for the primary path.
+//
+// Source: https://ngxgroup.com/exchange/data/equities-price-list/
+// Format: Server-rendered HTML. Each listed security appears in
+// a <span class="ticker__list__item"> block containing:
+//   - An <a href="...?symbol=SYMBOL&directory=companydirectory"> tag
+//   - A price literal like "N123.45"
+//   - A <span class="iconNull|iconUp|iconDown"> with "X.XX %"
+//
+// The page repeats each ticker in 6 scrolling marquees; we dedup
+// by instrument_id and keep the first occurrence.
+// ============================================================
 
 export interface Quote {
   instrument_id: string
@@ -19,122 +25,109 @@ export interface Quote {
   fetched_at: string
 }
 
-// Full NGX instrument map — instrument_id → TradingView symbol
-// TradingView uses NGX: prefix for Nigerian Exchange Group stocks
-const NGX_SYMBOL_MAP: Record<string, string> = {
-  // Banking & Finance
-  'ACCESSCORP':  'NGX:ACCESSCORP',
-  'GTCO':        'NGX:GTCO',
-  'ZENITHBANK':  'NGX:ZENITHBANK',
-  'UBA':         'NGX:UBA',
-  'FBNH':        'NGX:FBNH',
-  'FIRSTHOLDCO': 'NGX:FBNH',
-  'FIDELITYBK':  'NGX:FIDELITYBK',
-  'FCMB':        'NGX:FCMB',
-  'UBN':         'NGX:UBN',
-  'WEMABANK':    'NGX:WEMABANK',
-  'STANBIC':     'NGX:STANBIC',
-  'STERLINGNG':  'NGX:STERLINGNG',
-  'AFRIPRUD':    'NGX:AFRIPRUD',
-  'UCAP':        'NGX:UCAP',
-  // Oil & Gas
-  'SEPLAT':      'NGX:SEPLAT',
-  'ARADEL':      'NGX:ARADEL',
-  'OANDO':       'NGX:OANDO',
-  'ETERNA':      'NGX:ETERNA',
-  'CONOIL':      'NGX:CONOIL',
-  'MRS':         'NGX:MRS',
-  'TOTAL':       'NGX:TOTAL',
-  // Telecoms & Tech
-  'MTNN':        'NGX:MTNN',
-  'AIRTELAFRI':  'NGX:AIRTELAFRI',
-  // Industrial & Cement
-  'DANGCEM':     'NGX:DANGCEM',
-  'WAPCO':       'NGX:WAPCO',
-  'JBERGER':     'NGX:JBERGER',
-  'SCOA':        'NGX:SCOA',
-  // Consumer Goods & FMCG
-  'NB':          'NGX:NB',
-  'GUINNESS':    'NGX:GUINNESS',
-  'NESTLE':      'NGX:NESTLE',
-  'UNILEVER':    'NGX:UNILEVER',
-  'DANGSUGAR':   'NGX:DANGSUGAR',
-  'FLOURMILL':   'NGX:FLOURMILL',
-  'CADBURY':     'NGX:CADBURY',
-  'PZ':          'NGX:PZ',
-  'VITAFOAM':    'NGX:VITAFOAM',
-  // Agriculture
-  'OKOMUOIL':    'NGX:OKOMUOIL',
-  'PRESCO':      'NGX:PRESCO',
-  // Conglomerates
-  'UACN':        'NGX:UACN',
-  'TRANSCORP':   'NGX:TRANSCORP',
-  // Insurance
-  'AIICO':       'NGX:AIICO',
-  'WAPIC':       'NGX:WAPIC',
-  'CUSTODIAN':   'NGX:CUSTODIAN',
-  'PRESTIGE':    'NGX:PRESTIGE',
-  'MANSARD':     'NGX:MANSARD',
-  // Services & Others
-  'NAHCO':       'NGX:NAHCO',
-  'JOHNHOLT':    'NGX:JOHNHOLT',
-  'TRIPPLEG':    'NGX:TRIPPLEG',
-  'UPDC':        'NGX:UPDC',
-  'UPDCREIT':    'NGX:UPDCREIT',
-  'ETI':         'NGX:ETI',
-  'ZENITH':      'NGX:ZENITHBANK',   // legacy alias
+// NGX's published ticker sometimes differs from our instrument_id.
+// This map translates NGX-published tickers to the internal IDs used
+// by the `instruments` table in Supabase.
+const NGX_TICKER_ALIASES: Record<string, string> = {
+  FIRSTHOLDCO: 'FBNH',   // First HoldCo (was First Bank of Nigeria Holdings)
+  MOBIL: 'MRS',          // MRS Oil Nigeria (historical Mobil ticker)
 }
 
-// Reverse map: TradingView symbol suffix → instrument_id
-const NGX_REVERSE_MAP: Record<string, string> = Object.fromEntries(
-  Object.entries(NGX_SYMBOL_MAP).map(([id, sym]) => [sym.replace('NGX:', ''), id])
-)
+const NGX_EQUITIES_URL = 'https://ngxgroup.com/exchange/data/equities-price-list/'
 
-// ---- Fetch NGX equity prices via Apify TradingView scraper ----
-export async function fetchNGXPrices(apifyKey: string): Promise<Quote[]> {
-  // Deduplicate symbols (some instrument_ids map to same TradingView symbol)
-  const symbols = [...new Set(Object.values(NGX_SYMBOL_MAP))]
+// User-Agent is required — NGX returns 403 or a stripped page to default fetch UAs.
+const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36'
 
-  const response = await fetch(
-    `https://api.apify.com/v2/acts/apify~trading-view-scraper/run-sync-get-dataset-items?token=${apifyKey}&timeout=90`,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ symbols, timeframe: 'D', bars: 1 }),
-    }
-  )
+// --------------------------------------------------------------
+// Primary: Direct scrape of NGX equities price list
+// --------------------------------------------------------------
+export async function fetchNGXPrices(
+  validInstrumentIds?: Set<string>
+): Promise<Quote[]> {
+  const res = await fetch(NGX_EQUITIES_URL, {
+    headers: {
+      'User-Agent': BROWSER_UA,
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.9',
+    },
+    cache: 'no-store',
+  })
 
-  if (!response.ok) {
-    throw new Error(`Apify API error ${response.status}: ${await response.text()}`)
+  if (!res.ok) {
+    throw new Error(`NGX fetch failed: HTTP ${res.status} ${res.statusText}`)
   }
 
-  const data: ApifyQuote[] = await response.json()
-  if (!Array.isArray(data) || data.length === 0) {
-    throw new Error('Apify returned no data. Check your API key and actor permissions.')
+  const html = await res.text()
+  if (html.length < 5000) {
+    throw new Error(
+      `NGX returned unexpectedly short HTML (${html.length} bytes) — page structure may have changed`
+    )
   }
 
-  return data
-    .map(item => {
-      const rawSymbol = (item.symbol || '').replace('NGX:', '')
-      const instrument_id = NGX_REVERSE_MAP[rawSymbol]
-      if (!instrument_id) return null
-      const price = item.close ?? item.last
-      if (!price) return null
-      return {
+  // Each ticker entry looks like:
+  //   <a href="...?symbol=GTCO&directory=companydirectory" style="...">GTCO </a>
+  //   N123.45
+  //   <span class="iconNull">0.00 %</span>
+  //
+  // We capture from the URL `symbol=` (always clean, no bracket suffixes like [MRF])
+  // through to the percentage span text.
+  const re =
+    /<a\s+href="[^"]*\?symbol=([A-Z0-9_]+)&[^"]*"[^>]*>[\s\S]*?<\/a>\s*N([\d,]+\.?\d*)\s*<span\s+class="(iconNull|iconUp|iconDown)"[^>]*>\s*([-+]?\d+\.?\d*)\s*%/g
+
+  const fetchedAt = new Date().toISOString()
+  const seen = new Map<string, Quote>()
+
+  let match: RegExpExecArray | null
+  while ((match = re.exec(html)) !== null) {
+    const rawTicker = match[1]
+    const price = parseFloat(match[2].replace(/,/g, ''))
+    const direction = match[3]
+    let change = parseFloat(match[4])
+
+    if (!Number.isFinite(price) || price <= 0) continue
+    if (!Number.isFinite(change)) change = 0
+    if (direction === 'iconDown' && change > 0) change = -change
+    if (direction === 'iconNull') change = 0
+
+    // Translate NGX-published ticker → our instrument_id
+    const instrument_id = NGX_TICKER_ALIASES[rawTicker] || rawTicker
+
+    // If caller supplied a whitelist (the instruments we actually hold),
+    // skip anything not in it. Prevents FK violations on market_prices insert
+    // (see pitfall #5) and avoids bloating the price table with 400+ rows.
+    if (validInstrumentIds && !validInstrumentIds.has(instrument_id)) continue
+
+    // Dedup — NGX repeats each ticker in up to 6 marquees; take the first.
+    if (!seen.has(instrument_id)) {
+      seen.set(instrument_id, {
         instrument_id,
         price,
-        day_change: item.changePercent ?? item.change ?? 0,
-        source: 'apify',
-        fetched_at: new Date().toISOString(),
-      } as Quote
-    })
-    .filter(Boolean) as Quote[]
+        day_change: change,
+        source: 'ngx',
+        fetched_at: fetchedAt,
+      })
+    }
+  }
+
+  if (seen.size === 0) {
+    throw new Error(
+      'NGX parse returned 0 quotes — regex may no longer match the page structure'
+    )
+  }
+
+  return [...seen.values()]
 }
 
-// ---- Fetch USD/NGN from exchangerate-api (free, no key needed) ----
+// --------------------------------------------------------------
+// FX rate (USD → NGN) — free endpoint, no key
+// --------------------------------------------------------------
 export async function fetchFXRate(): Promise<number | null> {
   try {
-    const r = await fetch('https://api.exchangerate-api.com/v4/latest/USD')
+    const r = await fetch('https://api.exchangerate-api.com/v4/latest/USD', {
+      cache: 'no-store',
+    })
     const d = await r.json()
     return d.rates?.NGN ?? null
   } catch {
@@ -142,8 +135,12 @@ export async function fetchFXRate(): Promise<number | null> {
   }
 }
 
-// ---- Alternative: Alpha Vantage (Nigerian stocks via .LAG suffix) ----
-// GTCO → GTCO.LAG, UBA → UBA.LAG, ZENITH → ZENITHBANK.LAG
+// --------------------------------------------------------------
+// Alpha Vantage fallback (kept for back-compat; not used by default)
+// Alpha Vantage has tight rate limits (5 req/min free tier) so it's
+// impractical for 50+ tickers, but we keep the export so anything
+// importing this symbol elsewhere still compiles.
+// --------------------------------------------------------------
 export async function fetchAlphaVantage(
   symbol: string,
   apiKey: string
@@ -163,34 +160,26 @@ export async function fetchAlphaVantage(
   }
 }
 
-// ---- Combine all sources ----
+// --------------------------------------------------------------
+// Aggregator — signature preserved for callers, implementation
+// swapped to NGX-direct. The old (apifyKey, alphaVantageKey) config
+// is ignored if passed; new callers should pass { validInstrumentIds }.
+// --------------------------------------------------------------
 export async function fetchAllMarketData(config: {
-  apifyKey?: string
-  alphaVantageKey?: string
+  validInstrumentIds?: Set<string>
+  apifyKey?: string        // deprecated — ignored
+  alphaVantageKey?: string // deprecated — ignored
 }): Promise<{ quotes: Quote[]; fxRate: number | null; errors: string[] }> {
   const quotes: Quote[] = []
   const errors: string[] = []
 
-  // 1. Apify (primary for NGX equities)
-  if (config.apifyKey) {
-    try {
-      const ngxQuotes = await fetchNGXPrices(config.apifyKey)
-      quotes.push(...ngxQuotes)
-    } catch (e) {
-      errors.push(`Apify: ${(e as Error).message}`)
-      // Fallback to Alpha Vantage if available
-      if (config.alphaVantageKey) {
-        for (const [id, sym] of Object.entries({ UBA:'UBA', GTCO:'GTCO', ZENITH:'ZENITHBANK' })) {
-          try {
-            const q = await fetchAlphaVantage(sym, config.alphaVantageKey)
-            if (q) quotes.push({ instrument_id: id, price: q.price, day_change: q.change, source: 'alpha_vantage', fetched_at: new Date().toISOString() })
-          } catch {}
-        }
-      }
-    }
+  try {
+    const ngxQuotes = await fetchNGXPrices(config.validInstrumentIds)
+    quotes.push(...ngxQuotes)
+  } catch (e) {
+    errors.push(`NGX: ${(e as Error).message}`)
   }
 
-  // 2. FX rate (free)
   const fxRate = await fetchFXRate()
 
   return { quotes, fxRate, errors }

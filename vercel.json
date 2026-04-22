@@ -8,6 +8,9 @@
     },
     "app/api/analytics/route.ts": {
       "maxDuration": 30
+    },
+    "app/api/prices/route.ts": {
+      "maxDuration": 60
     }
   }
 }

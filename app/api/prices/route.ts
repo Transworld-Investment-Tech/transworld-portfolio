@@ -2,30 +2,48 @@ import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { fetchAllMarketData } from '@/lib/market-data'
 
-export async function POST(req: NextRequest) {
+// v16: Direct NGX scrape does not need Apify. Keep a generous timeout
+// in case the NGX page is slow under load (pitfall #12).
+export const maxDuration = 60
+
+export async function POST(_req: NextRequest) {
   try {
     const db = supabaseAdmin()
 
-    // Get API keys from config table
-    const { data: keys } = await db.from('api_config').select('key_name, key_value').in('key_name', ['apify', 'alpha_vantage'])
-    const keyMap = Object.fromEntries((keys || []).map((k: any) => [k.key_name, k.key_value]))
+    // Fetch every known instrument_id so we only try to upsert prices for
+    // securities that actually exist in the `instruments` table. Prevents
+    // FK-constraint violations on market_prices and keeps the price table tidy.
+    const { data: instruments, error: instErr } = await db
+      .from('instruments')
+      .select('instrument_id')
 
-    if (!keyMap.apify && !keyMap.alpha_vantage) {
-      return NextResponse.json({ error: 'No market data API keys configured. Add Apify key in Admin > Settings.' }, { status: 400 })
-    }
+    if (instErr) throw instErr
+
+    const validInstrumentIds = new Set<string>(
+      (instruments || []).map((r: any) => r.instrument_id as string)
+    )
 
     const { quotes, fxRate, errors } = await fetchAllMarketData({
-      apifyKey: keyMap.apify,
-      alphaVantageKey: keyMap.alpha_vantage,
+      validInstrumentIds,
     })
 
-    if (quotes.length === 0 && errors.length > 0) {
-      return NextResponse.json({ error: errors.join('; ') }, { status: 502 })
+    if (quotes.length === 0) {
+      return NextResponse.json(
+        {
+          error:
+            errors.length > 0
+              ? `Price fetch failed: ${errors.join('; ')}`
+              : 'No matching prices returned from NGX. Check that your instrument_ids match NGX tickers.',
+          errors,
+        },
+        { status: 502 }
+      )
     }
 
-    // Upsert prices into market_prices table
+    // Upsert into market_prices. UNIQUE constraint on (instrument_id, price_date)
+    // exists — using onConflict here is correct (unlike nav_log per pitfall #3).
     const today = new Date().toISOString().slice(0, 10)
-    const upserts = quotes.map(q => ({
+    const upserts = quotes.map((q) => ({
       instrument_id: q.instrument_id,
       price_date: today,
       price: q.price,
@@ -44,10 +62,17 @@ export async function POST(req: NextRequest) {
       updated: quotes.length,
       fxRate,
       errors,
-      quotes: quotes.map(q => ({ id: q.instrument_id, price: q.price, change: q.day_change })),
+      quotes: quotes.map((q) => ({
+        id: q.instrument_id,
+        price: q.price,
+        change: q.day_change,
+      })),
     })
   } catch (err) {
-    console.error('Price fetch error:', err)
-    return NextResponse.json({ error: (err as Error).message }, { status: 500 })
+    console.error('[/api/prices] fatal:', err)
+    return NextResponse.json(
+      { error: (err as Error).message || 'Unknown error in /api/prices' },
+      { status: 500 }
+    )
   }
 }
