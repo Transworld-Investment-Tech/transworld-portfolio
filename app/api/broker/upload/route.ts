@@ -29,6 +29,7 @@
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import { randomUUID } from 'crypto'
 import {
   parseContractNotesPdf,
   parseStatementPdf,
@@ -124,6 +125,7 @@ export async function POST(req: NextRequest) {
   const errors: string[] = []
   const uploadedFiles: UploadedFile[] = []
   const timestamp = Date.now()
+  const uploadSessionId = randomUUID()  // v21b-3a: groups all files from this POST
 
   // ── Upload + parse contract notes ────────────────────────
   let parsedCN: ParsedContractNotes | null = null
@@ -136,7 +138,8 @@ export async function POST(req: NextRequest) {
       cnField,
       'contract_notes',
       timestamp,
-      typeof uploaded_by === 'string' ? uploaded_by : null
+      typeof uploaded_by === 'string' ? uploaded_by : null,
+      uploadSessionId
     )
     if (up.error) {
       errors.push(`contract_notes upload: ${up.error}`)
@@ -206,7 +209,8 @@ export async function POST(req: NextRequest) {
       file,
       'statement',
       timestamp,
-      typeof uploaded_by === 'string' ? uploaded_by : null
+      typeof uploaded_by === 'string' ? uploaded_by : null,
+      uploadSessionId
     )
     if (up.error) {
       errors.push(`${file.name} upload: ${up.error}`)
@@ -363,7 +367,8 @@ async function uploadPdf(
   file: File,
   kind: 'contract_notes' | 'statement',
   timestamp: number,
-  uploaded_by: string | null
+  uploaded_by: string | null,
+  upload_session_id: string
 ): Promise<{ broker_file_id: string; storage_path: string; error?: string }> {
   const storage_path = `${portfolio_id}/${timestamp}-${sanitize(file.name)}`
   const bytes = Buffer.from(await file.arrayBuffer())
@@ -389,6 +394,7 @@ async function uploadPdf(
       size_bytes: file.size,
       parse_status: 'pending',
       uploaded_by,
+      upload_session_id,
       created_at: now,
       updated_at: now,
     })
