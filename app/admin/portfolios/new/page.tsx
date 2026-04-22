@@ -8,29 +8,20 @@ import {
   Briefcase, TrendingUp, Settings2, BarChart3, CheckCircle2,
 } from 'lucide-react'
 
-// v18: portfolio creation form.
-// v19d: starting NAV can be 0 or blank — the portfolio can be built up via
-//       TRANSFER_IN transactions instead of deploying capital up-front.
-//
-// The form writes three things atomically via POST /api/portfolios:
-//   1. `portfolios` row
-//   2. Three `sleeve_targets` rows (liq / eq / fi)
-//   3. An initial `nav_log` row at `start_date` with `nav_value = starting_nav`
-//      (starting_nav may be 0; IRR math handles it — the −0 cash flow at t=0
-//      is a no-op and TRANSFER_IN events carry the real capital flows.)
+// v20e: Hybrid rewrite.
+// Preserves v19d verbatim:
+//   • Starting NAV accepts 0 or blank (portfolio built from TRANSFER_IN)
+//   • missingReasons hint surfaces under disabled Create button
+//   • label conflict detection, name auto-sync with label
+//   • Suspense wrapper (Next 15 requires this for useSearchParams)
 
-// ─── Preset definitions ─────────────────────────────────────────────
 const MANDATE_PRESETS = {
   conservative: {
     label: 'Conservative',
     description: 'Income-focused. Low volatility tolerance.',
-    income_target: 0.12,
-    cap_target: 0.08,
-    liq_min: 0.10,
-    dd_alert: -0.05,
-    dd_action: -0.08,
-    max_eq_single: 0.07,
-    max_eq_sleeve: 0.35,
+    income_target: 0.12, cap_target: 0.08, liq_min: 0.10,
+    dd_alert: -0.05, dd_action: -0.08,
+    max_eq_single: 0.07, max_eq_sleeve: 0.35,
     sleeves: {
       liq: { target: 0.15, min: 0.10, max: 0.25 },
       eq:  { target: 0.25, min: 0.15, max: 0.35 },
@@ -40,13 +31,9 @@ const MANDATE_PRESETS = {
   balanced: {
     label: 'Balanced',
     description: 'Mix of income and capital growth.',
-    income_target: 0.10,
-    cap_target: 0.15,
-    liq_min: 0.05,
-    dd_alert: -0.10,
-    dd_action: -0.15,
-    max_eq_single: 0.10,
-    max_eq_sleeve: 0.60,
+    income_target: 0.10, cap_target: 0.15, liq_min: 0.05,
+    dd_alert: -0.10, dd_action: -0.15,
+    max_eq_single: 0.10, max_eq_sleeve: 0.60,
     sleeves: {
       liq: { target: 0.10, min: 0.05, max: 0.20 },
       eq:  { target: 0.60, min: 0.45, max: 0.70 },
@@ -56,13 +43,9 @@ const MANDATE_PRESETS = {
   growth: {
     label: 'Growth',
     description: 'Capital appreciation. Higher volatility.',
-    income_target: 0.08,
-    cap_target: 0.22,
-    liq_min: 0.03,
-    dd_alert: -0.15,
-    dd_action: -0.20,
-    max_eq_single: 0.15,
-    max_eq_sleeve: 0.80,
+    income_target: 0.08, cap_target: 0.22, liq_min: 0.03,
+    dd_alert: -0.15, dd_action: -0.20,
+    max_eq_single: 0.15, max_eq_sleeve: 0.80,
     sleeves: {
       liq: { target: 0.05, min: 0.02, max: 0.15 },
       eq:  { target: 0.80, min: 0.65, max: 0.90 },
@@ -74,9 +57,9 @@ const MANDATE_PRESETS = {
 type PresetKey = 'conservative' | 'balanced' | 'growth' | 'custom'
 
 const SLEEVE_META: Array<{ id: 'liq' | 'eq' | 'fi'; name: string; color: string }> = [
-  { id: 'liq', name: 'Liquidity (Cash)', color: '#8a91a8' },
-  { id: 'eq',  name: 'Equities (NGX)',   color: '#60a5fa' },
-  { id: 'fi',  name: 'Fixed Income',     color: '#2dd4bf' },
+  { id: 'liq', name: 'Liquidity (Cash)', color: 'var(--sidebar-bg)' },
+  { id: 'eq',  name: 'Equities (NGX)',   color: 'var(--gold)' },
+  { id: 'fi',  name: 'Fixed Income',     color: 'var(--pos)' },
 ]
 
 interface Client {
@@ -85,7 +68,6 @@ interface Client {
   name: string
 }
 
-// ─── Helpers ────────────────────────────────────────────────────────
 function pctToStr(v: number): string {
   return (v * 100).toFixed(2).replace(/\.?0+$/, '') || '0'
 }
@@ -100,13 +82,11 @@ function nextLetter(used: string[]): string {
   return 'A'
 }
 
-// ─── Main component ─────────────────────────────────────────────────
 function NewPortfolioInner() {
   const router = useRouter()
   const searchParams = useSearchParams()
   const preselectedClientId = searchParams.get('client') || ''
 
-  // ─── Client selection & basics ───
   const [clients, setClients] = useState<Client[]>([])
   const [clientId, setClientId] = useState(preselectedClientId)
   const [existingLabels, setExistingLabels] = useState<string[]>([])
@@ -117,7 +97,6 @@ function NewPortfolioInner() {
   const [startingNav, setStartingNav] = useState('')
   const [notes, setNotes] = useState('')
 
-  // ─── Preset + mandate state ───
   const [preset, setPreset] = useState<PresetKey>('balanced')
   const [mandate, setMandate] = useState(() => {
     const b = MANDATE_PRESETS.balanced
@@ -143,7 +122,6 @@ function NewPortfolioInner() {
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
 
-  // ─── Load active clients ───
   useEffect(() => {
     supabase
       .from('clients')
@@ -155,7 +133,6 @@ function NewPortfolioInner() {
       })
   }, [])
 
-  // ─── On client change: fetch existing labels, auto-suggest next letter ───
   useEffect(() => {
     if (!clientId) {
       setExistingLabels([])
@@ -192,7 +169,6 @@ function NewPortfolioInner() {
     setNameEditedManually(true)
   }
 
-  // ─── Preset helpers ───
   function applyPreset(key: PresetKey) {
     setPreset(key)
     if (key === 'custom') return
@@ -226,14 +202,12 @@ function NewPortfolioInner() {
     if (preset !== 'custom') setPreset('custom')
   }
 
-  // ─── Live validation ───
+  // Live validation — v19d preserved exactly
   const sleeveSum =
     strToPct(sleeves.liq.target) + strToPct(sleeves.eq.target) + strToPct(sleeves.fi.target)
   const sleeveSumPct = sleeveSum * 100
   const sumValid = Math.abs(sleeveSumPct - 100) < 0.01
 
-  // v19d: NAV is optional. Empty string → 0 (portfolio built from transactions).
-  //       Any non-negative number is valid. Negatives and non-numeric are not.
   const navIsEmpty = startingNav.trim() === ''
   const navNum = navIsEmpty ? 0 : Number(startingNav)
   const navValid = !isNaN(navNum) && navNum >= 0
@@ -243,9 +217,6 @@ function NewPortfolioInner() {
   const canSubmit =
     !!clientId && !!label && !!name.trim() && navValid && sumValid && !labelConflict && !saving
 
-  // v19d: surface a friendly "here's what's still missing" hint when the button
-  // is disabled, so users don't have to guess why. This would have saved the
-  // debug session where "Create portfolio" sat greyed out with no explanation.
   const missingReasons: string[] = []
   if (!clientId) missingReasons.push('select a client')
   if (!label.trim()) missingReasons.push('enter a label')
@@ -254,7 +225,6 @@ function NewPortfolioInner() {
   if (!navValid) missingReasons.push('starting NAV must be 0 or positive')
   if (!sumValid) missingReasons.push(`sleeve targets must sum to 100% (now ${sleeveSumPct.toFixed(1)}%)`)
 
-  // ─── Submit ───
   async function handleSubmit() {
     setError('')
     if (!clientId) return setError('Please select a client')
@@ -275,7 +245,7 @@ function NewPortfolioInner() {
         label,
         name: name.trim(),
         currency: 'NGN',
-        starting_nav: navNum,   // 0 is allowed; API will seed nav_log with nav_value=0
+        starting_nav: navNum,
         start_date: startDate,
         income_target: strToPct(mandate.income_target),
         cap_target: strToPct(mandate.cap_target),
@@ -312,69 +282,78 @@ function NewPortfolioInner() {
     }
   }
 
-  // ─── Render ─────────────────────────────────────────────────────
   const selectedClient = clients.find(c => c.id === clientId)
 
   return (
-    <div>
-      {/* Header */}
-      <div className="px-8 py-6 border-b border-white/[0.07] bg-[#13161d]">
-        <div className="flex items-center gap-3">
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      <div className="page-head">
+        <div>
           <Link
             href="/admin"
-            className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-            <ArrowLeft size={13} /> Admin panel
+            className="eyebrow"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 10, textDecoration: 'none' }}
+          >
+            <ArrowLeft size={11} /> Admin panel
           </Link>
-          <div className="w-px h-4 bg-white/10" />
-          <h1 className="text-xl font-semibold">New portfolio</h1>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            New portfolio
+          </h1>
+          <p style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+            Configure mandate parameters and sleeve targets. The form will also seed an initial
+            NAV log entry for IRR baselining.
+          </p>
         </div>
-        <p className="text-xs text-[#555d72] mt-2">
-          Configure mandate parameters and sleeve targets. The form will also seed an initial
-          NAV log entry for IRR baselining.
-        </p>
       </div>
 
-      <div className="px-8 py-6 max-w-4xl">
-        {/* ── Section 1: Client & basics ─────────────────────── */}
-        <div className="tw-card mb-4">
-          <div className="flex items-center gap-3 mb-5">
-            <div className="w-9 h-9 rounded-xl bg-[#a78bfa]/10 border border-[#a78bfa]/20 flex items-center justify-center flex-shrink-0">
-              <BarChart3 size={16} className="text-[#a78bfa]" />
+      <div style={{ maxWidth: 880, display: 'flex', flexDirection: 'column', gap: 14 }}>
+
+        {/* ── Section 1: Client & basics ──────────────────── */}
+        <div className="panel">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18, paddingBottom: 14, borderBottom: '1px solid var(--border-soft)' }}>
+            <div
+              style={{
+                width: 36, height: 36, borderRadius: 4,
+                background: 'var(--gold-soft)',
+                border: '1px solid rgba(176, 139, 62, 0.25)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              <BarChart3 size={16} style={{ color: 'var(--gold)' }} />
             </div>
             <div>
-              <div className="text-sm font-semibold">Portfolio basics</div>
-              <div className="text-[11px] text-[#555d72]">
+              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>Portfolio basics</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
                 Which client, portfolio name, start date, capital deployed
               </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
-            <div className="col-span-2">
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Client</label>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 16 }}>
+            <div style={{ gridColumn: 'span 2' }}>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Client</label>
               <select
                 value={clientId}
                 onChange={e => setClientId(e.target.value)}
-                className="tw-select">
+                className="select-h"
+              >
                 <option value="">— Select a client —</option>
                 {clients.map(c => (
-                  <option key={c.id} value={c.id}>
-                    {c.code} · {c.name}
-                  </option>
+                  <option key={c.id} value={c.id}>{c.code} · {c.name}</option>
                 ))}
               </select>
               {clientId && existingLabels.length > 0 && (
-                <div className="mt-1.5 text-[11px] text-[#555d72]">
+                <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
                   Existing portfolios for this client:{' '}
-                  <span className="font-mono text-[#8a91a8]">
+                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>
                     {existingLabels.join(', ')}
                   </span>
                 </div>
               )}
               {clients.length === 0 && (
-                <div className="mt-1.5 text-[11px] text-[#eab308]">
+                <div style={{ marginTop: 6, fontSize: 11, color: 'var(--warn)' }}>
                   No active clients yet.{' '}
-                  <Link href="/admin/clients/new" className="underline hover:text-[#e8eaf0]">
+                  <Link href="/admin/clients/new" style={{ textDecoration: 'underline', color: 'var(--warn)' }}>
                     Create one first
                   </Link>
                   .
@@ -383,49 +362,50 @@ function NewPortfolioInner() {
             </div>
 
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Label</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Label</label>
               <input
                 type="text"
                 value={label}
                 onChange={e => handleLabelChange(e.target.value)}
                 maxLength={2}
-                className="tw-input font-mono uppercase"
+                className="input-h input-h-mono"
+                style={{ textTransform: 'uppercase' }}
               />
-              <div className="mt-1.5 text-[11px] min-h-[14px]">
+              <div style={{ marginTop: 6, fontSize: 11, minHeight: 14 }}>
                 {labelConflict ? (
-                  <span className="text-[#ef4444] inline-flex items-center gap-1">
+                  <span style={{ color: 'var(--neg)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <AlertCircle size={10} /> Already used for this client
                   </span>
                 ) : (
-                  <span className="text-[#555d72]">Single letter (A, B, C…)</span>
+                  <span style={{ color: 'var(--text-3)' }}>Single letter (A, B, C…)</span>
                 )}
               </div>
             </div>
 
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Name</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Name</label>
               <input
                 type="text"
                 value={name}
                 onChange={e => handleNameChange(e.target.value)}
-                className="tw-input"
+                className="input-h"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Start date</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Start date</label>
               <input
                 type="date"
                 value={startDate}
                 onChange={e => setStartDate(e.target.value)}
                 max={new Date().toISOString().slice(0, 10)}
-                className="tw-input font-mono"
+                className="input-h input-h-mono"
               />
             </div>
 
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">
-                Starting NAV (₦) <span className="text-[#555d72] font-normal">— optional</span>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                Starting NAV (₦) <span style={{ color: 'var(--text-3)', fontWeight: 400 }}>— optional</span>
               </label>
               <input
                 type="number"
@@ -434,18 +414,17 @@ function NewPortfolioInner() {
                 placeholder="Leave blank to build from transactions"
                 min="0"
                 step="0.01"
-                className="tw-input font-mono"
+                className="input-h input-h-mono"
               />
-              {/* v19d: context-aware helper text */}
-              <div className="mt-1.5 text-[11px] min-h-[14px]">
+              <div style={{ marginTop: 6, fontSize: 11, minHeight: 14 }}>
                 {!navValid ? (
-                  <span className="text-[#ef4444]">Must be 0 or a positive number</span>
+                  <span style={{ color: 'var(--neg)' }}>Must be 0 or a positive number</span>
                 ) : navIsEmpty || navNum === 0 ? (
-                  <span className="text-[#555d72]">
+                  <span style={{ color: 'var(--text-3)' }}>
                     Built from transaction history — initial NAV seeded as ₦0
                   </span>
                 ) : (
-                  <span className="text-[#555d72]">
+                  <span style={{ color: 'var(--text-3)' }}>
                     ₦{navNum.toLocaleString('en-NG', { maximumFractionDigits: 2 })}
                   </span>
                 )}
@@ -454,66 +433,76 @@ function NewPortfolioInner() {
           </div>
         </div>
 
-        {/* ── Section 2: Mandate preset selector ─────────────── */}
-        <div className="tw-card mb-4">
-          <div className="flex items-center gap-3 mb-5">
-            <div className="w-9 h-9 rounded-xl bg-[#2dd4bf]/10 border border-[#2dd4bf]/20 flex items-center justify-center flex-shrink-0">
-              <Briefcase size={16} className="text-[#2dd4bf]" />
+        {/* ── Section 2: Mandate preset selector ──────────── */}
+        <div className="panel">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 18, paddingBottom: 14, borderBottom: '1px solid var(--border-soft)' }}>
+            <div
+              style={{
+                width: 36, height: 36, borderRadius: 4,
+                background: 'rgba(45, 110, 78, 0.1)',
+                border: '1px solid rgba(45, 110, 78, 0.25)',
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              <Briefcase size={16} style={{ color: 'var(--pos)' }} />
             </div>
             <div>
-              <div className="text-sm font-semibold">Mandate style</div>
-              <div className="text-[11px] text-[#555d72]">
+              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>Mandate style</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
                 Pick a preset to pre-fill thresholds and sleeves, then fine-tune below
               </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-4 gap-3">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10 }}>
             <PresetCard
               active={preset === 'conservative'}
               onClick={() => applyPreset('conservative')}
-              icon={<Shield size={15} />}
-              color="#60a5fa"
+              icon={<Shield size={14} />}
+              color="var(--sidebar-bg)"
               label="Conservative"
               description="Income-focused, low volatility"
             />
             <PresetCard
               active={preset === 'balanced'}
               onClick={() => applyPreset('balanced')}
-              icon={<Briefcase size={15} />}
-              color="#2dd4bf"
+              icon={<Briefcase size={14} />}
+              color="var(--pos)"
               label="Balanced"
               description="Income + growth mix"
             />
             <PresetCard
               active={preset === 'growth'}
               onClick={() => applyPreset('growth')}
-              icon={<TrendingUp size={15} />}
-              color="#22c55e"
+              icon={<TrendingUp size={14} />}
+              color="var(--gold)"
               label="Growth"
               description="Capital appreciation"
             />
             <PresetCard
               active={preset === 'custom'}
               onClick={() => applyPreset('custom')}
-              icon={<Settings2 size={15} />}
-              color="#a78bfa"
+              icon={<Settings2 size={14} />}
+              color="var(--warn)"
               label="Custom"
               description="Set everything manually"
             />
           </div>
         </div>
 
-        {/* ── Section 3: Mandate thresholds ──────────────────── */}
-        <div className="tw-card mb-4">
-          <div className="mb-4">
-            <div className="text-sm font-semibold mb-1">Mandate thresholds</div>
-            <div className="text-[11px] text-[#555d72]">
-              All values in percent. Drawdown thresholds are negative.
+        {/* ── Section 3: Mandate thresholds ───────────────── */}
+        <div className="panel">
+          <div className="panel-header">
+            <div>
+              <div className="panel-title">Mandate thresholds</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                All values in percent. Drawdown thresholds are negative.
+              </div>
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 16 }}>
             <MandateField
               label="Income target"
               hint="Annual yield from dividends + coupons"
@@ -562,75 +551,85 @@ function NewPortfolioInner() {
           </div>
         </div>
 
-        {/* ── Section 4: Sleeve targets ──────────────────────── */}
-        <div className="tw-card mb-4">
-          <div className="flex items-center justify-between mb-4">
+        {/* ── Section 4: Sleeve targets ───────────────────── */}
+        <div className="panel">
+          <div className="panel-header">
             <div>
-              <div className="text-sm font-semibold mb-1">Sleeve allocation</div>
-              <div className="text-[11px] text-[#555d72]">
+              <div className="panel-title">Sleeve allocation</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
                 Target / min / max as % of NAV. Targets must sum to 100%.
               </div>
             </div>
-            <div className="text-right">
-              <div className="text-[10px] uppercase tracking-widest text-[#555d72]">
+            <div style={{ textAlign: 'right' }}>
+              <div style={{ fontSize: 10, textTransform: 'uppercase' as const, letterSpacing: '0.14em', color: 'var(--text-3)', fontWeight: 600 }}>
                 Target sum
               </div>
               <div
-                className={`text-lg font-mono font-semibold ${
-                  sumValid ? 'text-[#22c55e]' : 'text-[#ef4444]'
-                }`}>
+                className="hybrid-serif"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 500,
+                  color: sumValid ? 'var(--pos)' : 'var(--neg)',
+                  fontFamily: 'var(--font-mono)',
+                  lineHeight: 1,
+                  marginTop: 4,
+                }}
+              >
                 {sleeveSumPct.toFixed(2)}%
-                {sumValid && <CheckCircle2 size={14} className="inline ml-1 -mt-0.5" />}
+                {sumValid && <CheckCircle2 size={14} style={{ display: 'inline', marginLeft: 5, verticalAlign: 'middle' }} />}
               </div>
             </div>
           </div>
 
           {!sumValid && (
-            <div className="mb-3 text-xs text-[#ef4444] bg-[#ef4444]/10 rounded-lg px-3 py-2 border border-[#ef4444]/20 flex items-center gap-2">
-              <AlertCircle size={11} />
-              Targets must sum to 100%. Adjust values or click a preset above to reset.
+            <div className="alert-h alert-h-critical" style={{ fontSize: 11, marginBottom: 12 }}>
+              <AlertCircle size={11} style={{ flexShrink: 0, marginTop: 1 }} />
+              <span>Targets must sum to 100%. Adjust values or click a preset above to reset.</span>
             </div>
           )}
 
-          <table className="tw-table w-full">
+          <table className="h-table" style={{ width: '100%' }}>
             <thead>
               <tr>
                 <th>Sleeve</th>
-                <th className="text-right">Target %</th>
-                <th className="text-right">Min %</th>
-                <th className="text-right">Max %</th>
+                <th className="num">Target %</th>
+                <th className="num">Min %</th>
+                <th className="num">Max %</th>
               </tr>
             </thead>
             <tbody>
               {SLEEVE_META.map(m => (
                 <tr key={m.id}>
                   <td>
-                    <div className="flex items-center gap-2">
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                       <span
-                        className="w-2.5 h-2.5 rounded-full inline-block flex-shrink-0"
-                        style={{ background: m.color }}
+                        style={{
+                          width: 10, height: 10, borderRadius: '50%',
+                          display: 'inline-block', flexShrink: 0,
+                          background: m.color,
+                        }}
                       />
                       <div>
-                        <div className="text-sm">{m.name}</div>
-                        <div className="text-[10px] text-[#555d72] font-mono uppercase">
+                        <div style={{ fontSize: 13, color: 'var(--text)' }}>{m.name}</div>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', textTransform: 'uppercase' as const }}>
                           {m.id}
                         </div>
                       </div>
                     </div>
                   </td>
-                  <td className="text-right">
+                  <td className="num">
                     <SleeveInput
                       value={sleeves[m.id].target}
                       onChange={v => updateSleeve(m.id, 'target', v)}
                     />
                   </td>
-                  <td className="text-right">
+                  <td className="num">
                     <SleeveInput
                       value={sleeves[m.id].min}
                       onChange={v => updateSleeve(m.id, 'min', v)}
                     />
                   </td>
-                  <td className="text-right">
+                  <td className="num">
                     <SleeveInput
                       value={sleeves[m.id].max}
                       onChange={v => updateSleeve(m.id, 'max', v)}
@@ -642,61 +641,61 @@ function NewPortfolioInner() {
           </table>
         </div>
 
-        {/* ── Section 5: Notes ──────────────────────────────── */}
-        <div className="tw-card mb-4">
-          <label className="block text-xs text-[#8a91a8] mb-1.5">Notes (optional)</label>
+        {/* ── Section 5: Notes ────────────────────────────── */}
+        <div className="panel">
+          <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+            Notes (optional)
+          </label>
           <textarea
             value={notes}
             onChange={e => setNotes(e.target.value)}
             rows={3}
             placeholder="Any context on this mandate — source of funds, restrictions, expected cash flows…"
-            className="tw-input resize-none"
+            className="textarea-h"
           />
         </div>
 
-        {/* ── Submit bar ────────────────────────────────────── */}
+        {/* ── Submit bar ─────────────────────────────────── */}
         {error && (
-          <div className="mb-3 text-xs text-[#ef4444] bg-[#ef4444]/10 rounded-lg px-3 py-2 border border-[#ef4444]/20">
-            <AlertCircle size={11} className="inline mr-1 -mt-0.5" />
-            {error}
+          <div className="alert-h alert-h-critical" style={{ fontSize: 12 }}>
+            <AlertCircle size={12} style={{ flexShrink: 0, marginTop: 1 }} />
+            <span>{error}</span>
           </div>
         )}
 
-        <div className="flex items-center gap-3">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
           <button
             onClick={handleSubmit}
             disabled={!canSubmit}
-            className="flex items-center gap-2 bg-[#a78bfa] text-white px-5 py-2.5 rounded-lg text-sm font-medium hover:bg-[#9b87e8] transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+            className="btn-h btn-h-primary"
+            style={{ padding: '9px 20px' }}
+          >
             <Save size={13} /> {saving ? 'Creating portfolio…' : 'Create portfolio'}
           </button>
-          <Link
-            href="/admin"
-            className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+          <Link href="/admin" className="btn-h" style={{ textDecoration: 'none' }}>
             Cancel
           </Link>
           {selectedClient && (
-            <div className="ml-auto text-[11px] text-[#555d72]">
+            <div style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-3)' }}>
               Creating{' '}
-              <span className="font-mono text-[#8a91a8]">
+              <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>
                 {selectedClient.code}-{label}
               </span>{' '}
-              for <span className="text-[#e8eaf0]">{selectedClient.name}</span>
+              for <span style={{ color: 'var(--text)' }}>{selectedClient.name}</span>
             </div>
           )}
         </div>
 
-        {/* v19d: tell the user why the button is greyed out */}
+        {/* v19d: missing-requirements hint */}
         {!canSubmit && !saving && missingReasons.length > 0 && (
-          <div className="mt-3 text-[11px] text-[#eab308] flex items-start gap-2">
-            <AlertCircle size={11} className="mt-0.5 flex-shrink-0" />
-            <span>
-              Before creating: {missingReasons.join(' · ')}
-            </span>
+          <div style={{ fontSize: 11, color: 'var(--warn)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6 }}>
+            <AlertCircle size={11} style={{ marginTop: 2, flexShrink: 0 }} />
+            <span>Before creating: {missingReasons.join(' · ')}</span>
           </div>
         )}
 
-        <div className="mt-4 text-[11px] text-[#555d72] flex items-start gap-2">
-          <Info size={11} className="mt-0.5 flex-shrink-0" />
+        <div style={{ fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6 }}>
+          <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
             On save we write three things: the portfolio row, three sleeve_targets rows, and an
             initial nav_log row at the start date so IRR calculations have a baseline. Holdings
@@ -704,11 +703,10 @@ function NewPortfolioInner() {
           </span>
         </div>
       </div>
-    </div>
+    </main>
   )
 }
 
-// ─── Small presentational components ─────────────────────────────────
 function PresetCard({
   active, onClick, icon, color, label, description,
 }: {
@@ -722,21 +720,33 @@ function PresetCard({
   return (
     <button
       onClick={onClick}
-      className={`text-left p-3 rounded-xl border transition-all ${
-        active
-          ? 'border-white/25 bg-white/[0.04]'
-          : 'border-white/[0.07] bg-[#13161d] hover:border-white/15'
-      }`}>
-      <div className="flex items-center gap-2 mb-2">
+      style={{
+        textAlign: 'left' as const,
+        padding: 14,
+        borderRadius: 4,
+        border: active ? `1.5px solid ${color}` : '1px solid var(--border-soft)',
+        background: active ? 'var(--bg-soft)' : 'var(--card)',
+        cursor: 'pointer',
+        transition: 'all 0.15s',
+        fontFamily: 'var(--font-sans)',
+      }}
+    >
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
         <div
-          className="w-7 h-7 rounded-lg flex items-center justify-center flex-shrink-0"
-          style={{ background: color + '15', color }}>
+          style={{
+            width: 26, height: 26, borderRadius: 3,
+            background: color === 'var(--sidebar-bg)' ? 'rgba(10, 31, 58, 0.1)' : `${color}22`,
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            flexShrink: 0,
+            color,
+          }}
+        >
           {icon}
         </div>
-        <div className="text-xs font-semibold">{label}</div>
-        {active && <CheckCircle2 size={12} className="ml-auto" style={{ color }} />}
+        <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text)' }}>{label}</div>
+        {active && <CheckCircle2 size={12} style={{ marginLeft: 'auto', color }} />}
       </div>
-      <div className="text-[10px] text-[#555d72] leading-snug">{description}</div>
+      <div style={{ fontSize: 10, color: 'var(--text-3)', lineHeight: 1.4 }}>{description}</div>
     </button>
   )
 }
@@ -752,28 +762,40 @@ function MandateField({
 }) {
   return (
     <div>
-      <label className="block text-xs text-[#8a91a8] mb-1.5">{label}</label>
-      <div className="relative">
+      <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>{label}</label>
+      <div style={{ position: 'relative' }}>
         <input
           type="number"
           value={value}
           onChange={e => onChange(e.target.value)}
           step="0.01"
           min={allowNegative ? undefined : '0'}
-          className="tw-input font-mono pr-8"
+          className="input-h input-h-mono"
+          style={{ paddingRight: 28 }}
         />
-        <span className="absolute right-3 top-1/2 -translate-y-1/2 text-[#555d72] text-xs font-mono pointer-events-none">
+        <span
+          style={{
+            position: 'absolute',
+            right: 10,
+            top: '50%',
+            transform: 'translateY(-50%)',
+            color: 'var(--text-3)',
+            fontSize: 11,
+            fontFamily: 'var(--font-mono)',
+            pointerEvents: 'none',
+          }}
+        >
           %
         </span>
       </div>
-      <div className="mt-1 text-[10px] text-[#555d72]">{hint}</div>
+      <div style={{ marginTop: 4, fontSize: 10, color: 'var(--text-3)' }}>{hint}</div>
     </div>
   )
 }
 
 function SleeveInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
   return (
-    <div className="relative inline-block">
+    <div style={{ position: 'relative', display: 'inline-block' }}>
       <input
         type="number"
         value={value}
@@ -781,22 +803,36 @@ function SleeveInput({ value, onChange }: { value: string; onChange: (v: string)
         step="0.01"
         min="0"
         max="100"
-        className="tw-input font-mono text-right pr-7 w-24"
+        className="input-h input-h-sm input-h-mono"
+        style={{ textAlign: 'right', paddingRight: 22, width: 96 }}
       />
-      <span className="absolute right-2.5 top-1/2 -translate-y-1/2 text-[#555d72] text-[10px] font-mono pointer-events-none">
+      <span
+        style={{
+          position: 'absolute',
+          right: 8,
+          top: '50%',
+          transform: 'translateY(-50%)',
+          color: 'var(--text-3)',
+          fontSize: 10,
+          fontFamily: 'var(--font-mono)',
+          pointerEvents: 'none',
+        }}
+      >
         %
       </span>
     </div>
   )
 }
 
-// Suspense wrapper — required by Next 15 for useSearchParams in client components.
 export default function NewPortfolioPage() {
   return (
     <Suspense
       fallback={
-        <div className="px-8 py-6 text-sm text-[#555d72]">Loading…</div>
-      }>
+        <div className="hybrid-page" style={{ padding: 32, fontSize: 13, color: 'var(--text-3)' }}>
+          Loading…
+        </div>
+      }
+    >
       <NewPortfolioInner />
     </Suspense>
   )

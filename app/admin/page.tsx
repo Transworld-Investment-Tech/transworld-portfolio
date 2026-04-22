@@ -2,12 +2,21 @@
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
-import { fmt } from '@/lib/portfolio'
 import {
-  Users, BarChart3, TrendingUp, FileText, Settings,
-  RefreshCw, PlusCircle, Activity, ChevronRight, Upload,
-  LineChart
+  Users, BarChart3, FileText, Settings,
+  PlusCircle, ChevronRight, Upload, LineChart,
 } from 'lucide-react'
+
+// v20e: Hybrid rewrite of the admin dashboard.
+// Stats cards, quick actions, and recent-reports list — preserves all links.
+
+type QuickAction = {
+  href: string
+  icon: React.ReactNode
+  label: string
+  sub: string
+  accent: string   // CSS var for accent bar / icon tint
+}
 
 export default function AdminPage() {
   const [stats, setStats] = useState({ clients: 0, portfolios: 0, reports: 0 })
@@ -28,62 +37,133 @@ export default function AdminPage() {
     load()
   }, [])
 
-  // v17: Market prices quick link added. Sits after Settings because it's
-  // data-operational, not administrative. Uses yellow to signal it's the
-  // place to go when prices go stale.
-  const quickLinks = [
-    { href: '/admin/clients/new', icon: <PlusCircle size={16} />, label: 'Add client', sub: 'Onboard a new discretionary mandate', color: '#a78bfa' },
-    { href: '/admin/portfolios/new', icon: <BarChart3 size={16} />, label: 'New portfolio', sub: 'Create portfolio A/B/C/D for a client', color: '#2dd4bf' },
-    { href: '/admin/prices', icon: <LineChart size={16} />, label: 'Market prices', sub: 'View, refresh & manually override NGX prices', color: '#eab308' },
-    { href: '/admin/settings', icon: <Settings size={16} />, label: 'Settings', sub: 'API keys, Apify, Anthropic', color: '#60a5fa' },
-    { href: '/admin/reports', icon: <FileText size={16} />, label: 'All reports', sub: 'View & download generated reports', color: '#fb923c' },
-    { href: '/admin/import', icon: <Upload size={16} />, label: 'Import transactions', sub: 'Upload CSV/Excel from broker system', color: '#22c55e' },
+  const quickLinks: QuickAction[] = [
+    { href: '/admin/clients/new',    icon: <PlusCircle size={14} />, label: 'Add client',           sub: 'Onboard a new discretionary mandate',          accent: 'var(--gold)' },
+    { href: '/admin/portfolios/new', icon: <BarChart3 size={14} />,  label: 'New portfolio',        sub: 'Create portfolio A/B/C/D for a client',        accent: 'var(--pos)' },
+    { href: '/admin/prices',         icon: <LineChart size={14} />,  label: 'Market prices',        sub: 'View, refresh & manually override NGX prices', accent: 'var(--warn)' },
+    { href: '/admin/settings',       icon: <Settings size={14} />,   label: 'Settings',             sub: 'API keys, Apify, Anthropic',                   accent: 'var(--sidebar-bg)' },
+    { href: '/admin/reports',        icon: <FileText size={14} />,   label: 'All reports',          sub: 'View & download generated reports',            accent: 'var(--neg)' },
+    { href: '/admin/import',         icon: <Upload size={14} />,     label: 'Import transactions',  sub: 'Upload CSV/Excel from broker system',          accent: 'var(--gold-bright)' },
+  ]
+
+  const statCards = [
+    { icon: <Users size={16} />,     label: 'Active clients',     value: stats.clients,            link: '/admin/clients', accent: 'var(--gold)' },
+    { icon: <BarChart3 size={16} />, label: 'Active portfolios',  value: `${stats.portfolios} / 25`, link: '/',              accent: 'var(--pos)' },
+    { icon: <FileText size={16} />,  label: 'Reports generated',  value: `${stats.reports}+`,       link: '/admin/reports', accent: 'var(--sidebar-bg)' },
   ]
 
   return (
-    <div>
-      <div className="px-8 py-6 border-b border-white/[0.07] bg-[#13161d]">
-        <h1 className="text-xl font-semibold">Admin panel</h1>
-        <p className="text-xs text-[#555d72] mt-0.5">Transworld Asset Management · Portfolio Intelligence Platform</p>
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      <div className="page-head">
+        <div>
+          <div className="eyebrow" style={{ marginBottom: 10 }}>
+            Transworld Asset Management
+          </div>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Admin panel
+          </h1>
+        </div>
       </div>
 
-      <div className="px-8 py-6 max-w-5xl">
-        {/* Stats */}
-        <div className="grid grid-cols-3 gap-4 mb-8">
-          {[
-            { icon: <Users size={18} className="text-[#a78bfa]" />, label: 'Active clients', value: stats.clients, link: '/admin/clients' },
-            { icon: <BarChart3 size={18} className="text-[#2dd4bf]" />, label: 'Active portfolios', value: `${stats.portfolios} / 25`, link: '/' },
-            { icon: <FileText size={18} className="text-[#fb923c]" />, label: 'Reports generated', value: stats.reports + '+', link: '/admin/reports' },
-          ].map((s, i) => (
-            <Link href={s.link} key={i}>
-              <div className="tw-card flex items-center gap-4 hover:border-white/15 transition-colors cursor-pointer">
-                <div className="w-10 h-10 rounded-xl bg-[#1a1e28] flex items-center justify-center flex-shrink-0">{s.icon}</div>
-                <div>
-                  <div className="kpi-label">{s.label}</div>
-                  <div className="text-xl font-semibold font-mono">{loading ? '—' : s.value}</div>
+      <div style={{ maxWidth: 960 }}>
+        {/* Stats row */}
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 32 }}>
+          {statCards.map((s, i) => (
+            <Link key={i} href={s.link} style={{ textDecoration: 'none' }}>
+              <div
+                className="panel"
+                style={{
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 14,
+                  padding: '18px 20px',
+                  cursor: 'pointer',
+                  transition: 'border-color 0.15s',
+                }}
+                onMouseEnter={e => { e.currentTarget.style.borderColor = 'var(--border-strong)' }}
+                onMouseLeave={e => { e.currentTarget.style.borderColor = 'var(--border)' }}
+              >
+                <div
+                  style={{
+                    width: 40,
+                    height: 40,
+                    borderRadius: 4,
+                    background: 'var(--bg-soft)',
+                    border: '1px solid var(--border-soft)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'center',
+                    flexShrink: 0,
+                    color: s.accent,
+                  }}
+                >
+                  {s.icon}
                 </div>
-                <ChevronRight size={14} className="ml-auto text-[#555d72]" />
+                <div style={{ flex: 1 }}>
+                  <div
+                    style={{
+                      fontSize: 10,
+                      letterSpacing: '0.14em',
+                      textTransform: 'uppercase' as const,
+                      color: 'var(--text-3)',
+                      fontWeight: 600,
+                      marginBottom: 6,
+                    }}
+                  >
+                    {s.label}
+                  </div>
+                  <div className="hybrid-serif" style={{ fontSize: 26, fontWeight: 500, letterSpacing: '-0.01em', color: 'var(--text)', lineHeight: 1 }}>
+                    {loading ? '—' : s.value}
+                  </div>
+                </div>
+                <ChevronRight size={14} style={{ color: 'var(--text-3)' }} />
               </div>
             </Link>
           ))}
         </div>
 
         {/* Quick actions */}
-        <div className="mb-8">
-          <h2 className="text-xs font-semibold uppercase tracking-widest text-[#555d72] mb-3">Quick actions</h2>
-          <div className="grid grid-cols-2 gap-3">
+        <div style={{ marginBottom: 32 }}>
+          <h2 style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.18em', color: 'var(--text-3)', marginBottom: 12 }}>
+            Quick actions
+          </h2>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 12 }}>
             {quickLinks.map(l => (
-              <Link href={l.href} key={l.href}>
-                <div className="tw-card flex items-center gap-4 hover:border-white/15 transition-all cursor-pointer group">
-                  <div className="w-9 h-9 rounded-xl flex items-center justify-center flex-shrink-0"
-                    style={{ background: l.color + '15', color: l.color }}>
+              <Link key={l.href} href={l.href} style={{ textDecoration: 'none' }}>
+                <div
+                  className="panel"
+                  style={{
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 14,
+                    padding: '14px 18px',
+                    cursor: 'pointer',
+                    transition: 'all 0.15s',
+                    borderLeft: `3px solid ${l.accent}`,
+                  }}
+                  onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-soft)' }}
+                  onMouseLeave={e => { e.currentTarget.style.background = 'var(--card)' }}
+                >
+                  <div
+                    style={{
+                      width: 34,
+                      height: 34,
+                      borderRadius: 4,
+                      background: l.accent === 'var(--sidebar-bg)' ? 'rgba(10, 31, 58, 0.08)' : `${l.accent}1a`,
+                      display: 'flex',
+                      alignItems: 'center',
+                      justifyContent: 'center',
+                      flexShrink: 0,
+                      color: l.accent,
+                    }}
+                  >
                     {l.icon}
                   </div>
-                  <div>
-                    <div className="text-sm font-medium group-hover:text-[#a78bfa] transition-colors">{l.label}</div>
-                    <div className="text-[11px] text-[#555d72]">{l.sub}</div>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>{l.label}</div>
+                    <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>{l.sub}</div>
                   </div>
-                  <ChevronRight size={13} className="ml-auto text-[#555d72] group-hover:text-[#a78bfa] transition-colors" />
+                  <ChevronRight size={13} style={{ color: 'var(--text-3)' }} />
                 </div>
               </Link>
             ))}
@@ -92,25 +172,47 @@ export default function AdminPage() {
 
         {/* Recent reports */}
         <div>
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="text-xs font-semibold uppercase tracking-widest text-[#555d72]">Recent AI reports</h2>
-            <Link href="/admin/reports" className="text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors">View all →</Link>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 }}>
+            <h2 style={{ fontSize: 10, fontWeight: 600, textTransform: 'uppercase' as const, letterSpacing: '0.18em', color: 'var(--text-3)' }}>
+              Recent AI reports
+            </h2>
+            <Link href="/admin/reports" style={{ fontSize: 11, color: 'var(--gold)', textDecoration: 'none' }}>
+              View all →
+            </Link>
           </div>
-          <div className="tw-card p-0 overflow-hidden">
+          <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
             {recentReports.length === 0 ? (
-              <div className="px-5 py-8 text-center text-xs text-[#555d72]">No reports generated yet</div>
+              <div style={{ padding: '32px 20px', textAlign: 'center', fontSize: 12, color: 'var(--text-3)' }}>
+                No reports generated yet
+              </div>
             ) : (
-              <table className="tw-table w-full">
-                <thead><tr><th>Portfolio</th><th>Client</th><th>Type</th><th>Date</th><th></th></tr></thead>
+              <table className="h-table" style={{ width: '100%' }}>
+                <thead>
+                  <tr>
+                    <th>Portfolio</th>
+                    <th>Client</th>
+                    <th>Type</th>
+                    <th>Date</th>
+                    <th></th>
+                  </tr>
+                </thead>
                 <tbody>
                   {recentReports.map(r => (
                     <tr key={r.id}>
-                      <td className="font-medium">{r.portfolio?.name}</td>
-                      <td className="text-[#555d72]">{r.portfolio?.client?.name}</td>
-                      <td><span className="badge badge-ntb capitalize">{r.report_type}</span></td>
-                      <td className="text-[#555d72]">{new Date(r.created_at).toLocaleDateString('en-GB')}</td>
+                      <td style={{ fontWeight: 500 }}>{r.portfolio?.name}</td>
+                      <td style={{ color: 'var(--text-3)' }}>{r.portfolio?.client?.name}</td>
                       <td>
-                        <Link href={`/admin/reports/${r.id}`} className="text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors">View →</Link>
+                        <span className="pill pill-warn" style={{ textTransform: 'capitalize' as const }}>
+                          {r.report_type}
+                        </span>
+                      </td>
+                      <td style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+                        {new Date(r.created_at).toLocaleDateString('en-GB')}
+                      </td>
+                      <td style={{ textAlign: 'right' }}>
+                        <Link href={`/admin/reports/${r.id}`} style={{ fontSize: 11, color: 'var(--gold)', textDecoration: 'none' }}>
+                          View →
+                        </Link>
                       </td>
                     </tr>
                   ))}
@@ -120,6 +222,6 @@ export default function AdminPage() {
           </div>
         </div>
       </div>
-    </div>
+    </main>
   )
 }

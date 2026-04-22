@@ -4,8 +4,10 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import { ArrowLeft, RefreshCw, Edit2, Search, AlertCircle, X, Save, Info } from 'lucide-react'
 
-// Staleness threshold. Any price older than this many days shows a yellow
-// indicator. Kept as a module constant for easy tuning.
+// v20e: Hybrid rewrite of the v17 Market Prices admin page.
+// Preserves the 3-day staleness threshold, source filter, held-only
+// toggle, and the manual-override modal which writes source='manual'.
+
 const STALE_DAYS = 3
 
 interface Row {
@@ -62,7 +64,6 @@ export default function MarketPricesPage() {
       supabase.from('holdings').select('instrument_id'),
     ])
 
-    // Latest price per instrument (first occurrence after the DESC sort)
     const priceMap = new Map<string, any>()
     priceRes.data?.forEach((p: any) => {
       if (!priceMap.has(p.instrument_id)) priceMap.set(p.instrument_id, p)
@@ -163,96 +164,131 @@ export default function MarketPricesPage() {
     return true
   })
 
-  // Summary counts over the held subset (most operationally useful)
   const held = rows.filter(r => r.holdingsCount > 0)
   const heldStaleCount = held.filter(r => stalenessOf(r.price_date) !== 'fresh').length
 
   return (
-    <div>
-      {/* Header */}
-      <div className="px-8 py-6 border-b border-white/[0.07] bg-[#13161d]">
-        <div className="flex items-center gap-3">
-          <Link href="/admin" className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-            <ArrowLeft size={13} /> Admin panel
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      <div className="page-head">
+        <div>
+          <Link
+            href="/admin"
+            className="eyebrow"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 10, textDecoration: 'none' }}
+          >
+            <ArrowLeft size={11} /> Admin panel
           </Link>
-          <div className="w-px h-4 bg-white/10" />
-          <h1 className="text-xl font-semibold">Market prices</h1>
-
-          <div className="ml-auto flex items-center gap-3">
-            {refreshMsg && (
-              <span className={`text-xs ${refreshMsg.startsWith('✓') ? 'text-[#22c55e]' : 'text-[#ef4444]'}`}>
-                {refreshMsg}
-              </span>
-            )}
-            <button
-              onClick={refreshFromNGX}
-              disabled={refreshing}
-              className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] border border-white/10 rounded-lg px-3 py-1.5 transition-colors disabled:opacity-50">
-              <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} /> {refreshing ? 'Fetching…' : 'Refresh from NGX'}
-            </button>
-          </div>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Market prices
+          </h1>
         </div>
-        <p className="text-xs text-[#555d72] mt-2">
-          {rows.length} instruments in master · {held.length} currently held ·{' '}
-          {heldStaleCount > 0 ? (
-            <span className="text-[#eab308]">{heldStaleCount} held position{heldStaleCount === 1 ? '' : 's'} with stale / missing price</span>
-          ) : (
-            <span className="text-[#22c55e]">All held prices fresh</span>
-          )}. Updates flow automatically to every portfolio.
-        </p>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {refreshMsg && (
+            <span style={{ fontSize: 11, color: refreshMsg.startsWith('✓') ? 'var(--pos)' : 'var(--neg)' }}>
+              {refreshMsg}
+            </span>
+          )}
+          <button
+            className="btn-h btn-h-primary"
+            onClick={refreshFromNGX}
+            disabled={refreshing}
+          >
+            <RefreshCw size={12} style={refreshing ? { animation: 'spin 0.7s linear infinite' } : undefined} />
+            {refreshing ? 'Fetching…' : 'Refresh from NGX'}
+          </button>
+        </div>
       </div>
 
-      <div className="px-8 py-5 max-w-6xl">
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+
+      {/* Status line */}
+      <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 18, lineHeight: 1.6 }}>
+        <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{rows.length}</span> instruments in master ·{' '}
+        <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{held.length}</span> currently held ·{' '}
+        {heldStaleCount > 0 ? (
+          <span style={{ color: 'var(--warn)' }}>
+            {heldStaleCount} held position{heldStaleCount === 1 ? '' : 's'} with stale / missing price
+          </span>
+        ) : (
+          <span style={{ color: 'var(--pos)' }}>All held prices fresh</span>
+        )}
+        . Updates flow automatically to every portfolio.
+      </div>
+
+      <div style={{ maxWidth: 1200 }}>
         {/* Filters */}
-        <div className="flex flex-wrap items-center gap-3 mb-4">
-          <div className="relative flex-1 min-w-[200px] max-w-sm">
-            <Search size={12} className="absolute left-3 top-1/2 -translate-y-1/2 text-[#555d72]" />
+        <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+          <div style={{ position: 'relative', flex: 1, minWidth: 200, maxWidth: 320 }}>
+            <Search
+              size={12}
+              style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }}
+            />
             <input
               type="text"
               value={search}
               onChange={e => setSearch(e.target.value)}
               placeholder="Search by ticker or name…"
-              className="tw-input pl-9 text-xs w-full"
+              className="input-h input-h-sm"
+              style={{ paddingLeft: 32 }}
             />
           </div>
           <select
             value={sourceFilter}
             onChange={e => setSourceFilter(e.target.value)}
-            className="tw-select text-xs">
+            className="select-h"
+            style={{ width: 180, padding: '5px 32px 5px 10px', fontSize: 12 }}
+          >
             <option value="all">All sources</option>
             <option value="ngx">NGX (auto)</option>
             <option value="manual">Manual override</option>
             <option value="seed-import">Seed import</option>
+            <option value="trade-history">Trade history</option>
             <option value="none">No price yet</option>
           </select>
-          <label className="flex items-center gap-1.5 text-xs text-[#8a91a8] cursor-pointer select-none">
-            <input type="checkbox" checked={heldOnly} onChange={e => setHeldOnly(e.target.checked)} className="accent-[#a78bfa]" />
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-2)', cursor: 'pointer', userSelect: 'none' as const }}>
+            <input
+              type="checkbox"
+              checked={heldOnly}
+              onChange={e => setHeldOnly(e.target.checked)}
+              style={{ accentColor: 'var(--gold)' }}
+            />
             Held only
           </label>
-          <label className="flex items-center gap-1.5 text-xs text-[#8a91a8] cursor-pointer select-none">
-            <input type="checkbox" checked={staleOnly} onChange={e => setStaleOnly(e.target.checked)} className="accent-[#eab308]" />
+          <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12, color: 'var(--text-2)', cursor: 'pointer', userSelect: 'none' as const }}>
+            <input
+              type="checkbox"
+              checked={staleOnly}
+              onChange={e => setStaleOnly(e.target.checked)}
+              style={{ accentColor: 'var(--warn)' }}
+            />
             Stale / missing only
           </label>
-          <div className="text-[11px] text-[#555d72] ml-auto">{filtered.length} shown</div>
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginLeft: 'auto' }}>
+            {filtered.length} shown
+          </div>
         </div>
 
         {/* Table */}
-        <div className="tw-card p-0 overflow-hidden">
+        <div className="panel" style={{ padding: 0, overflowX: 'auto' }}>
           {loading ? (
-            <div className="px-5 py-8 text-center text-xs text-[#555d72]">Loading…</div>
+            <div style={{ padding: '32px 20px', textAlign: 'center', fontSize: 12, color: 'var(--text-3)' }}>
+              Loading…
+            </div>
           ) : filtered.length === 0 ? (
-            <div className="px-5 py-8 text-center text-xs text-[#555d72]">No instruments match your filters</div>
+            <div style={{ padding: '32px 20px', textAlign: 'center', fontSize: 12, color: 'var(--text-3)' }}>
+              No instruments match your filters
+            </div>
           ) : (
-            <table className="tw-table w-full">
+            <table className="h-table" style={{ width: '100%' }}>
               <thead>
                 <tr>
                   <th>Instrument</th>
                   <th>Type</th>
-                  <th className="text-right">Price</th>
-                  <th className="text-right">Day chg</th>
+                  <th className="num">Price</th>
+                  <th className="num">Day chg</th>
                   <th>Source</th>
                   <th>As of</th>
-                  <th className="text-right">Holdings</th>
+                  <th className="num">Holdings</th>
                   <th></th>
                 </tr>
               </thead>
@@ -260,62 +296,93 @@ export default function MarketPricesPage() {
                 {filtered.map(r => {
                   const stale = stalenessOf(r.price_date)
                   const dotColor =
-                    stale === 'fresh' ? '#22c55e' :
-                    stale === 'stale' ? '#eab308' : '#6b7280'
+                    stale === 'fresh' ? 'var(--pos)' :
+                    stale === 'stale' ? 'var(--warn)' : 'var(--text-4)'
                   const dotTitle =
                     stale === 'fresh' ? `Fresh (within ${STALE_DAYS} days)` :
                     stale === 'stale' ? `Stale (older than ${STALE_DAYS} days)` :
                     'No price recorded'
                   const isHeld = r.holdingsCount > 0
                   return (
-                    <tr key={r.instrument_id} className={isHeld ? '' : 'opacity-60'}>
+                    <tr key={r.instrument_id} style={isHeld ? {} : { opacity: 0.55 }}>
                       <td>
-                        <div className="text-sm font-medium">{r.name}</div>
-                        <div className="text-[10px] text-[#555d72] font-mono">{r.instrument_id}</div>
+                        <div style={{ fontWeight: 500 }}>{r.name}</div>
+                        <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                          {r.instrument_id}
+                        </div>
                       </td>
                       <td>
-                        <span className="text-[10px] text-[#8a91a8] uppercase tracking-wide">{r.type}</span>
+                        <span style={{ fontSize: 10, color: 'var(--text-2)', textTransform: 'uppercase' as const, letterSpacing: '0.08em' }}>
+                          {r.type}
+                        </span>
                       </td>
-                      <td className="font-mono text-right">
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
                         {r.price !== undefined ? (
                           `₦${r.price.toFixed(r.type === 'Stock' ? 2 : 4)}`
                         ) : (
-                          <span className="text-[#555d72]">—</span>
+                          <span style={{ color: 'var(--text-4)' }}>—</span>
                         )}
                       </td>
-                      <td className={`font-mono text-right text-xs ${
-                        (r.day_change ?? 0) > 0 ? 'text-[#22c55e]' :
-                        (r.day_change ?? 0) < 0 ? 'text-[#ef4444]' : 'text-[#555d72]'
-                      }`}>
+                      <td
+                        className="num"
+                        style={{
+                          fontFamily: 'var(--font-mono)',
+                          fontSize: 12,
+                          color:
+                            (r.day_change ?? 0) > 0 ? 'var(--pos)' :
+                            (r.day_change ?? 0) < 0 ? 'var(--neg)' : 'var(--text-3)',
+                        }}
+                      >
                         {r.day_change !== undefined ? (
                           <>{r.day_change > 0 ? '+' : ''}{r.day_change.toFixed(2)}</>
                         ) : '—'}
                       </td>
                       <td>
                         {r.source ? (
-                          <span className="text-[10px] font-mono text-[#8a91a8] uppercase">{r.source}</span>
+                          <span style={{ fontSize: 10, fontFamily: 'var(--font-mono)', color: 'var(--text-2)', textTransform: 'uppercase' as const, letterSpacing: '0.06em' }}>
+                            {r.source}
+                          </span>
                         ) : (
-                          <span className="text-[10px] text-[#555d72]">—</span>
+                          <span style={{ fontSize: 10, color: 'var(--text-4)' }}>—</span>
                         )}
                       </td>
-                      <td className="text-xs">
-                        <span className="inline-flex items-center gap-2" title={dotTitle}>
+                      <td style={{ fontSize: 12 }}>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }} title={dotTitle}>
                           <span
-                            style={{ background: dotColor }}
-                            className="w-2 h-2 rounded-full inline-block flex-shrink-0"
+                            style={{
+                              width: 7,
+                              height: 7,
+                              borderRadius: '50%',
+                              background: dotColor,
+                              display: 'inline-block',
+                              flexShrink: 0,
+                            }}
                           />
-                          <span className={stale === 'stale' ? 'text-[#eab308]' : stale === 'none' ? 'text-[#555d72]' : ''}>
+                          <span
+                            style={{
+                              color:
+                                stale === 'stale' ? 'var(--warn)' :
+                                stale === 'none' ? 'var(--text-3)' : 'var(--text-2)',
+                            }}
+                          >
                             {formatDate(r.price_date)}
                           </span>
                         </span>
                       </td>
-                      <td className="text-right text-xs font-mono text-[#8a91a8]">
-                        {r.holdingsCount > 0 ? r.holdingsCount : <span className="text-[#555d72]">0</span>}
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                        {r.holdingsCount > 0 ? (
+                          <span style={{ color: 'var(--text-2)' }}>{r.holdingsCount}</span>
+                        ) : (
+                          <span style={{ color: 'var(--text-4)' }}>0</span>
+                        )}
                       </td>
                       <td>
                         <button
                           onClick={() => openEdit(r)}
-                          className="flex items-center gap-1 text-[11px] text-[#555d72] hover:text-[#a78bfa] transition-colors px-2 py-1 border border-white/10 rounded">
+                          className="btn-h"
+                          style={{ fontSize: 11, padding: '4px 10px' }}
+                          title="Manual override"
+                        >
                           <Edit2 size={11} /> Override
                         </button>
                       </td>
@@ -327,12 +394,12 @@ export default function MarketPricesPage() {
           )}
         </div>
 
-        <div className="mt-4 text-[11px] text-[#555d72] flex items-start gap-2 max-w-2xl">
-          <Info size={11} className="mt-0.5 flex-shrink-0" />
+        <div style={{ marginTop: 16, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6, maxWidth: 700 }}>
+          <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
-            Manual overrides write a row with <span className="font-mono">source=&lsquo;manual&rsquo;</span>.
-            A later &ldquo;Refresh from NGX&rdquo; will overwrite the same (instrument, date) row if NGX publishes a price for that instrument.
-            Use overrides for suspended tickers, transferred-in holdings, or securities NGX doesn&rsquo;t list under the ticker our records use.
+            Manual overrides write a row with <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>source='manual'</span>.
+            A later "Refresh from NGX" will overwrite the same (instrument, date) row if NGX publishes a price.
+            Use overrides for suspended tickers, transferred-in holdings, or securities NGX doesn't list under the ticker our records use.
           </span>
         </div>
       </div>
@@ -340,69 +407,109 @@ export default function MarketPricesPage() {
       {/* Edit modal */}
       {editing && (
         <div
-          className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50 px-4"
-          onClick={() => setEditing(null)}>
-          <div className="tw-card max-w-md w-full" onClick={e => e.stopPropagation()}>
-            <div className="flex items-start justify-between mb-4">
+          style={{
+            position: 'fixed',
+            inset: 0,
+            background: 'rgba(10, 31, 58, 0.55)',
+            backdropFilter: 'blur(3px)',
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            zIndex: 50,
+            padding: '0 16px',
+          }}
+          onClick={() => setEditing(null)}
+        >
+          <div
+            className="panel"
+            style={{ maxWidth: 440, width: '100%', margin: 0 }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 18 }}>
               <div>
-                <div className="text-[10px] font-bold tracking-widest text-[#555d72] uppercase">Manual price override</div>
-                <div className="text-base font-semibold mt-1">{editing.name}</div>
-                <div className="text-[11px] text-[#555d72] font-mono">{editing.instrument_id} · {editing.type}</div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>
+                  Manual price override
+                </div>
+                <div className="hybrid-serif" style={{ fontSize: 20, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
+                  {editing.name}
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
+                  {editing.instrument_id} · {editing.type}
+                </div>
               </div>
-              <button onClick={() => setEditing(null)} className="text-[#555d72] hover:text-[#e8eaf0] transition-colors">
+              <button
+                onClick={() => setEditing(null)}
+                style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: 'pointer', padding: 4 }}
+              >
                 <X size={16} />
               </button>
             </div>
 
-            <div className="space-y-3">
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
               {editing.price !== undefined ? (
-                <div className="text-[11px] text-[#8a91a8] bg-white/[0.03] rounded-lg px-3 py-2 border border-white/[0.05]">
-                  <div className="text-[#555d72] text-[10px] uppercase tracking-wide mb-0.5">Current</div>
-                  ₦{editing.price.toFixed(editing.type === 'Stock' ? 2 : 4)} ·{' '}
-                  <span className="font-mono uppercase text-[10px]">{editing.source}</span> ·{' '}
-                  as of {formatDate(editing.price_date)}
+                <div
+                  style={{
+                    fontSize: 11,
+                    color: 'var(--text-2)',
+                    background: 'var(--bg-soft)',
+                    borderRadius: 3,
+                    padding: '8px 12px',
+                    border: '1px solid var(--border-soft)',
+                  }}
+                >
+                  <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.1em', marginBottom: 3 }}>
+                    Current
+                  </div>
+                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>
+                    ₦{editing.price.toFixed(editing.type === 'Stock' ? 2 : 4)}
+                  </span>{' '}
+                  ·{' '}
+                  <span style={{ fontFamily: 'var(--font-mono)', textTransform: 'uppercase' as const, fontSize: 10 }}>
+                    {editing.source}
+                  </span>{' '}
+                  · as of {formatDate(editing.price_date)}
                 </div>
               ) : (
-                <div className="text-[11px] text-[#eab308] bg-[#eab308]/10 rounded-lg px-3 py-2 border border-[#eab308]/20">
+                <div className="alert-h alert-h-warn" style={{ fontSize: 11 }}>
                   No price recorded yet for this instrument.
                 </div>
               )}
               <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">New price (₦)</label>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>New price (₦)</label>
                 <input
                   type="number"
                   value={editPrice}
                   onChange={e => setEditPrice(e.target.value)}
                   step="0.01"
-                  className="tw-input font-mono"
+                  className="input-h input-h-mono"
                   autoFocus
                 />
               </div>
               <div>
-                <label className="block text-xs text-[#8a91a8] mb-1.5">As of date</label>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>As of date</label>
                 <input
                   type="date"
                   value={editDate}
                   onChange={e => setEditDate(e.target.value)}
-                  className="tw-input font-mono"
+                  className="input-h input-h-mono"
                 />
               </div>
               {editError && (
-                <div className="text-xs text-[#ef4444] bg-[#ef4444]/10 rounded-lg px-3 py-2 border border-[#ef4444]/20">
-                  <AlertCircle size={11} className="inline mr-1 -mt-0.5" />
-                  {editError}
+                <div className="alert-h alert-h-critical" style={{ fontSize: 11 }}>
+                  <AlertCircle size={11} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>{editError}</span>
                 </div>
               )}
-              <div className="flex gap-2 pt-2">
+              <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
                 <button
                   onClick={saveManualPrice}
                   disabled={editSaving || !editPrice || Number(editPrice) <= 0}
-                  className="flex-1 flex items-center justify-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors disabled:opacity-50">
+                  className="btn-h btn-h-primary"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
                   <Save size={12} /> {editSaving ? 'Saving…' : 'Save override'}
                 </button>
-                <button
-                  onClick={() => setEditing(null)}
-                  className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+                <button onClick={() => setEditing(null)} className="btn-h">
                   Cancel
                 </button>
               </div>
@@ -410,6 +517,6 @@ export default function MarketPricesPage() {
           </div>
         </div>
       )}
-    </div>
+    </main>
   )
 }

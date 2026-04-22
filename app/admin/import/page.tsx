@@ -1,14 +1,16 @@
 'use client'
-import { useEffect, useState, useCallback, useRef } from 'react'
+import { useEffect, useState, useRef } from 'react'
+import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import {
   Upload, FileSpreadsheet, CheckCircle2, AlertTriangle,
-  X, ChevronDown, ArrowRight, RefreshCw, Download
+  X, ArrowRight, RefreshCw, Download, ArrowLeft,
 } from 'lucide-react'
 import * as XLSX from 'xlsx'
 
-// ── Column mapping ─────────────────────────────────────────────
-// Maps our internal field names to common broker column names
+// v20e: Hybrid rewrite. Preserves all parsing logic, auto-detection,
+// field mapping, validation, and the 4-step flow. Only chrome changes.
+
 const FIELD_DEFS = [
   { key: 'trade_date',         label: 'Trade Date',       required: true,  type: 'date'   },
   { key: 'action',             label: 'Action',           required: true,  type: 'action' },
@@ -28,7 +30,6 @@ const FIELD_DEFS = [
 
 type FieldKey = typeof FIELD_DEFS[number]['key']
 
-// Common column name patterns from Nigerian brokers
 const AUTO_MAP: Record<string, FieldKey> = {
   'date': 'trade_date', 'trade date': 'trade_date', 'value date': 'trade_date',
   'settlement date': 'trade_date', 'transaction date': 'trade_date',
@@ -75,18 +76,15 @@ function normaliseAction(raw: string): string {
 function parseDate(raw: any): string {
   if (!raw) return ''
   if (typeof raw === 'number') {
-    // Excel serial date
     const d = new Date((raw - 25569) * 86400 * 1000)
     return d.toISOString().slice(0, 10)
   }
   const s = String(raw).trim()
-  // Try DD/MM/YYYY
   const dmy = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{2,4})$/)
   if (dmy) {
     const y = dmy[3].length === 2 ? '20' + dmy[3] : dmy[3]
     return `${y}-${dmy[2].padStart(2,'0')}-${dmy[1].padStart(2,'0')}`
   }
-  // ISO or other
   const d = new Date(s)
   if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10)
   return s
@@ -113,6 +111,16 @@ function applyMapping(rows: Record<string, any>[], mapping: Record<FieldKey, str
   })
 }
 
+function actionPill(action: string): string {
+  if (action === 'BUY') return 'pill-buy'
+  if (action === 'SELL') return 'pill-sell'
+  if (action === 'INCOME') return 'pill-warn'
+  if (action === 'FEE') return 'pill-hold'
+  if (action === 'TRANSFER_IN') return 'pill-ok'
+  if (action === 'TRANSFER_OUT') return 'pill-breach'
+  return 'pill-hold'
+}
+
 export default function ImportPage() {
   const [portfolios,  setPortfolios]  = useState<any[]>([])
   const [portfolioId, setPortfolioId] = useState('')
@@ -136,7 +144,6 @@ export default function ImportPage() {
       .then(({ data }) => setPortfolios(data ?? []))
   }, [])
 
-  // Rebuild preview when mapping changes
   useEffect(() => {
     if (rawRows.length && Object.keys(mapping).length) {
       setPreview(applyMapping(rawRows.slice(0, 8), mapping as Record<FieldKey,string>))
@@ -203,58 +210,93 @@ export default function ImportPage() {
   const progress = ((step - 1) / 3) * 100
 
   return (
-    <div>
-      <div className="px-8 py-5 border-b border-white/[0.07] bg-[#13161d] flex items-center justify-between">
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      <div className="page-head">
         <div>
-          <h1 className="text-base font-semibold">Import Transactions</h1>
-          <p className="text-xs text-[#555d72] mt-0.5">Upload CSV or Excel from your brokerage system · Monthly reconciliation</p>
+          <Link
+            href="/admin"
+            className="eyebrow"
+            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, marginBottom: 10, textDecoration: 'none' }}
+          >
+            <ArrowLeft size={11} /> Admin panel
+          </Link>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Import transactions
+          </h1>
+          <p style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
+            Upload CSV or Excel from your brokerage system · Monthly reconciliation
+          </p>
         </div>
-        <button onClick={downloadTemplate}
-          className="flex items-center gap-1.5 text-xs border border-white/10 text-[#8a91a8] hover:text-[#e8eaf0] rounded-lg px-3 py-1.5 transition-colors">
+        <button className="btn-h" onClick={downloadTemplate}>
           <Download size={12} /> Download template
         </button>
       </div>
 
       {/* Progress bar */}
-      <div className="h-0.5 bg-white/[0.05]">
-        <div className="h-full bg-[#a78bfa] transition-all duration-500" style={{ width: progress + '%' }} />
+      <div style={{ height: 2, background: 'var(--border-soft)', borderRadius: 1, overflow: 'hidden', marginBottom: 28 }}>
+        <div
+          style={{
+            height: '100%',
+            width: `${progress}%`,
+            background: 'var(--gold)',
+            transition: 'width 0.5s',
+          }}
+        />
       </div>
 
-      <div className="px-8 py-6 max-w-4xl">
-
-        {/* Step indicators */}
-        <div className="flex items-center gap-0 mb-8">
-          {[
-            { n: 1, label: 'Upload file' },
-            { n: 2, label: 'Map columns' },
-            { n: 3, label: 'Preview & import' },
-            { n: 4, label: 'Done' },
-          ].map(({ n, label }, i) => (
-            <div key={n} className="flex items-center">
-              <div className="flex items-center gap-2">
-                <div className="w-7 h-7 rounded-full flex items-center justify-center text-xs font-bold flex-shrink-0 transition-all"
-                  style={{
-                    background: step > n ? '#22c55e' : step === n ? '#a78bfa' : 'rgba(255,255,255,0.05)',
-                    color: step >= n ? 'white' : '#555d72',
-                  }}>
-                  {step > n ? <CheckCircle2 size={14} /> : n}
-                </div>
-                <span className="text-xs font-medium" style={{ color: step >= n ? '#e8eaf0' : '#555d72' }}>{label}</span>
+      {/* Step indicators */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 0, marginBottom: 32 }}>
+        {[
+          { n: 1, label: 'Upload file' },
+          { n: 2, label: 'Map columns' },
+          { n: 3, label: 'Preview & import' },
+          { n: 4, label: 'Done' },
+        ].map(({ n, label }, i) => (
+          <div key={n} style={{ display: 'flex', alignItems: 'center' }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+              <div
+                style={{
+                  width: 26,
+                  height: 26,
+                  borderRadius: '50%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  fontSize: 11,
+                  fontWeight: 600,
+                  flexShrink: 0,
+                  transition: 'all 0.2s',
+                  background: step > n ? 'var(--pos)' : step === n ? 'var(--gold)' : 'var(--bg-soft)',
+                  color: step >= n ? '#fff' : 'var(--text-3)',
+                  border: step < n ? '1px solid var(--border)' : 'none',
+                }}
+              >
+                {step > n ? <CheckCircle2 size={13} /> : n}
               </div>
-              {i < 3 && <div className="w-12 h-px mx-3 bg-white/10" />}
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 500,
+                  color: step >= n ? 'var(--text)' : 'var(--text-3)',
+                }}
+              >
+                {label}
+              </span>
             </div>
-          ))}
-        </div>
+            {i < 3 && <div style={{ width: 40, height: 1, margin: '0 12px', background: 'var(--border)' }} />}
+          </div>
+        ))}
+      </div>
 
+      <div style={{ maxWidth: 900 }}>
         {/* ── STEP 1: Upload ─────────────────────────────────── */}
         {step === 1 && (
-          <div className="space-y-5">
-            {/* Portfolio selector */}
-            <div className="tw-card">
-              <label className="block text-xs font-semibold text-[#8a91a8] uppercase tracking-wider mb-3">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div className="panel">
+              <label style={{ display: 'block', fontSize: 10, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 12 }}>
                 1. Select portfolio to import into
               </label>
-              <select value={portfolioId} onChange={e => setPortfolioId(e.target.value)} className="tw-select">
+              <select value={portfolioId} onChange={e => setPortfolioId(e.target.value)} className="select-h">
                 <option value="">Choose portfolio…</option>
                 {portfolios.map(p => (
                   <option key={p.id} value={p.id}>
@@ -264,112 +306,150 @@ export default function ImportPage() {
               </select>
             </div>
 
-            {/* Drop zone */}
             <div
               onDragOver={e => { e.preventDefault(); setDragging(true) }}
               onDragLeave={() => setDragging(false)}
               onDrop={handleDrop}
               onClick={() => portfolioId && fileRef.current?.click()}
-              className="tw-card flex flex-col items-center justify-center py-14 cursor-pointer transition-all"
+              className="panel"
               style={{
-                border: dragging ? '2px dashed #a78bfa' : '2px dashed rgba(255,255,255,0.1)',
-                background: dragging ? '#a78bfa08' : undefined,
-                opacity: portfolioId ? 1 : 0.5,
+                display: 'flex',
+                flexDirection: 'column',
+                alignItems: 'center',
+                justifyContent: 'center',
+                padding: '56px 24px',
+                transition: 'all 0.2s',
+                border: dragging ? '2px dashed var(--gold)' : '2px dashed var(--border)',
+                background: dragging ? 'var(--gold-soft)' : undefined,
+                opacity: portfolioId ? 1 : 0.55,
                 cursor: portfolioId ? 'pointer' : 'not-allowed',
-              }}>
-              <FileSpreadsheet size={40} className="text-[#555d72] mb-4" />
-              <div className="text-sm font-medium text-[#8a91a8] mb-1">
+              }}
+            >
+              <FileSpreadsheet size={44} style={{ color: 'var(--text-3)', marginBottom: 14 }} />
+              <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text)', marginBottom: 6 }}>
                 {portfolioId ? 'Drop your file here or click to browse' : 'Select a portfolio first'}
               </div>
-              <div className="text-xs text-[#555d72]">Supports .xlsx, .xls, .csv · Any broker format</div>
-              <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" className="hidden"
-                onChange={e => { const f = e.target.files?.[0]; if (f) parseFile(f) }} />
+              <div style={{ fontSize: 12, color: 'var(--text-3)' }}>
+                Supports .xlsx, .xls, .csv · Any broker format
+              </div>
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".xlsx,.xls,.csv"
+                style={{ display: 'none' }}
+                onChange={e => { const f = e.target.files?.[0]; if (f) parseFile(f) }}
+              />
             </div>
 
-            {/* Template note */}
-            <div className="px-4 py-3 bg-[#a78bfa]/[0.07] border border-[#a78bfa]/20 rounded-xl text-xs text-[#8a91a8] leading-relaxed">
-              <strong className="text-[#a78bfa]">Tip:</strong> Any column order works — you'll map columns in the next step.
-              For Stanbic IBTC broker statements, the auto-detection handles most columns automatically.
-              Download the template above to see the expected format.
+            <div className="alert-h alert-h-info" style={{ fontSize: 12, lineHeight: 1.6 }}>
+              <div>
+                <strong style={{ color: 'var(--gold)' }}>Tip:</strong> Any column order works — you'll map columns in the next step.
+                For Stanbic IBTC broker statements, the auto-detection handles most columns automatically.
+                Download the template above to see the expected format.
+              </div>
             </div>
           </div>
         )}
 
         {/* ── STEP 2: Column mapping ────────────────────────── */}
         {step === 2 && (
-          <div className="space-y-5">
-            <div className="flex items-center justify-between">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
               <div>
-                <div className="text-sm font-semibold">{file?.name}</div>
-                <div className="text-xs text-[#555d72] mt-0.5">{rawRows.length} rows detected · {headers.length} columns</div>
+                <div style={{ fontSize: 14, fontWeight: 500, color: 'var(--text)' }}>{file?.name}</div>
+                <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 3 }}>
+                  {rawRows.length} rows detected · {headers.length} columns
+                </div>
               </div>
-              <button onClick={() => { setStep(1); setFile(null); setRawRows([]) }}
-                className="text-xs text-[#555d72] hover:text-[#e8eaf0] flex items-center gap-1 transition-colors">
+              <button
+                onClick={() => { setStep(1); setFile(null); setRawRows([]) }}
+                className="btn-h"
+              >
                 <X size={12} /> Change file
               </button>
             </div>
 
-            <div className="tw-card">
-              <div className="text-xs font-semibold text-[#555d72] uppercase tracking-wider mb-4">
+            <div className="panel">
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 16 }}>
                 Map your columns → our fields
               </div>
-              <div className="grid grid-cols-2 gap-3">
-                {FIELD_DEFS.map(fd => (
-                  <div key={fd.key} className="flex items-center gap-3">
-                    <div className="w-40 flex-shrink-0">
-                      <div className="text-[11px] font-medium text-[#8a91a8]">
-                        {fd.label}
-                        {fd.required && <span className="text-[#ff5c7a] ml-0.5">*</span>}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 }}>
+                {FIELD_DEFS.map(fd => {
+                  const isMapped = Boolean((mapping as any)[fd.key])
+                  const requiredUnmapped = fd.required && !isMapped
+                  return (
+                    <div key={fd.key} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                      <div style={{ width: 170, flexShrink: 0 }}>
+                        <div style={{ fontSize: 11, fontWeight: 500, color: 'var(--text-2)' }}>
+                          {fd.label}
+                          {fd.required && <span style={{ color: 'var(--neg)', marginLeft: 3 }}>*</span>}
+                        </div>
                       </div>
+                      <select
+                        value={(mapping as any)[fd.key] ?? ''}
+                        onChange={e => setMapping(m => ({ ...m, [fd.key]: e.target.value || undefined }))}
+                        className="select-h"
+                        style={{
+                          flex: 1,
+                          padding: '5px 32px 5px 10px',
+                          fontSize: 12,
+                          borderColor: requiredUnmapped ? 'var(--neg)' : undefined,
+                        }}
+                      >
+                        <option value="">— not mapped —</option>
+                        {headers.map(h => <option key={h} value={h}>{h}</option>)}
+                      </select>
+                      {isMapped && <CheckCircle2 size={13} style={{ color: 'var(--pos)', flexShrink: 0 }} />}
                     </div>
-                    <select
-                      value={(mapping as any)[fd.key] ?? ''}
-                      onChange={e => setMapping(m => ({ ...m, [fd.key]: e.target.value || undefined }))}
-                      className="tw-select py-1 text-xs flex-1"
-                      style={{ borderColor: fd.required && !(mapping as any)[fd.key] ? '#ef4444' : undefined }}>
-                      <option value="">— not mapped —</option>
-                      {headers.map(h => <option key={h} value={h}>{h}</option>)}
-                    </select>
-                    {(mapping as any)[fd.key] && <CheckCircle2 size={14} className="text-[#22c55e] flex-shrink-0" />}
-                  </div>
-                ))}
+                  )
+                })}
               </div>
             </div>
 
-            {/* Preview table */}
             {preview.length > 0 && (
-              <div className="tw-card p-0 overflow-hidden">
-                <div className="px-4 py-2.5 border-b border-white/[0.07] text-xs font-semibold text-[#555d72] uppercase tracking-wider">
+              <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+                <div style={{ padding: '12px 18px', borderBottom: '1px solid var(--border-soft)', fontSize: 10, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em' }}>
                   Preview (first 8 rows)
                 </div>
-                <div className="overflow-x-auto">
-                  <table className="tw-table w-full" style={{ minWidth: 700 }}>
+                <div style={{ overflowX: 'auto' }}>
+                  <table className="h-table" style={{ width: '100%', minWidth: 800 }}>
                     <thead>
                       <tr>
                         <th>Date</th><th>Action</th><th>Instrument</th>
-                        <th>Qty</th><th>Price</th><th>Gross</th><th>Total Fees</th><th>Commission</th>
+                        <th className="num">Qty</th><th className="num">Price</th><th className="num">Gross</th>
+                        <th className="num">Total Fees</th><th className="num">Commission</th>
                       </tr>
                     </thead>
                     <tbody>
                       {preview.map((row, i) => {
                         const badAction = row.action && !['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].includes(row.action)
                         return (
-                          <tr key={i} style={{ background: badAction ? 'rgba(239,68,68,0.05)' : undefined }}>
-                            <td className="font-mono text-[11px]">{row.trade_date || '—'}</td>
+                          <tr key={i} style={badAction ? { background: 'rgba(166, 59, 59, 0.05)' } : undefined}>
+                            <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{row.trade_date || '—'}</td>
                             <td>
-                              <span className={`badge badge-${
-                                row.action === 'BUY' ? 'buy' : row.action === 'SELL' ? 'sell' :
-                                row.action === 'FEE' ? 'hold' : 'ntb'
-                              }`} style={badAction ? { background:'#ef444420', color:'#ef4444' } : {}}>
+                              <span
+                                className={`pill ${actionPill(row.action)}`}
+                                style={badAction ? { background: 'rgba(166, 59, 59, 0.12)', color: 'var(--neg)' } : undefined}
+                              >
                                 {row.action || '—'}
                               </span>
                             </td>
-                            <td className="font-mono">{row.instrument_id || '—'}</td>
-                            <td className="font-mono">{row.quantity?.toLocaleString() ?? '—'}</td>
-                            <td className="font-mono">{row.price ? `₦${row.price.toFixed(2)}` : '—'}</td>
-                            <td className="font-mono">{row.gross_value ? `₦${(row.gross_value/1e6).toFixed(2)}M` : '—'}</td>
-                            <td className="font-mono">{row.fees ? `₦${row.fees.toLocaleString()}` : '—'}</td>
-                            <td className="font-mono">{row.fee_commission ? `₦${row.fee_commission.toLocaleString()}` : '—'}</td>
+                            <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{row.instrument_id || '—'}</td>
+                            <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {row.quantity?.toLocaleString() ?? '—'}
+                            </td>
+                            <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {row.price ? `₦${row.price.toFixed(2)}` : '—'}
+                            </td>
+                            <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {row.gross_value ? `₦${(row.gross_value/1e6).toFixed(2)}M` : '—'}
+                            </td>
+                            <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {row.fees ? `₦${row.fees.toLocaleString()}` : '—'}
+                            </td>
+                            <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                              {row.fee_commission ? `₦${row.fee_commission.toLocaleString()}` : '—'}
+                            </td>
                           </tr>
                         )
                       })}
@@ -379,14 +459,15 @@ export default function ImportPage() {
               </div>
             )}
 
-            <div className="flex gap-3">
+            <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
               <button
                 onClick={() => setStep(3)}
                 disabled={!mapping.trade_date || !mapping.action}
-                className="flex items-center gap-2 bg-[#a78bfa] text-white px-5 py-2 rounded-lg text-xs font-semibold disabled:opacity-50 transition-colors hover:bg-[#9b87e8]">
-                Continue to preview <ArrowRight size={13} />
+                className="btn-h btn-h-primary"
+              >
+                Continue to preview <ArrowRight size={12} />
               </button>
-              <span className="text-[11px] text-[#555d72] self-center">
+              <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
                 {rawRows.length} rows will be processed
               </span>
             </div>
@@ -395,44 +476,59 @@ export default function ImportPage() {
 
         {/* ── STEP 3: Preview & import ──────────────────────── */}
         {step === 3 && (
-          <div className="space-y-5">
-            <div className="tw-card">
-              <div className="text-xs font-semibold text-[#555d72] uppercase tracking-wider mb-4">Import summary</div>
-              <div className="grid grid-cols-3 gap-4 mb-4">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 18 }}>
+            <div className="panel">
+              <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 16 }}>
+                Import summary
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
                 {[
-                  { label: 'Portfolio', value: portfolios.find(p => p.id === portfolioId)?.name ?? '—' },
+                  { label: 'Portfolio',  value: portfolios.find(p => p.id === portfolioId)?.name ?? '—' },
                   { label: 'Total rows', value: rawRows.length.toLocaleString() },
-                  { label: 'File', value: file?.name ?? '—' },
+                  { label: 'File',       value: file?.name ?? '—' },
                 ].map(item => (
                   <div key={item.label}>
-                    <div className="text-[10px] text-[#555d72] uppercase tracking-wider mb-1">{item.label}</div>
-                    <div className="text-sm font-medium text-[#e8eaf0] truncate">{item.value}</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 4 }}>
+                      {item.label}
+                    </div>
+                    <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {item.value}
+                    </div>
                   </div>
                 ))}
               </div>
 
-              {/* Options */}
-              <div className="flex items-center gap-3 pt-3 border-t border-white/[0.07]">
-                <label className="flex items-center gap-2 cursor-pointer">
-                  <input type="checkbox" checked={skipDupes} onChange={e => setSkipDupes(e.target.checked)}
-                    className="w-3.5 h-3.5 rounded accent-[#a78bfa]" />
-                  <span className="text-xs text-[#8a91a8]">Skip duplicate transactions (same date + instrument + action + qty + price)</span>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 10, paddingTop: 14, borderTop: '1px solid var(--border-soft)' }}>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 8, cursor: 'pointer' }}>
+                  <input
+                    type="checkbox"
+                    checked={skipDupes}
+                    onChange={e => setSkipDupes(e.target.checked)}
+                    style={{ width: 14, height: 14, accentColor: 'var(--gold)' }}
+                  />
+                  <span style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                    Skip duplicate transactions (same date + instrument + action + qty + price)
+                  </span>
                 </label>
               </div>
             </div>
 
-            {/* Full preview */}
-            <div className="tw-card p-0 overflow-hidden">
-              <div className="px-4 py-2.5 border-b border-white/[0.07] flex items-center justify-between">
-                <span className="text-xs font-semibold text-[#555d72] uppercase tracking-wider">All {rawRows.length} rows</span>
-                <span className="text-[10px] text-[#555d72]">Scroll to review before importing</span>
+            <div className="panel" style={{ padding: 0, overflow: 'hidden' }}>
+              <div style={{ padding: '12px 18px', borderBottom: '1px solid var(--border-soft)', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <span style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em' }}>
+                  All {rawRows.length} rows
+                </span>
+                <span style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                  Scroll to review before importing
+                </span>
               </div>
-              <div className="overflow-x-auto max-h-80">
-                <table className="tw-table w-full" style={{ minWidth: 800 }}>
-                  <thead className="sticky top-0 bg-[#13161d]">
+              <div style={{ overflowX: 'auto', maxHeight: 360 }}>
+                <table className="h-table" style={{ width: '100%', minWidth: 900 }}>
+                  <thead style={{ position: 'sticky', top: 0, background: 'var(--card)' }}>
                     <tr>
                       <th>#</th><th>Date</th><th>Action</th><th>Instrument</th>
-                      <th>Qty</th><th>Price</th><th>Gross</th><th>Fees</th><th>Notes</th>
+                      <th className="num">Qty</th><th className="num">Price</th><th className="num">Gross</th>
+                      <th className="num">Fees</th><th>Notes</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -440,22 +536,32 @@ export default function ImportPage() {
                       const bad = row.trade_date === '' || row.action === '' ||
                         !['BUY','SELL','INCOME','FEE','TRANSFER_IN','TRANSFER_OUT'].includes(row.action)
                       return (
-                        <tr key={i} style={bad ? { background: 'rgba(239,68,68,0.05)' } : {}}>
-                          <td className="text-[#555d72] font-mono">{i + 1}</td>
-                          <td className="font-mono text-[11px]">{row.trade_date || <span className="text-[#ef4444]">missing</span>}</td>
+                        <tr key={i} style={bad ? { background: 'rgba(166, 59, 59, 0.05)' } : {}}>
+                          <td style={{ color: 'var(--text-3)', fontFamily: 'var(--font-mono)', fontSize: 11 }}>{i + 1}</td>
+                          <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>
+                            {row.trade_date || <span style={{ color: 'var(--neg)' }}>missing</span>}
+                          </td>
                           <td>
-                            <span className={`badge badge-${
-                              row.action === 'BUY' ? 'buy' : row.action === 'SELL' ? 'sell' :
-                              row.action === 'FEE' ? 'hold' : 'ntb'}`}>
+                            <span className={`pill ${actionPill(row.action)}`}>
                               {row.action || '?'}
                             </span>
                           </td>
-                          <td className="font-mono">{row.instrument_id || '—'}</td>
-                          <td className="font-mono text-xs">{row.quantity?.toLocaleString() ?? '—'}</td>
-                          <td className="font-mono text-xs">{row.price ? `₦${row.price.toFixed(2)}` : '—'}</td>
-                          <td className="font-mono text-xs">{row.gross_value ? `₦${(row.gross_value/1e6).toFixed(3)}M` : '—'}</td>
-                          <td className="font-mono text-xs">{row.fees ? `₦${row.fees.toLocaleString()}` : '—'}</td>
-                          <td className="text-[11px] text-[#555d72] max-w-[120px] truncate">{row.notes || '—'}</td>
+                          <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>{row.instrument_id || '—'}</td>
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                            {row.quantity?.toLocaleString() ?? '—'}
+                          </td>
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                            {row.price ? `₦${row.price.toFixed(2)}` : '—'}
+                          </td>
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                            {row.gross_value ? `₦${(row.gross_value/1e6).toFixed(3)}M` : '—'}
+                          </td>
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
+                            {row.fees ? `₦${row.fees.toLocaleString()}` : '—'}
+                          </td>
+                          <td style={{ fontSize: 11, color: 'var(--text-3)', maxWidth: 120, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {row.notes || '—'}
+                          </td>
                         </tr>
                       )
                     })}
@@ -464,84 +570,113 @@ export default function ImportPage() {
               </div>
             </div>
 
-            <div className="flex gap-3">
-              <button onClick={() => setStep(2)}
-                className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+            <div style={{ display: 'flex', gap: 12 }}>
+              <button onClick={() => setStep(2)} className="btn-h">
                 ← Back
               </button>
-              <button onClick={runImport} disabled={importing}
-                className="flex items-center gap-2 bg-[#22c55e] text-white px-6 py-2 rounded-lg text-xs font-bold disabled:opacity-60 transition-colors hover:bg-[#16a34a]">
-                {importing
-                  ? <><RefreshCw size={13} className="animate-spin" /> Importing…</>
-                  : <><Upload size={13} /> Import {rawRows.length} transactions</>}
+              <button
+                onClick={runImport}
+                disabled={importing}
+                className="btn-h"
+                style={{ background: 'var(--pos)', color: '#fff', borderColor: 'var(--pos)', fontWeight: 600 }}
+              >
+                {importing ? (
+                  <>
+                    <RefreshCw size={12} style={{ animation: 'spin 0.7s linear infinite' }} />
+                    Importing…
+                  </>
+                ) : (
+                  <>
+                    <Upload size={12} /> Import {rawRows.length} transactions
+                  </>
+                )}
               </button>
             </div>
+            <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
           </div>
         )}
 
         {/* ── STEP 4: Result ────────────────────────────────── */}
         {step === 4 && result && (
-          <div className="space-y-4">
-            {/* Summary card */}
-            <div className="tw-card" style={{ borderLeft: `4px solid ${result.ok ? '#22c55e' : '#f59e0b'}` }}>
-              <div className="flex items-center gap-3 mb-4">
-                {result.ok
-                  ? <CheckCircle2 size={24} className="text-[#22c55e]" />
-                  : <AlertTriangle size={24} className="text-[#f59e0b]" />}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+            <div
+              className="panel"
+              style={{ borderLeft: `3px solid ${result.ok ? 'var(--pos)' : 'var(--warn)'}` }}
+            >
+              <div style={{ display: 'flex', alignItems: 'center', gap: 14, marginBottom: 18 }}>
+                {result.ok ? (
+                  <CheckCircle2 size={26} style={{ color: 'var(--pos)' }} />
+                ) : (
+                  <AlertTriangle size={26} style={{ color: 'var(--warn)' }} />
+                )}
                 <div>
-                  <div className="text-sm font-bold text-[#e8eaf0]">
+                  <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, color: 'var(--text)' }}>
                     {result.ok ? 'Import complete' : 'Import completed with warnings'}
                   </div>
-                  <div className="text-xs text-[#555d72]">{result.summary}</div>
+                  <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 3 }}>{result.summary}</div>
                 </div>
               </div>
-              <div className="grid grid-cols-3 gap-4">
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 12 }}>
                 {[
-                  { label: 'Inserted', value: result.inserted, color: '#22c55e' },
-                  { label: 'Skipped (dupes)', value: result.skipped, color: '#555d72' },
-                  { label: 'Errors', value: result.errors?.length ?? 0, color: '#ef4444' },
+                  { label: 'Inserted',        value: result.inserted,              color: 'var(--pos)' },
+                  { label: 'Skipped (dupes)', value: result.skipped,               color: 'var(--text-3)' },
+                  { label: 'Errors',          value: result.errors?.length ?? 0,   color: 'var(--neg)' },
                 ].map(item => (
-                  <div key={item.label} className="text-center p-3 rounded-xl bg-white/[0.03]">
-                    <div className="text-2xl font-bold font-mono" style={{ color: item.color }}>{item.value}</div>
-                    <div className="text-[10px] text-[#555d72] uppercase tracking-wider mt-1">{item.label}</div>
+                  <div
+                    key={item.label}
+                    style={{ textAlign: 'center', padding: '14px 12px', borderRadius: 4, background: 'var(--bg-soft)', border: '1px solid var(--border-soft)' }}
+                  >
+                    <div className="hybrid-serif" style={{ fontSize: 28, fontWeight: 500, color: item.color, letterSpacing: '-0.01em', lineHeight: 1 }}>
+                      {item.value}
+                    </div>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginTop: 6 }}>
+                      {item.label}
+                    </div>
                   </div>
                 ))}
               </div>
             </div>
 
-            {/* Warnings */}
             {result.warnings?.length > 0 && (
-              <div className="tw-card border-[#f59e0b]/20">
-                <div className="text-xs font-semibold text-[#f59e0b] uppercase tracking-wider mb-2">Warnings</div>
+              <div className="panel" style={{ borderColor: 'rgba(166, 124, 42, 0.3)' }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--warn)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 10 }}>
+                  Warnings
+                </div>
                 {result.warnings.map((w: string, i: number) => (
-                  <div key={i} className="text-xs text-[#8a91a8] py-1 border-b border-white/[0.05]">{w}</div>
+                  <div key={i} style={{ fontSize: 11, color: 'var(--text-2)', padding: '6px 0', borderBottom: '1px solid var(--border-soft)' }}>
+                    {w}
+                  </div>
                 ))}
               </div>
             )}
 
-            {/* Errors */}
             {result.errors?.length > 0 && (
-              <div className="tw-card border-[#ef4444]/20">
-                <div className="text-xs font-semibold text-[#ef4444] uppercase tracking-wider mb-2">Errors</div>
+              <div className="panel" style={{ borderColor: 'rgba(166, 59, 59, 0.3)' }}>
+                <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--neg)', textTransform: 'uppercase' as const, letterSpacing: '0.14em', marginBottom: 10 }}>
+                  Errors
+                </div>
                 {result.errors.map((e: string, i: number) => (
-                  <div key={i} className="text-xs text-[#8a91a8] py-1 border-b border-white/[0.05] font-mono">{e}</div>
+                  <div key={i} style={{ fontSize: 11, color: 'var(--text-2)', padding: '6px 0', borderBottom: '1px solid var(--border-soft)', fontFamily: 'var(--font-mono)' }}>
+                    {e}
+                  </div>
                 ))}
               </div>
             )}
 
-            <div className="flex gap-3">
-              <a href={`/portfolio/${portfolioId}/transactions`}
-                className="flex items-center gap-2 bg-[#a78bfa] text-white px-5 py-2 rounded-lg text-xs font-semibold hover:bg-[#9b87e8] transition-colors">
+            <div style={{ display: 'flex', gap: 12 }}>
+              <Link href={`/portfolio/${portfolioId}/transactions`} className="btn-h btn-h-primary" style={{ textDecoration: 'none' }}>
                 View transactions →
-              </a>
-              <button onClick={() => { setStep(1); setFile(null); setRawRows([]); setMapping({}); setResult(null) }}
-                className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+              </Link>
+              <button
+                onClick={() => { setStep(1); setFile(null); setRawRows([]); setMapping({}); setResult(null) }}
+                className="btn-h"
+              >
                 Import another file
               </button>
             </div>
           </div>
         )}
       </div>
-    </div>
+    </main>
   )
 }

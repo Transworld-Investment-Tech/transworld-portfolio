@@ -5,10 +5,9 @@ import { useRouter } from 'next/navigation'
 import { supabase } from '@/lib/supabase'
 import { ArrowLeft, Save, AlertCircle, CheckCircle2, Info, Users } from 'lucide-react'
 
-// v18: client creation form. Styling mirrors /admin/prices (v17).
-// On success we hand off to /admin/portfolios/new?client=<id> so the
-// user immediately creates the client's first portfolio — per the
-// agreed scope, these are two separate trips rather than a combined form.
+// v20e: Hybrid rewrite. Preserves v18 debounced code uniqueness check,
+// sanitisation (uppercase letters/digits only, max 10 chars), and the
+// handoff to /admin/portfolios/new?client=<id> on success.
 
 type CodeCheckState = 'idle' | 'checking' | 'available' | 'taken'
 
@@ -22,7 +21,6 @@ export default function NewClientPage() {
   const [error, setError] = useState('')
   const [codeCheck, setCodeCheck] = useState<CodeCheckState>('idle')
 
-  // Debounced uniqueness check
   useEffect(() => {
     if (!code || code.length < 2) {
       setCodeCheck('idle')
@@ -66,7 +64,6 @@ export default function NewClientPage() {
         setSaving(false)
         return
       }
-      // Hand off to portfolio creation with this client preselected.
       router.push(`/admin/portfolios/new?client=${data.client.id}`)
     } catch (e) {
       setError((e as Error).message)
@@ -81,65 +78,85 @@ export default function NewClientPage() {
     !saving
 
   return (
-    <div>
-      {/* Header */}
-      <div className="px-8 py-6 border-b border-white/[0.07] bg-[#13161d]">
-        <div className="flex items-center gap-3">
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      <div className="page-head">
+        <div>
           <Link
             href="/admin"
-            className="flex items-center gap-1.5 text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
-            <ArrowLeft size={13} /> Admin panel
+            className="eyebrow"
+            style={{
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              marginBottom: 10,
+              textDecoration: 'none',
+            }}
+          >
+            <ArrowLeft size={11} /> Admin panel
           </Link>
-          <div className="w-px h-4 bg-white/10" />
-          <h1 className="text-xl font-semibold">Add client</h1>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Add client
+          </h1>
         </div>
-        <p className="text-xs text-[#555d72] mt-2">
-          Create a new client entity. Afterwards you&apos;ll be taken to the portfolio creation form.
-        </p>
       </div>
 
-      <div className="px-8 py-6 max-w-xl">
-        <div className="tw-card">
-          <div className="flex items-center gap-3 mb-5">
-            <div className="w-9 h-9 rounded-xl bg-[#a78bfa]/10 border border-[#a78bfa]/20 flex items-center justify-center flex-shrink-0">
-              <Users size={16} className="text-[#a78bfa]" />
+      <div style={{ maxWidth: 560 }}>
+        <div className="panel">
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 20, paddingBottom: 14, borderBottom: '1px solid var(--border-soft)' }}>
+            <div
+              style={{
+                width: 36,
+                height: 36,
+                borderRadius: 4,
+                background: 'var(--gold-soft)',
+                border: '1px solid rgba(176, 139, 62, 0.25)',
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                flexShrink: 0,
+              }}
+            >
+              <Users size={16} style={{ color: 'var(--gold)' }} />
             </div>
             <div>
-              <div className="text-sm font-semibold">Client details</div>
-              <div className="text-[11px] text-[#555d72]">Basic information for the new mandate</div>
+              <div style={{ fontSize: 13, fontWeight: 500, color: 'var(--text)' }}>Client details</div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+                Basic information for the new mandate
+              </div>
             </div>
           </div>
 
-          <div className="space-y-4">
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
             {/* Code */}
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Client code</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Client code</label>
               <input
                 type="text"
                 value={code}
                 onChange={e => handleCodeChange(e.target.value)}
                 placeholder="e.g. ADE, DON, CMFB"
                 maxLength={10}
-                className="tw-input font-mono uppercase"
+                className="input-h input-h-mono"
+                style={{ textTransform: 'uppercase' }}
                 autoFocus
               />
-              <div className="mt-1.5 text-[11px] min-h-[14px]">
+              <div style={{ marginTop: 6, fontSize: 11, minHeight: 14 }}>
                 {codeCheck === 'checking' && (
-                  <span className="text-[#555d72]">Checking availability…</span>
+                  <span style={{ color: 'var(--text-3)' }}>Checking availability…</span>
                 )}
                 {codeCheck === 'available' && (
-                  <span className="text-[#22c55e] inline-flex items-center gap-1">
+                  <span style={{ color: 'var(--pos)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <CheckCircle2 size={10} /> Available
                   </span>
                 )}
                 {codeCheck === 'taken' && (
-                  <span className="text-[#ef4444] inline-flex items-center gap-1">
+                  <span style={{ color: 'var(--neg)', display: 'inline-flex', alignItems: 'center', gap: 4 }}>
                     <AlertCircle size={10} /> Already in use
                   </span>
                 )}
                 {codeCheck === 'idle' && (
-                  <span className="text-[#555d72]">
-                    2-10 uppercase letters or digits. Used as short identifier.
+                  <span style={{ color: 'var(--text-3)' }}>
+                    2–10 uppercase letters or digits. Used as short identifier.
                   </span>
                 )}
               </div>
@@ -147,28 +164,29 @@ export default function NewClientPage() {
 
             {/* Name */}
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Client name</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Client name</label>
               <input
                 type="text"
                 value={name}
                 onChange={e => setName(e.target.value)}
                 placeholder="e.g. Adolphus Estate"
-                className="tw-input"
+                className="input-h"
               />
             </div>
 
             {/* Type */}
             <div>
-              <label className="block text-xs text-[#8a91a8] mb-1.5">Type</label>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Type</label>
               <select
                 value={type}
                 onChange={e => setType(e.target.value as any)}
-                className="tw-select">
+                className="select-h"
+              >
                 <option value="discretionary">Discretionary</option>
                 <option value="advisory">Advisory</option>
                 <option value="internal">Internal</option>
               </select>
-              <div className="mt-1.5 text-[11px] text-[#555d72]">
+              <div style={{ marginTop: 6, fontSize: 11, color: 'var(--text-3)' }}>
                 {type === 'discretionary' && 'Transworld manages the portfolio with full authority.'}
                 {type === 'advisory' && 'Client makes final decisions; Transworld advises.'}
                 {type === 'internal' && "Transworld's own portfolio."}
@@ -176,37 +194,37 @@ export default function NewClientPage() {
             </div>
 
             {error && (
-              <div className="text-xs text-[#ef4444] bg-[#ef4444]/10 rounded-lg px-3 py-2 border border-[#ef4444]/20">
-                <AlertCircle size={11} className="inline mr-1 -mt-0.5" />
-                {error}
+              <div className="alert-h alert-h-critical" style={{ fontSize: 12 }}>
+                <AlertCircle size={12} style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>{error}</span>
               </div>
             )}
 
-            <div className="flex gap-2 pt-2">
+            <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
               <button
+                className="btn-h btn-h-primary"
                 onClick={handleSubmit}
                 disabled={!canSubmit}
-                className="flex-1 flex items-center justify-center gap-2 bg-[#a78bfa] text-white px-4 py-2 rounded-lg text-xs font-medium hover:bg-[#9b87e8] transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
                 <Save size={12} /> {saving ? 'Creating…' : 'Create client & continue'}
               </button>
-              <Link
-                href="/admin"
-                className="px-4 py-2 border border-white/10 rounded-lg text-xs text-[#8a91a8] hover:text-[#e8eaf0] transition-colors">
+              <Link href="/admin" className="btn-h" style={{ textDecoration: 'none' }}>
                 Cancel
               </Link>
             </div>
           </div>
         </div>
 
-        <div className="mt-4 text-[11px] text-[#555d72] flex items-start gap-2">
-          <Info size={11} className="mt-0.5 flex-shrink-0" />
+        <div style={{ marginTop: 14, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6 }}>
+          <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
             The client code must be unique across the system. Existing codes include{' '}
-            <span className="font-mono">TW, CMFB, ADE, DON, OPC</span>. After saving, you&apos;ll be
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>TW, CMFB, ADE, DON, OPC</span>. After saving, you'll be
             taken to the portfolio creation form with this client preselected.
           </span>
         </div>
       </div>
-    </div>
+    </main>
   )
 }
