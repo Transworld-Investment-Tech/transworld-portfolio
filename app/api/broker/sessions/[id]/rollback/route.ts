@@ -1,27 +1,38 @@
 /**
- * app/api/broker/sessions/[id]/rollback/route.ts — v21b-3b
+ * app/api/broker/sessions/[id]/rollback/route.ts — v21d
  *
  * POST /api/broker/sessions/[id]/rollback
  *
  * Reverses a prior commit of this session:
  *   - Deletes transactions where source_file_id IN (session's broker_file ids)
  *   - Resets broker_files.parse_status from 'committed' back to 'parsed'
+ *   - Rebuilds the portfolio's holdings from the now-smaller
+ *     transactions set (v21d)
  *
  * Guards:
  *   - 409 if no file in the session is in parse_status='committed'.
  *     Nothing to roll back.
  *
- * Returns { ok, transactions_deleted, broker_files_reset, elapsed_ms }.
+ * Returns { ok, transactions_deleted, broker_files_reset,
+ *           holdings_rebuild, elapsed_ms }.
  *
  * Note: staged_transactions rows are NOT touched — they remain
  * exactly as they were, so you can re-commit (possibly with
  * different include_in_commit selections) after a rollback.
+ *
+ * v21d: After the transactions DELETE, we call rebuildPortfolioHoldings
+ * so the holdings table reflects the post-rollback state. Without
+ * this, a rollback would leave stale holdings pointing at trades
+ * that no longer exist. Failure of the rebuild is surfaced as a
+ * warning; the rollback itself stays committed (transactions are
+ * the source of truth).
  *
  * Next.js 15: params is a Promise.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -56,7 +67,7 @@ export async function POST(
     // 1. Fetch all broker_files in session.
     const { data: files, error: filesErr } = await db
       .from('broker_files')
-      .select('id, parse_status')
+      .select('id, portfolio_id, parse_status')
       .eq('upload_session_id', session_id)
 
     if (filesErr) {
@@ -78,6 +89,7 @@ export async function POST(
     }
 
     const committedFileIds = committedFiles.map((f) => f.id)
+    const portfolio_id = committedFiles[0].portfolio_id
 
     // 2. Delete transactions linked to these broker_files.
     //    transactions.source_file_id (on the transactions table, this
@@ -119,10 +131,22 @@ export async function POST(
       )
     }
 
+    // 4. v21d: Rebuild holdings from the now-smaller transactions set.
+    //    Non-fatal. If the rebuild errors, holdings may be stale but
+    //    the rollback itself is still correct (transactions truly got
+    //    deleted). The user can retry via a future operation or manual fix.
+    const holdingsRebuild = await rebuildPortfolioHoldings(db, portfolio_id)
+
     return NextResponse.json({
       ok: true,
       transactions_deleted,
       broker_files_reset: committedFileIds.length,
+      holdings_rebuild: {
+        upserted: holdingsRebuild.upserted,
+        deleted: holdingsRebuild.deleted,
+        skipped_no_instrument: holdingsRebuild.skipped_no_instrument,
+        errors: holdingsRebuild.errors,
+      },
       elapsed_ms: Date.now() - started,
     })
   } catch (err: any) {

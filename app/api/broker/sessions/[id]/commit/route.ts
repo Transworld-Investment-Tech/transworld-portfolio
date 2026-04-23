@@ -1,10 +1,12 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v21b-3b-hotfix-1
+ * app/api/broker/sessions/[id]/commit/route.ts — v21d
  *
  * POST /api/broker/sessions/[id]/commit
  *
  * Moves all staged_transactions for this session where
  * include_in_commit = true into the real `transactions` table.
+ * Then rebuilds the portfolio's holdings from its now-current
+ * transaction history (v21d).
  *
  * v21b-3b-hotfix-1 additions:
  *   1. Defensive NGX_TICKER_ALIASES pass when mapping staged →
@@ -16,6 +18,15 @@
  *      with `missing_instruments: string[]` so the UI can render
  *      a helpful error instead of a raw FK violation.
  *
+ * v21d additions:
+ *   - After a successful transactions INSERT (and before returning
+ *     success), call rebuildPortfolioHoldings(). Recomputes the
+ *     holdings table from the portfolio's full transaction history.
+ *     Failure of the rebuild is surfaced as a warning in the
+ *     response but does NOT cause the commit itself to fail —
+ *     transactions have already been inserted and we don't want
+ *     to roll them back over a holdings derivation issue.
+ *
  * Side effects on success:
  *   - transactions.source_file_id is set to the staged row's
  *     broker_file_id (FK column name differs across tables).
@@ -23,6 +34,8 @@
  *   - If the target portfolio has a NULL cscs_number and any
  *     broker_file in the session has one populated, it's
  *     backfilled onto the portfolio.
+ *   - holdings for the portfolio are fully rebuilt from the
+ *     current transactions history (v21d).
  *
  * Guards:
  *   - 409 if any broker_file in the session is already
@@ -30,8 +43,9 @@
  *   - 400 if any instrument_id on a to-be-committed row is
  *     missing from the instruments master table.
  *
- * Returns { ok, committed, skipped, broker_files, elapsed_ms }
- * on success; { error, missing_instruments?, hint? } on failure.
+ * Returns { ok, committed, skipped, broker_files, holdings_rebuild,
+ *           elapsed_ms } on success;
+ * { error, missing_instruments?, hint? } on failure.
  *
  * Next.js 15: params is a Promise.
  */
@@ -39,6 +53,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { NGX_TICKER_ALIASES } from '@/lib/market-data'
+import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -284,11 +299,23 @@ export async function POST(
       // best-effort; continue
     }
 
+    // 10. v21d: Rebuild holdings from the portfolio's transaction
+    //     history. Non-fatal — if the rebuild errors, we surface it
+    //     as a warning but keep the commit successful. Transactions
+    //     are the source of truth; holdings are a derived cache.
+    const holdingsRebuild = await rebuildPortfolioHoldings(db, portfolio_id)
+
     return NextResponse.json({
       ok: true,
       committed,
       skipped,
       broker_files: fileIds.length,
+      holdings_rebuild: {
+        upserted: holdingsRebuild.upserted,
+        deleted: holdingsRebuild.deleted,
+        skipped_no_instrument: holdingsRebuild.skipped_no_instrument,
+        errors: holdingsRebuild.errors,
+      },
       elapsed_ms: Date.now() - started,
     })
   } catch (err: any) {
