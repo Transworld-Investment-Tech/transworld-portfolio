@@ -9,6 +9,9 @@ import { Save, Plus, Trash2, AlertTriangle, Copy, Check } from 'lucide-react'
 // Sidebar rendered by app/portfolio/[id]/layout.tsx — do NOT render here.
 // PageActions dropped; inline hybrid Copy button wired to getSettingsText().
 // Drawdown fields remain stored as negative numbers (mandate convention).
+// v21j: Starting NAV and start_date are now editable inputs, included in
+//   savePortfolio(). Previously they were read-only display fields. This
+//   allows manual override for portfolios not using the broker upload path.
 
 export default function PortfolioSettingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
@@ -58,8 +61,11 @@ export default function PortfolioSettingsPage() {
       setSaving(false)
       return
     }
+    // v21j: starting_nav and start_date included in save payload
     const { error: pe } = await supabase.from('portfolios').update({
       name:           portfolio.name,
+      starting_nav:   Number(portfolio.starting_nav) || 0,
+      start_date:     portfolio.start_date || null,
       income_target:  Number(portfolio.income_target),
       cap_target:     Number(portfolio.cap_target),
       liq_min:        Number(portfolio.liq_min),
@@ -79,6 +85,8 @@ export default function PortfolioSettingsPage() {
         }).match({ portfolio_id: portfolioId, sleeve_id: sl.sleeve_id })
       }
       flash('Settings saved ✓')
+    } else {
+      flash(pe.message, true)
     }
     setSaving(false)
   }
@@ -86,12 +94,14 @@ export default function PortfolioSettingsPage() {
   async function addNavEntry() {
     if (!newNav.nav_value) return
     setSavingNav(true)
-    await supabase.from('nav_log').upsert({
+    // nav_log has no unique constraint on (portfolio_id, nav_date) — pitfall #3.
+    // Use plain insert rather than upsert with onConflict to avoid a DB error.
+    await supabase.from('nav_log').insert({
       portfolio_id: portfolioId,
       nav_date:     newNav.nav_date,
       nav_value:    Number(newNav.nav_value),
       notes:        newNav.notes || null,
-    }, { onConflict: 'portfolio_id,nav_date' })
+    })
     const { data } = await supabase.from('nav_log').select('*').eq('portfolio_id', portfolioId).order('nav_date', { ascending: false }).limit(20)
     setNavLog(data ?? [])
     setNewNav(n => ({ ...n, nav_value: '', notes: '' }))
@@ -202,6 +212,7 @@ export default function PortfolioSettingsPage() {
           <div className="panel-header">
             <div className="panel-title">Portfolio details</div>
           </div>
+          {/* Portfolio name + valuation date */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
             <div>
               <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>Portfolio name</label>
@@ -221,9 +232,41 @@ export default function PortfolioSettingsPage() {
               />
             </div>
           </div>
+          {/* v21j: Starting NAV and start_date are now editable inputs */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                Starting NAV (₦)
+              </label>
+              <input
+                type="number"
+                value={portfolio.starting_nav ?? ''}
+                onChange={e => updateField('starting_nav', e.target.value)}
+                placeholder="0"
+                className="input-h input-h-mono"
+                step="0.01"
+              />
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                Used for IRR &amp; performance calculations. Set to 0 for broker-onboarded portfolios (auto-inferred at first commit).
+              </div>
+            </div>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                Relationship start date
+              </label>
+              <input
+                type="date"
+                value={portfolio.start_date || ''}
+                onChange={e => updateField('start_date', e.target.value)}
+                className="input-h"
+              />
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                Date of first capital deployment or mandate inception.
+              </div>
+            </div>
+          </div>
+          {/* Currency and label remain read-only */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 16, fontSize: 12, color: 'var(--text-3)' }}>
-            <div>Starting NAV: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)', marginLeft: 4 }}>{fmt.ngn(portfolio.starting_nav)}</span></div>
-            <div>Start date: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)', marginLeft: 4 }}>{portfolio.start_date}</span></div>
             <div>Currency: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)', marginLeft: 4 }}>{portfolio.currency}</span></div>
             <div>Label: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)', marginLeft: 4 }}>Portfolio {portfolio.label}</span></div>
           </div>
@@ -395,10 +438,7 @@ export default function PortfolioSettingsPage() {
         {/* Danger zone */}
         <div
           className="panel"
-          style={{
-            borderColor: 'rgba(166, 59, 59, 0.3)',
-            boxShadow: 'none',
-          }}
+          style={{ borderColor: 'rgba(166, 59, 59, 0.3)', boxShadow: 'none' }}
         >
           <div
             className="panel-header"
@@ -424,11 +464,7 @@ export default function PortfolioSettingsPage() {
                 router.push('/')
               }}
               className="btn-h"
-              style={{
-                color: 'var(--neg)',
-                borderColor: 'rgba(166, 59, 59, 0.35)',
-                flexShrink: 0,
-              }}
+              style={{ color: 'var(--neg)', borderColor: 'rgba(166, 59, 59, 0.35)', flexShrink: 0 }}
             >
               Close portfolio
             </button>

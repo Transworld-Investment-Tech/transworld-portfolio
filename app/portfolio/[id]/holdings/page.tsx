@@ -2,17 +2,18 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
+import * as XLSX from 'xlsx'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle } from 'lucide-react'
+import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle, FileSpreadsheet } from 'lucide-react'
 
 // v20d: Hybrid rewrite.
 // Sidebar is rendered by app/portfolio/[id]/layout.tsx — do NOT render one here.
 // v17: prices display an "As of" date with a stale indicator.
 // v21h: new Sector, NGX Board, Volume, Prev close, and Day change %
-//   columns surface v20h data. Volume/prev-close/day-change live in
-//   market_prices (populated from NGX REST feed); sector + ngx_market
-//   live on instruments. All additive; null-safe.
+//   columns surface v20h data.
+// v21j: Excel export via SheetJS. "Export Excel" button added to header.
+//   Exports all held positions with full column set to a single-sheet .xlsx.
 
 const STALE_DAYS = 3
 
@@ -31,8 +32,6 @@ function formatShortDate(iso?: string): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
 }
 
-// v21h: compact volume formatter. NGX volumes can get huge (50M+) so
-// we want K/M/B suffixes for scannability.
 function formatVolume(v?: number | null): string {
   if (v === undefined || v === null) return '—'
   if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B'
@@ -53,7 +52,7 @@ const SLEEVE_ORDER: Record<string, number> = { liq: 0, ntb: 1, fgn: 2, fi: 3, eq
 
 interface PriceRow {
   price: number
-  day_change: number | null      // percent
+  day_change: number | null
   prev_close: number | null
   volume: number | null
   price_date: string
@@ -79,7 +78,6 @@ export default function HoldingsPage() {
       supabase.from('portfolios').select('*, client:clients(name)').eq('id', portfolioId).single(),
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId).order('sleeve_id'),
       supabase.from('instruments').select('*').eq('approved', true).order('name'),
-      // v21h: pull day_change, prev_close, volume alongside price
       supabase.from('market_prices')
         .select('instrument_id, price, day_change, prev_close, volume, price_date')
         .order('price_date', { ascending: false }),
@@ -142,6 +140,62 @@ export default function HoldingsPage() {
 
   const updateLocal = (instrId: string, key: string, val: string) => {
     setHoldings(h => h.map(hold => hold.instrument_id === instrId ? { ...hold, [key]: val } : hold))
+  }
+
+  // v21j: Excel export — single sheet with all visible columns
+  function downloadExcel() {
+    const totalNav = holdings.reduce((sum, h) => {
+      const p = priceData[h.instrument_id]?.price ?? h.avg_cost ?? 1
+      return sum + Number(h.quantity) * p
+    }, 0)
+
+    const headers = [
+      'Instrument', 'Ticker', 'Type', 'Sector', 'NGX Board', 'Sleeve',
+      'Quantity', 'Avg Cost (₦)', 'Prev Close (₦)', 'Current Price (₦)',
+      'Day Chg %', 'Volume', 'Price Date',
+      'Market Value (₦)', 'Unrealised P&L (₦)', 'Weight %',
+    ]
+
+    const rows = holdings.map(h => {
+      const pr = priceData[h.instrument_id]
+      const p = pr?.price ?? Number(h.avg_cost) ?? 1
+      const v = Number(h.quantity) * p
+      const pnl = Number(h.quantity) * (p - Number(h.avg_cost))
+      const wt = totalNav > 0 ? v / totalNav * 100 : 0
+      return [
+        h.instrument?.name ?? h.instrument_id,
+        h.instrument_id,
+        h.instrument?.type ?? '',
+        h.instrument?.sector ?? '',
+        h.instrument?.ngx_market ?? '',
+        SLEEVE_NAMES[h.sleeve_id] ?? h.sleeve_id ?? '',
+        Number(h.quantity),
+        Number(h.avg_cost),
+        pr?.prev_close ?? '',
+        p,
+        pr?.day_change ?? '',
+        pr?.volume ?? '',
+        pr?.price_date ?? '',
+        v,
+        pnl,
+        Number(wt.toFixed(2)),
+      ]
+    })
+
+    const wb = XLSX.utils.book_new()
+    const ws = XLSX.utils.aoa_to_sheet([headers, ...rows])
+    ws['!cols'] = [
+      { wch: 32 }, { wch: 14 }, { wch: 10 }, { wch: 24 }, { wch: 14 }, { wch: 18 },
+      { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
+      { wch: 10 }, { wch: 12 }, { wch: 12 },
+      { wch: 18 }, { wch: 18 }, { wch: 10 },
+    ]
+    XLSX.utils.book_append_sheet(wb, ws, 'Holdings')
+
+    const clientName = portfolio?.client?.name ?? 'Portfolio'
+    const portfolioName = portfolio?.name ?? 'Holdings'
+    const today = new Date().toISOString().slice(0, 10)
+    XLSX.writeFile(wb, `${clientName} - ${portfolioName} Holdings ${today}.xlsx`)
   }
 
   function getHoldingsText(): string {
@@ -211,18 +265,12 @@ export default function HoldingsPage() {
             <Link
               href="/admin/prices?stale=1"
               style={{
-                display: 'inline-flex',
-                alignItems: 'center',
-                gap: 6,
-                fontSize: 10,
-                color: 'var(--warn)',
+                display: 'inline-flex', alignItems: 'center', gap: 6,
+                fontSize: 10, color: 'var(--warn)',
                 background: 'rgba(166, 124, 42, 0.1)',
                 border: '1px solid rgba(166, 124, 42, 0.25)',
-                borderRadius: 999,
-                padding: '3px 12px',
-                textDecoration: 'none',
-                fontWeight: 600,
-                letterSpacing: '0.04em',
+                borderRadius: 999, padding: '3px 12px',
+                textDecoration: 'none', fontWeight: 600, letterSpacing: '0.04em',
               }}
               title="Click to open Market prices filtered to stale entries"
             >
@@ -230,14 +278,16 @@ export default function HoldingsPage() {
               {staleHeldCount} stale price{staleHeldCount === 1 ? '' : 's'}
             </Link>
           )}
-          {msg && (
-            <span style={{ fontSize: 11, color: 'var(--pos)' }}>{msg}</span>
-          )}
+          {msg && <span style={{ fontSize: 11, color: 'var(--pos)' }}>{msg}</span>}
           <Link href="/admin/prices" className="btn-h" style={{ textDecoration: 'none' }}>
             <LineChart size={12} /> Manage prices
           </Link>
           <button className="btn-h" onClick={copyText}>
             {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
+          </button>
+          {/* v21j: Excel export */}
+          <button className="btn-h" onClick={downloadExcel}>
+            <FileSpreadsheet size={12} /> Export Excel
           </button>
           <button className="btn-h btn-h-primary" onClick={() => setAdding(true)}>
             <Plus size={12} /> Add position
@@ -340,7 +390,7 @@ export default function HoldingsPage() {
                     const dotTitle =
                       stale === 'fresh' ? `Fresh price (within ${STALE_DAYS} days)` :
                       stale === 'stale' ? `Stale price — older than ${STALE_DAYS} days. Click Manage prices to override.` :
-                      'No market price on record — displaying average cost. Click Manage prices to set one.'
+                      'No market price on record — displaying average cost.'
                     const mktVal = Number(h.quantity) * mktPrice
                     const pnl = Number(h.quantity) * (mktPrice - Number(h.avg_cost))
                     const typePill =
@@ -348,7 +398,6 @@ export default function HoldingsPage() {
                       h.instrument?.type === 'Bond' ? 'pill-buy' :
                       h.instrument?.type === 'NTB' ? 'pill-warn' :
                       'pill-hold'
-
                     const sectorRaw = h.instrument?.sector as string | null | undefined
                     const ngxMarket = h.instrument?.ngx_market as string | null | undefined
                     const dayChgVal = pr?.day_change
@@ -363,15 +412,11 @@ export default function HoldingsPage() {
                             {ngxMarket && (
                               <span
                                 style={{
-                                  fontSize: 9,
-                                  padding: '1px 6px',
-                                  borderRadius: 2,
+                                  fontSize: 9, padding: '1px 6px', borderRadius: 2,
                                   background: ngxMarket === 'Premium Board' ? 'var(--gold-soft)' : 'var(--bg-soft)',
                                   color: ngxMarket === 'Premium Board' ? 'var(--gold)' : 'var(--text-3)',
                                   border: '1px solid var(--border)',
-                                  fontWeight: 600,
-                                  letterSpacing: '0.04em',
-                                  whiteSpace: 'nowrap' as const,
+                                  fontWeight: 600, letterSpacing: '0.04em', whiteSpace: 'nowrap' as const,
                                 }}
                                 title={`NGX board: ${ngxMarket}`}
                               >
@@ -383,17 +428,11 @@ export default function HoldingsPage() {
                             {h.instrument_id}
                           </div>
                         </td>
-                        <td>
-                          <span className={`pill ${typePill}`}>{h.instrument?.type}</span>
-                        </td>
+                        <td><span className={`pill ${typePill}`}>{h.instrument?.type}</span></td>
                         <td style={{ fontSize: 11, color: sectorRaw ? 'var(--text-2)' : 'var(--text-4)' }}>
                           {sectorRaw ? (
                             <span title={sectorRaw}>
-                              {sectorRaw
-                                .toLowerCase()
-                                .split(/\s+/)
-                                .map(w => w.charAt(0).toUpperCase() + w.slice(1))
-                                .join(' ')}
+                              {sectorRaw.toLowerCase().split(/\s+/).map((w: string) => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
                             </span>
                           ) : '—'}
                         </td>
@@ -427,52 +466,32 @@ export default function HoldingsPage() {
                         <td
                           className="num"
                           style={{
-                            fontFamily: 'var(--font-mono)',
-                            fontSize: 11,
-                            color:
-                              dayChgVal === null || dayChgVal === undefined ? 'var(--text-4)' :
-                              dayChgVal > 0 ? 'var(--pos)' :
-                              dayChgVal < 0 ? 'var(--neg)' : 'var(--text-3)',
+                            fontFamily: 'var(--font-mono)', fontSize: 11,
+                            color: dayChgVal === null || dayChgVal === undefined ? 'var(--text-4)' :
+                              dayChgVal > 0 ? 'var(--pos)' : dayChgVal < 0 ? 'var(--neg)' : 'var(--text-3)',
                           }}
                         >
                           {dayChgVal === null || dayChgVal === undefined
                             ? '—'
                             : <>{dayChgVal > 0 ? '+' : ''}{dayChgVal.toFixed(2)}%</>}
                         </td>
-                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: volume !== null && volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }} title={volume !== null && volume !== undefined ? volume.toLocaleString() : undefined}>
+                        <td
+                          className="num"
+                          style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: volume !== null && volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
+                          title={volume !== null && volume !== undefined ? volume.toLocaleString() : undefined}
+                        >
                           {formatVolume(volume)}
                         </td>
                         <td>
-                          <span
-                            style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }}
-                            title={dotTitle}
-                          >
-                            <span
-                              style={{
-                                width: 7,
-                                height: 7,
-                                borderRadius: '50%',
-                                background: dotColor,
-                                display: 'inline-block',
-                                flexShrink: 0,
-                              }}
-                            />
-                            <span
-                              style={{
-                                color:
-                                  stale === 'stale' ? 'var(--warn)' :
-                                  stale === 'none' ? 'var(--text-3)' : 'var(--text-2)',
-                              }}
-                            >
+                          <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 11 }} title={dotTitle}>
+                            <span style={{ width: 7, height: 7, borderRadius: '50%', background: dotColor, display: 'inline-block', flexShrink: 0 }} />
+                            <span style={{ color: stale === 'stale' ? 'var(--warn)' : stale === 'none' ? 'var(--text-3)' : 'var(--text-2)' }}>
                               {formatShortDate(priceDate)}
                             </span>
                           </span>
                         </td>
                         <td className="num num-serif">{fmt.ngnM(mktVal)}</td>
-                        <td
-                          className="num num-serif"
-                          style={{ color: pnl >= 0 ? 'var(--pos)' : 'var(--neg)' }}
-                        >
+                        <td className="num num-serif" style={{ color: pnl >= 0 ? 'var(--pos)' : 'var(--neg)' }}>
                           {pnl >= 0 ? '+' : '−'}{fmt.ngnM(Math.abs(pnl))}
                         </td>
                         <td>

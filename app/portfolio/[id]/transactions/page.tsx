@@ -1,14 +1,16 @@
 'use client'
 import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
+import * as XLSX from 'xlsx'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { Plus, Search, Copy, Check, Info } from 'lucide-react'
+import { Plus, Search, Copy, Check, Info, FileSpreadsheet } from 'lucide-react'
 
 // v20d: Hybrid rewrite.
 // Sidebar rendered by app/portfolio/[id]/layout.tsx — do NOT render here.
-// PageActions dropped; inline hybrid Copy button wired to getTxnsText().
-// Virtual fee rows logic preserved verbatim — only styling changes.
+// v21j: Excel export via SheetJS. "Export Excel" button added to header.
+//   Two-sheet workbook: "Summary" (fee totals + transaction counts) and
+//   "Transactions" (full transaction history with all fee columns).
 
 const ACTION_PILL: Record<string, string> = {
   BUY:           'pill-buy',
@@ -41,13 +43,8 @@ function buildFeeRows(txns: any[]): any[] {
 }
 
 const FEE_TYPES = [
-  'Management Fee',
-  'Brokerage Commission',
-  'Stamp Duty',
-  'VAT',
-  'Exchange Levy',
-  'Clearing Fee',
-  'SMS Charge',
+  'Management Fee', 'Brokerage Commission', 'Stamp Duty',
+  'VAT', 'Exchange Levy', 'Clearing Fee', 'SMS Charge',
 ]
 
 export default function TransactionsPage() {
@@ -142,6 +139,88 @@ export default function TransactionsPage() {
     total:      txns.reduce((s, t) => s + (t.fees               ?? 0), 0),
   }
 
+  // v21j: Excel export — Sheet 1: Summary, Sheet 2: Full transactions
+  function downloadExcel() {
+    const wb = XLSX.utils.book_new()
+
+    // Sheet 1: Summary
+    const summaryData = [
+      ['Portfolio', portfolio?.name ?? ''],
+      ['Client', portfolio?.client?.name ?? ''],
+      ['Export date', new Date().toLocaleDateString('en-GB')],
+      [''],
+      ['FEE SUMMARY', ''],
+      ['Brokerage commission (₦)', feeTotals.commission],
+      ['VAT on commission (₦)', feeTotals.vat],
+      ['Contract stamp duty (₦)', feeTotals.stamp],
+      ['NGX exchange levy (₦)', feeTotals.exchange],
+      ['CSCS clearing fee (₦)', feeTotals.clearing],
+      ['SMS charges (₦)', feeTotals.sms],
+      ['Management fees (₦)', feeTotals.management],
+      ['TOTAL FEES (₦)', feeTotals.total],
+      [''],
+      ['TRANSACTION COUNTS', ''],
+      ['Total transactions', txns.length],
+      ['Buys', txns.filter(t => t.action === 'BUY').length],
+      ['Sells', txns.filter(t => t.action === 'SELL').length],
+      ['Income entries', txns.filter(t => t.action === 'INCOME').length],
+      ['Fee entries', txns.filter(t => t.action === 'FEE').length],
+      ['Transfers in', txns.filter(t => t.action === 'TRANSFER_IN').length],
+      ['Transfers out', txns.filter(t => t.action === 'TRANSFER_OUT').length],
+      [''],
+      ['VOLUME SUMMARY', ''],
+      ['Gross buys (₦)', txns.filter(t => t.action === 'BUY').reduce((s, t) => s + (t.gross_value || 0), 0)],
+      ['Gross sells (₦)', txns.filter(t => t.action === 'SELL').reduce((s, t) => s + (t.gross_value || 0), 0)],
+    ]
+    const summaryWs = XLSX.utils.aoa_to_sheet(summaryData)
+    summaryWs['!cols'] = [{ wch: 30 }, { wch: 20 }]
+    XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary')
+
+    // Sheet 2: Full transactions
+    const headers = [
+      'Date', 'Settlement Date', 'Action', 'Instrument', 'CN Number',
+      'Quantity', 'Price (₦)', 'Gross Value (₦)', 'Amount (₦)',
+      'Total Fees (₦)', 'Commission (₦)', 'VAT (₦)', 'Stamp Duty (₦)',
+      'Exchange Levy (₦)', 'Clearing (₦)', 'SMS (₦)', 'Management Fee (₦)',
+      'Broker', 'Notes',
+    ]
+    const txnRows = txns.map(t => [
+      t.trade_date ?? '',
+      t.settlement_date ?? '',
+      t.action ?? '',
+      t.instrument_id ?? '',
+      t.cn_number ?? '',
+      t.quantity != null ? Number(t.quantity) : '',
+      t.price != null ? Number(t.price) : '',
+      t.gross_value != null ? Number(t.gross_value) : '',
+      t.amount != null ? Number(t.amount) : '',
+      Number(t.fees ?? 0),
+      Number(t.fee_commission ?? 0),
+      Number(t.fee_vat ?? 0),
+      Number(t.fee_contract_stamp ?? 0),
+      Number(t.fee_exchange ?? 0),
+      Number(t.fee_clearing ?? 0),
+      Number(t.fee_sms ?? 0),
+      Number(t.fee_management ?? 0),
+      t.broker ?? '',
+      t.notes ?? '',
+    ])
+    const txnWs = XLSX.utils.aoa_to_sheet([headers, ...txnRows])
+    txnWs['!cols'] = [
+      { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 16 }, { wch: 14 },
+      { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 14 },
+      { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 14 },
+      { wch: 14 }, { wch: 12 }, { wch: 10 }, { wch: 16 },
+      { wch: 16 }, { wch: 36 },
+    ]
+    XLSX.utils.book_append_sheet(wb, txnWs, 'Transactions')
+
+    const clientName = portfolio?.client?.name ?? 'Portfolio'
+    const portfolioName = portfolio?.name ?? 'Transactions'
+    const today = new Date().toISOString().slice(0, 10)
+    XLSX.writeFile(wb, `${clientName} - ${portfolioName} Transactions ${today}.xlsx`)
+  }
+
   function getTxnsText(): string {
     const lines: string[] = []
     const totalBuys  = txns.filter(t => t.action === 'BUY').reduce((s, t) => s + (t.gross_value || 0), 0)
@@ -203,19 +282,21 @@ export default function TransactionsPage() {
           <button className="btn-h" onClick={copyText}>
             {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
           </button>
+          {/* v21j: Excel export */}
+          <button className="btn-h" onClick={downloadExcel}>
+            <FileSpreadsheet size={12} /> Export Excel
+          </button>
           <button className="btn-h btn-h-primary" onClick={() => setShowForm(!showForm)}>
             <Plus size={12} /> Enter trade
           </button>
         </div>
       </div>
 
-      {/* Fee summary cards (4 tiles with accent top borders) */}
+      {/* Fee summary cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 12, marginBottom: 18 }}>
         <div className="kpi-mini" style={{ borderTopColor: 'var(--gold)' }}>
           <div className="kpi-mini-label">Brokerage commission</div>
-          <div className="kpi-mini-value" style={{ color: 'var(--gold)' }}>
-            ₦{feeTotals.commission.toLocaleString()}
-          </div>
+          <div className="kpi-mini-value" style={{ color: 'var(--gold)' }}>₦{feeTotals.commission.toLocaleString()}</div>
         </div>
         <div className="kpi-mini" style={{ borderTopColor: 'var(--warn)' }}>
           <div className="kpi-mini-label">Statutory charges</div>
@@ -225,15 +306,11 @@ export default function TransactionsPage() {
         </div>
         <div className="kpi-mini" style={{ borderTopColor: 'var(--sidebar-bg)' }}>
           <div className="kpi-mini-label">Management fees</div>
-          <div className="kpi-mini-value" style={{ color: 'var(--sidebar-bg)' }}>
-            ₦{feeTotals.management.toLocaleString()}
-          </div>
+          <div className="kpi-mini-value" style={{ color: 'var(--sidebar-bg)' }}>₦{feeTotals.management.toLocaleString()}</div>
         </div>
         <div className="kpi-mini" style={{ borderTopColor: 'var(--neg)' }}>
           <div className="kpi-mini-label">Total fees paid</div>
-          <div className="kpi-mini-value" style={{ color: 'var(--neg)' }}>
-            ₦{feeTotals.total.toLocaleString()}
-          </div>
+          <div className="kpi-mini-value" style={{ color: 'var(--neg)' }}>₦{feeTotals.total.toLocaleString()}</div>
         </div>
       </div>
 
@@ -255,14 +332,7 @@ export default function TransactionsPage() {
               <div style={{ fontSize: 10, color: 'var(--text-3)', marginBottom: 8, lineHeight: 1.35, letterSpacing: '0.02em' }}>
                 {item.label}
               </div>
-              <div
-                style={{
-                  fontSize: 15,
-                  fontFamily: 'var(--font-mono)',
-                  fontWeight: 500,
-                  color: idx === arr.length - 1 ? 'var(--text)' : 'var(--text-2)',
-                }}
-              >
+              <div style={{ fontSize: 15, fontFamily: 'var(--font-mono)', fontWeight: 500, color: idx === arr.length - 1 ? 'var(--text)' : 'var(--text-2)' }}>
                 ₦{item.value.toLocaleString()}
               </div>
             </div>
@@ -276,7 +346,6 @@ export default function TransactionsPage() {
           <div className="panel-header">
             <div className="panel-title">New trade entry</div>
           </div>
-
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
             <FormField label="Trade date" required>
               <input type="date" value={form.trade_date} onChange={set('trade_date')} required className="input-h" />
@@ -293,7 +362,6 @@ export default function TransactionsPage() {
               </select>
             </FormField>
           </div>
-
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, marginBottom: 16 }}>
             {['BUY','SELL'].includes(form.action) && (
               <>
@@ -322,17 +390,14 @@ export default function TransactionsPage() {
               </FormField>
             )}
           </div>
-
           <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 16 }}>
             <FormField label="Broker"><input value={form.broker} onChange={set('broker')} className="input-h" /></FormField>
             <FormField label="Counterparty"><input value={form.counterparty} onChange={set('counterparty')} className="input-h" /></FormField>
             <FormField label="Maturity date"><input type="date" value={form.maturity_date} onChange={set('maturity_date')} className="input-h" /></FormField>
           </div>
-
           <div style={{ marginBottom: 16 }}>
             <FormField label="Notes"><input value={form.notes} onChange={set('notes')} className="input-h" /></FormField>
           </div>
-
           {form.action === 'BUY' && form.quantity && form.price && (
             <div className="alert-h alert-h-info" style={{ marginBottom: 16, fontSize: 12 }}>
               Gross value: <strong style={{ fontFamily: 'var(--font-mono)', marginLeft: 4 }}>
@@ -340,14 +405,11 @@ export default function TransactionsPage() {
               </strong>
             </div>
           )}
-
           <div style={{ display: 'flex', gap: 10 }}>
             <button type="submit" disabled={saving} className="btn-h btn-h-primary">
               {saving ? 'Saving…' : 'Submit trade'}
             </button>
-            <button type="button" onClick={() => setShowForm(false)} className="btn-h">
-              Cancel
-            </button>
+            <button type="button" onClick={() => setShowForm(false)} className="btn-h">Cancel</button>
           </div>
         </form>
       )}
@@ -355,10 +417,7 @@ export default function TransactionsPage() {
       {/* Filters row */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center', marginBottom: 12 }}>
         <div style={{ position: 'relative', width: 200 }}>
-          <Search
-            size={12}
-            style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }}
-          />
+          <Search size={12} style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
           <input
             value={filter.search}
             onChange={e => setFilter(f => ({ ...f, search: e.target.value }))}
@@ -367,7 +426,6 @@ export default function TransactionsPage() {
             style={{ paddingLeft: 30 }}
           />
         </div>
-
         <select
           value={filter.action}
           onChange={e => setFilter(f => ({ ...f, action: e.target.value, feeType: '' }))}
@@ -379,7 +437,6 @@ export default function TransactionsPage() {
             <option key={a} value={a}>{a}</option>
           ))}
         </select>
-
         <select
           value={filter.feeType}
           onChange={e => setFilter(f => ({ ...f, feeType: e.target.value, action: '' }))}
@@ -387,22 +444,13 @@ export default function TransactionsPage() {
           style={{ width: 200, padding: '5px 32px 5px 9px', fontSize: 12 }}
         >
           <option value="">All fee types</option>
-          {FEE_TYPES.map(ft => (
-            <option key={ft} value={ft}>{ft}</option>
-          ))}
+          {FEE_TYPES.map(ft => <option key={ft} value={ft}>{ft}</option>)}
         </select>
-
         {(filter.action || filter.feeType || filter.search) && (
-          <button
-            onClick={() => setFilter({ action: '', search: '', feeType: '' })}
-            className="btn-h"
-            style={{ fontSize: 11, padding: '4px 10px' }}
-          >
+          <button onClick={() => setFilter({ action: '', search: '', feeType: '' })} className="btn-h" style={{ fontSize: 11, padding: '4px 10px' }}>
             Clear filters
           </button>
         )}
-
-        {/* Fee column toggle */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginLeft: 'auto' }}>
           <span style={{ fontSize: 10, color: 'var(--text-3)', marginRight: 4 }}>Fee columns:</span>
           {(['total', 'breakdown'] as FeeView[]).map(v => (
@@ -410,13 +458,8 @@ export default function TransactionsPage() {
               key={v}
               onClick={() => setFeeView(v)}
               style={{
-                padding: '4px 11px',
-                borderRadius: 2,
-                fontSize: 11,
-                fontWeight: 500,
-                textTransform: 'capitalize' as const,
-                cursor: 'pointer',
-                transition: 'all 0.15s',
+                padding: '4px 11px', borderRadius: 2, fontSize: 11, fontWeight: 500,
+                textTransform: 'capitalize' as const, cursor: 'pointer', transition: 'all 0.15s',
                 fontFamily: 'var(--font-sans)',
                 ...(feeView === v
                   ? { background: 'var(--gold-soft)', color: 'var(--gold)', border: '1px solid rgba(176, 139, 62, 0.3)' }
@@ -427,14 +470,12 @@ export default function TransactionsPage() {
             </button>
           ))}
         </div>
-
         <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
           {filtered.length} record{filtered.length !== 1 ? 's' : ''}
           {filter.feeType && <span style={{ color: 'var(--gold)', marginLeft: 4 }}>— {filter.feeType}</span>}
         </span>
       </div>
 
-      {/* Fee type info note */}
       {filter.feeType && (
         <div className="alert-h alert-h-info" style={{ marginBottom: 12, fontSize: 11 }}>
           <Info size={12} style={{ marginTop: 1, flexShrink: 0 }} />
@@ -481,23 +522,17 @@ export default function TransactionsPage() {
             </thead>
             <tbody>
               {filtered.map(t => (
-                <tr
-                  key={t._virtual ? `${t.id}-${t._feeType}` : t.id}
-                  style={t._virtual ? { background: 'rgba(176, 139, 62, 0.04)' } : {}}
-                >
+                <tr key={t._virtual ? `${t.id}-${t._feeType}` : t.id} style={t._virtual ? { background: 'rgba(176, 139, 62, 0.04)' } : {}}>
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{t.trade_date}</td>
                   <td><span className={`pill ${ACTION_PILL[t.action] ?? 'pill-hold'}`}>{t.action}</span></td>
                   <td>
                     <div style={{ fontWeight: 500 }}>{t.instrument_id || '—'}</div>
-                    {t.income_category && (
-                      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.income_category}</div>
-                    )}
+                    {t.income_category && <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.income_category}</div>}
                   </td>
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                     {filter.feeType
                       ? <span style={{ color: 'var(--gold)', fontSize: 11 }}>{t._feeType}</span>
-                      : t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'
-                    }
+                      : t.quantity ? Number(t.quantity).toLocaleString() : t.amount ? fmt.ngnM(t.amount) : '—'}
                   </td>
                   <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>
                     {t.price ? `₦${Number(t.price).toFixed(2)}` : '—'}
@@ -520,8 +555,8 @@ export default function TransactionsPage() {
                       <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_contract_stamp ? `₦${Number(t.fee_contract_stamp).toFixed(0)}`          : '—'}</td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_exchange       ? `₦${Number(t.fee_exchange).toFixed(0)}`                : '—'}</td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--warn)' }}>{t.fee_clearing       ? `₦${Number(t.fee_clearing).toFixed(0)}`                : '—'}</td>
-                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--sidebar-bg)' }}>{t.fee_management     ? `₦${Number(t.fee_management).toLocaleString()}`        : '—'}</td>
-                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--neg)', fontWeight: 500 }}>{t.fees ? `₦${Number(t.fees).toLocaleString()}`                   : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--sidebar-bg)' }}>{t.fee_management ? `₦${Number(t.fee_management).toLocaleString()}`      : '—'}</td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--neg)', fontWeight: 500 }}>{t.fees ? `₦${Number(t.fees).toLocaleString()}` : '—'}</td>
                     </>
                   )}
                   <td style={{ fontSize: 11, color: 'var(--text-3)', maxWidth: 160, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
