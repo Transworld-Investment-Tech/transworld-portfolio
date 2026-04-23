@@ -66,7 +66,7 @@ export default function HoldingsPage() {
   const [priceData, setPriceData] = useState<Record<string, PriceRow>>({})
   const [saving, setSaving] = useState<Record<string, boolean>>({})
   const [adding, setAdding] = useState(false)
-  const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '' })
+  const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '', trade_date: '' })
   const [loading, setLoading] = useState(true)
   const [msg, setMsg] = useState('')
   const [copied, setCopied] = useState(false)
@@ -115,6 +115,25 @@ export default function HoldingsPage() {
 
   async function addHolding() {
     if (!newHolding.instrument_id || !newHolding.quantity) return
+    const res = await fetch('/api/holdings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        portfolioId,
+        instrumentId:  newHolding.instrument_id,
+        quantity:      Number(newHolding.quantity),
+        avgCost:       Number(newHolding.avg_cost) || priceData[newHolding.instrument_id]?.price || 0,
+        tradeDate:     newHolding.trade_date || new Date().toISOString().slice(0, 10),
+      }),
+    })
+    const data = await res.json()
+    if (!res.ok) { flashMsg('Error: ' + (data.error ?? 'Failed to add position')); return }
+    setNewHolding({ instrument_id: '', quantity: '', avg_cost: '', trade_date: '' })
+    flashMsg('Position added — transaction recorded ✓')
+    await load()
+  }
+  async function _unused_addHolding_OLD() {
+    if (!newHolding.instrument_id || !newHolding.quantity) return
     const instr = instruments.find(i => i.instrument_id === newHolding.instrument_id)
     await supabase.from('holdings').upsert({
       portfolio_id: portfolioId,
@@ -125,7 +144,7 @@ export default function HoldingsPage() {
       as_of_date: new Date().toISOString().slice(0, 10),
     }, { onConflict: 'portfolio_id,instrument_id' })
     setAdding(false)
-    setNewHolding({ instrument_id: '', quantity: '', avg_cost: '' })
+    setNewHolding({ instrument_id: '', quantity: '', avg_cost: '', trade_date: '' })
     load()
     flashMsg('Position added ✓')
   }
@@ -341,7 +360,17 @@ export default function HoldingsPage() {
               />
             </div>
             <div style={{ display: 'flex', gap: 6 }}>
-              <button className="btn-h btn-h-primary" onClick={addHolding}>Add</button>
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+                <label style={{ fontSize: 10, color: 'var(--text-3)', letterSpacing: '0.1em', fontWeight: 600, textTransform: 'uppercase' }}>Trade date</label>
+                <input
+                  type="date"
+                  className="input-h"
+                  value={newHolding.trade_date}
+                  onChange={e => setNewHolding(h => ({ ...h, trade_date: e.target.value }))}
+                  style={{ width: 160 }}
+                />
+              </div>
+              <button className="btn-h btn-h-primary" onClick={addHolding} style={{ alignSelf: 'flex-end' }}>Add</button>
               <button className="btn-h" onClick={() => setAdding(false)}>✕</button>
             </div>
           </div>
