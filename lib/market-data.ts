@@ -17,21 +17,35 @@
 //   https://doclib.ngxgroup.com/REST/api/statistics/equities/
 //     ?market=&sector=&orderby=&pageSize=300&pageNo=0
 //
-// Contract preserved from v20f:
+// v21i: Two additions:
+//   1. cleanBracketSuffix() strips NGX regulatory-filing tags like
+//      [MRF] (Missed Regulatory Filing), [DWL] (Delisting Watch List),
+//      [RST] (Restricted), [BMF] (Breach of Market-Making Framework),
+//      [BLS] (Breach of Listing Standards), [MRS] (Market Restriction),
+//      [DIP] (Defunct in Progress) from Symbol and Company2. These tags
+//      are operational alerts appended by NGX — not part of the ticker.
+//      Stripping is safe because valid ticker characters never include
+//      brackets.
+//   2. Quote now carries a `name` field (from Company2) so the route
+//      can auto-register unknown instruments with a meaningful display
+//      name. fetchNGXPrices no longer pre-filters by validInstrumentIds
+//      — that responsibility moved to app/api/prices/route.ts, which now
+//      auto-registers unknown tickers (as approved=false) before
+//      upserting prices. This keeps the fetcher independently testable
+//      and means all 146 NGX equities are priced every run.
+//
+// Contract preserved from v20h:
 //   - Quote.source still 'ngx'
 //   - Quote.day_change still stores PERCENT change (historical semantic)
-//   - NGX_TICKER_ALIASES still applied (MOBIL → MRS)
-//   - validInstrumentIds filter applied AFTER parse for diagnosability
+//   - NGX_TICKER_ALIASES still applied (MOBIL → MRS, GUARANTY → GTCO)
 //   - Throws on empty results so /api/prices surfaces a clear error
-//
-// New fields on Quote are all optional, so any caller written against
-// the v20f shape continues to compile and run unchanged.
 // ============================================================
 
 export interface Quote {
   instrument_id: string
-  price: number             // API.ClosePrice
-  day_change: number        // API.PercChange (percent; historical semantic preserved)
+  name?: string | null          // v21i: display name from API (Company2 field)
+  price: number                 // API.ClosePrice
+  day_change: number            // API.PercChange (percent; historical semantic preserved)
   source: string
   fetched_at: string
 
@@ -51,7 +65,7 @@ export interface Quote {
 
 // NGX's published ticker sometimes differs from our instrument_id.
 export const NGX_TICKER_ALIASES: Record<string, string> = {
-  MOBIL: 'MRS', // MRS Oil Nigeria (historical Mobil ticker)
+  MOBIL: 'MRS',       // MRS Oil Nigeria (historical Mobil ticker)
   GUARANTY: 'GTCO',
 }
 
@@ -65,6 +79,7 @@ const BROWSER_UA =
 
 interface NGXApiRow {
   Symbol?: string
+  Company2?: string | null      // v21i: display name e.g. "Lasaco Assurance Plc"
   ClosePrice?: number | null
   Change?: number | null
   PercChange?: number | null
@@ -78,7 +93,7 @@ interface NGXApiRow {
   Market?: string | null
   Sector?: string | null
   TradeDate?: string | null
-  // Also present on the wire but not consumed: $id, Id, Company2.
+  // Also present on the wire but not consumed: $id, Id.
   // CalculateChangePercent duplicates PercChange; we prefer the latter.
 }
 
@@ -104,12 +119,22 @@ function cleanText(v: unknown): string | null {
   return t.length > 0 ? t : null
 }
 
+// v21i: Strip NGX regulatory-status bracket tags from a string.
+// Valid ticker characters (letters, digits) never include brackets, so
+// removing a trailing [...] token is always correct for Symbol processing.
+// Applied to display names too so auto-registered instrument names are clean.
+function cleanBracketSuffix(s: string): string {
+  return s.replace(/\s*\[.*?\]\s*$/, '').trim()
+}
+
 // --------------------------------------------------------------
 // Primary: Direct JSON call to NGX statistics endpoint
 // --------------------------------------------------------------
-export async function fetchNGXPrices(
-  validInstrumentIds?: Set<string>
-): Promise<Quote[]> {
+// v21i: No longer accepts validInstrumentIds. Returns ALL rows that have
+// a valid Symbol + positive ClosePrice. The route (app/api/prices/route.ts)
+// owns the "do we know this instrument?" question and auto-registers
+// unknown tickers before upserting prices.
+export async function fetchNGXPrices(): Promise<Quote[]> {
   const res = await fetch(NGX_API_URL, {
     headers: {
       'User-Agent': BROWSER_UA,
@@ -146,8 +171,9 @@ export async function fetchNGXPrices(
   const seen = new Map<string, Quote>()
 
   for (const row of rows) {
-    const symbol = (row.Symbol || '').trim().toUpperCase()
-    if (!symbol) continue
+    // v21i: strip bracket regulatory tags BEFORE alias lookup and dedup.
+    const rawSymbol = cleanBracketSuffix((row.Symbol || '').trim().toUpperCase())
+    if (!rawSymbol) continue
 
     // ClosePrice must be a positive number. Suspended / untraded equities
     // come through with null or zero ClosePrice and are skipped.
@@ -158,11 +184,17 @@ export async function fetchNGXPrices(
     const pct = num(row.PercChange)
     const day_change = pct === null ? 0 : pct
 
-    const instrument_id = NGX_TICKER_ALIASES[symbol] || symbol
+    const instrument_id = NGX_TICKER_ALIASES[rawSymbol] || rawSymbol
+
+    // v21i: strip bracket tags from display name too (e.g. "Lasaco Assurance Plc [MRF]"
+    // → "Lasaco Assurance Plc").
+    const rawName = cleanText(row.Company2)
+    const name = rawName ? cleanBracketSuffix(rawName) : null
 
     if (!seen.has(instrument_id)) {
       seen.set(instrument_id, {
         instrument_id,
+        name,
         price,
         day_change,
         source: 'ngx',
@@ -192,11 +224,7 @@ export async function fetchNGXPrices(
     )
   }
 
-  // Apply caller-supplied whitelist AFTER parsing so the parse itself is
-  // independently diagnosable (raw count returned irrespective of holdings).
-  return validInstrumentIds
-    ? allQuotes.filter((q) => validInstrumentIds.has(q.instrument_id))
-    : allQuotes
+  return allQuotes
 }
 
 // --------------------------------------------------------------
@@ -239,7 +267,10 @@ export async function fetchAlphaVantage(
 // --------------------------------------------------------------
 // Aggregator — signature preserved for callers
 // --------------------------------------------------------------
-export async function fetchAllMarketData(config: {
+// v21i: validInstrumentIds and other config options are accepted for
+// back-compat but ignored — fetchNGXPrices now returns everything and
+// the route handles filtering / auto-registration.
+export async function fetchAllMarketData(config?: {
   validInstrumentIds?: Set<string>
   apifyKey?: string        // deprecated — ignored
   alphaVantageKey?: string // deprecated — ignored
@@ -248,7 +279,7 @@ export async function fetchAllMarketData(config: {
   const errors: string[] = []
 
   try {
-    const ngxQuotes = await fetchNGXPrices(config.validInstrumentIds)
+    const ngxQuotes = await fetchNGXPrices()
     quotes.push(...ngxQuotes)
   } catch (e) {
     errors.push(`NGX: ${(e as Error).message}`)
