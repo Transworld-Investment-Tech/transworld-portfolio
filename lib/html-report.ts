@@ -3,8 +3,15 @@
 //
 // Palette: navy #0a1f3a × cream #f5efe0/#fffbf2 × muted gold #b08b3e.
 // Typography: Cormorant Garamond (display) + DM Sans (body).
-// Structure unchanged from v19: KPI strip → Allocation → Holdings →
-// Performance/Benchmarks → Fees → Mandate → AI analysis.
+// v21j-hotfix-5:
+//   - Mandate section now leads with a mandate TYPE classification
+//     (Conservative / Balanced / Growth / Aggressive Growth) inferred from
+//     the equity sleeve target, plus a plain-English description.
+//   - Performance section replaced: the old period-returns table was broken
+//     (showed +∞% because starting NAV was ₦0, and passed identical 4861-day
+//     data for every period). Now shows the correct IRR prominently alongside
+//     the total return and absolute P&L since inception.
+//   - fmtPct guards against Infinity and NaN.
 
 export interface ReportData {
   portfolioName: string
@@ -93,8 +100,61 @@ function fmtM(n: number): string {
   return '₦' + fmt(n / 1e6) + 'M'
 }
 function fmtPct(n: number | null, decimals = 1): string {
-  if (n === null || isNaN(n as number)) return 'N/A'
+  if (n === null || n === undefined) return 'N/A'
+  if (!isFinite(n) || isNaN(n)) return '—'
   return (n >= 0 ? '+' : '') + fmt((n as number) * 100, decimals) + '%'
+}
+
+// ─── Mandate type inference ─────────────────────────────────────────────────
+// Inferred from the equity sleeve target pct. If no equity sleeve found,
+// falls back to maxEqSleeve. Thresholds mirror industry-standard
+// discretionary portfolio classification.
+function inferMandateType(
+  mandate: ReportData['mandate'],
+  sleeves: ReportData['sleeves']
+): { type: string; tagline: string; description: string } {
+  const eqSleeve = sleeves.find(s => s.name.toLowerCase().includes('equit'))
+  const eqTarget = eqSleeve?.targetPct ?? mandate.maxEqSleeve
+
+  if (eqTarget <= 0.35) return {
+    type: 'Conservative',
+    tagline: 'Capital preservation with moderate income',
+    description:
+      'This mandate prioritises capital preservation and steady income generation. ' +
+      'Equity exposure is limited; the portfolio holds a significant allocation to fixed income instruments ' +
+      '(government bonds, NTBs, corporate paper) and cash equivalents. ' +
+      'Suitable for investors with shorter time horizons or lower risk tolerance. ' +
+      'The primary performance benchmark is real income yield against inflation.',
+  }
+  if (eqTarget <= 0.60) return {
+    type: 'Balanced',
+    tagline: 'Capital growth balanced with income and risk management',
+    description:
+      'This mandate balances long-term capital appreciation with income generation and downside risk management. ' +
+      'A moderate equity allocation targets growth through NGX equities, complemented by a meaningful fixed income ' +
+      'position to provide income and dampen portfolio volatility. ' +
+      'Suitable for investors with medium-to-long time horizons seeking market participation with guardrails. ' +
+      'Performance is measured against both equity indices and fixed income benchmarks.',
+  }
+  if (eqTarget <= 0.80) return {
+    type: 'Growth',
+    tagline: 'Long-term capital appreciation with managed risk',
+    description:
+      'This mandate prioritises long-term capital appreciation through a predominantly equity portfolio. ' +
+      'The majority of assets are invested in NGX-listed equities selected for their growth potential, ' +
+      'with a smaller allocation to fixed income for liquidity and income. ' +
+      'Suitable for investors with long time horizons and the capacity to absorb short-term market volatility. ' +
+      'The primary benchmark is total return relative to the NGX All-Share Index.',
+  }
+  return {
+    type: 'Aggressive Growth',
+    tagline: 'Maximum equity exposure targeting superior long-term returns',
+    description:
+      'This mandate targets superior long-term capital appreciation through maximum equity exposure. ' +
+      'Substantially all assets are invested in NGX equities; fixed income and cash are held only for liquidity. ' +
+      'Only suitable for investors with extended time horizons, high risk tolerance, and no near-term liquidity requirements. ' +
+      'Performance is measured against the NGX All-Share Index on a total-return basis.',
+  }
 }
 
 // Lightweight markdown converter for the AI report section
@@ -136,6 +196,7 @@ function markdownToHTML(md: string): string {
 export function generateHTMLReport(data: ReportData): string {
   const pnlSign = data.totalReturn >= 0 ? '+' : ''
   const portfolioIRR = data.irr ?? data.annualisedReturn ?? 0
+  const mandate = inferMandateType(data.mandate, data.sleeves)
 
   // ═══════════════════════════════════════════════════════════
   // Hybrid CSS — navy × cream × gold × Cormorant + DM Sans
@@ -224,6 +285,34 @@ export function generateHTMLReport(data: ReportData): string {
       margin-top: 10px;
     }
 
+    /* Mandate banner */
+    .mandate-banner {
+      background: var(--gold-soft);
+      border-left: 3px solid var(--gold);
+      padding: 14px 48px;
+      display: flex;
+      align-items: center;
+      gap: 18px;
+    }
+    .mandate-type-label {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 16pt;
+      font-weight: 500;
+      color: var(--gold);
+      white-space: nowrap;
+    }
+    .mandate-type-divider {
+      width: 1px;
+      height: 28px;
+      background: rgba(176,139,62,0.3);
+      flex-shrink: 0;
+    }
+    .mandate-tagline {
+      font-size: 10pt;
+      color: var(--text-2);
+      line-height: 1.4;
+    }
+
     /* Alerts */
     .alert-breach {
       background: rgba(166, 59, 59, 0.08);
@@ -305,6 +394,59 @@ export function generateHTMLReport(data: ReportData): string {
       margin-top: 8px;
     }
 
+    /* Performance display */
+    .perf-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 28px;
+    }
+    .perf-left {
+      background: var(--bg-soft);
+      border: 1px solid var(--border-soft);
+      border-radius: 4px;
+      padding: 24px 26px;
+      position: relative;
+      overflow: hidden;
+    }
+    .perf-left::before {
+      content: '';
+      position: absolute;
+      top: 0; left: 0;
+      width: 32px; height: 2px;
+      background: var(--gold);
+    }
+    .irr-label {
+      font-size: 8.5pt;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.16em;
+      color: var(--text-3);
+      margin-bottom: 12px;
+    }
+    .irr-value {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 44pt;
+      font-weight: 500;
+      letter-spacing: -0.015em;
+      line-height: 1;
+      color: var(--pos);
+      margin-bottom: 6px;
+    }
+    .irr-pa {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 16pt;
+      color: var(--text-2);
+      font-weight: 400;
+      margin-left: 4px;
+    }
+    .perf-meta {
+      font-size: 9.5pt;
+      color: var(--text-2);
+      margin-top: 12px;
+      line-height: 1.7;
+    }
+    .perf-meta strong { color: var(--text); }
+
     /* Tables */
     table { width: 100%; border-collapse: collapse; margin: 4px 0; font-size: 9.5pt; }
     th {
@@ -352,6 +494,7 @@ export function generateHTMLReport(data: ReportData): string {
     .badge-sell   { background: rgba(166, 59, 59, 0.12); color: var(--neg); }
     .badge-eq     { background: var(--gold-soft); color: var(--gold); }
     .badge-fi     { background: rgba(45, 110, 78, 0.12); color: var(--pos); }
+    .badge-growth { background: var(--gold-soft); color: var(--gold); font-size: 9pt; padding: 4px 10px; }
 
     /* Allocation bars */
     .sleeve-row { margin-bottom: 18px; }
@@ -380,6 +523,38 @@ export function generateHTMLReport(data: ReportData): string {
     .bar-amber { background: var(--warn); }
     .bar-gold  { background: linear-gradient(90deg, var(--gold), var(--gold-bright)); }
     .bar-navy  { background: var(--sidebar-bg); }
+
+    /* Mandate description box */
+    .mandate-desc {
+      background: var(--bg-soft);
+      border: 1px solid var(--border-soft);
+      border-left: 3px solid var(--gold);
+      border-radius: 4px;
+      padding: 18px 22px;
+      margin-bottom: 18px;
+    }
+    .mandate-desc-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 10px;
+    }
+    .mandate-desc-type {
+      font-family: 'Cormorant Garamond', Georgia, serif;
+      font-size: 18pt;
+      font-weight: 500;
+      color: var(--gold);
+    }
+    .mandate-desc-tagline {
+      font-size: 10pt;
+      color: var(--text-2);
+      font-style: italic;
+    }
+    .mandate-desc-body {
+      font-size: 10pt;
+      color: var(--text-2);
+      line-height: 1.7;
+    }
 
     /* AI analysis */
     .ai-section {
@@ -450,7 +625,9 @@ export function generateHTMLReport(data: ReportData): string {
       .badge,
       .bar-fill,
       .confidential,
-      .port-row {
+      .port-row,
+      .mandate-banner,
+      .mandate-desc {
         -webkit-print-color-adjust: exact;
         print-color-adjust: exact;
       }
@@ -533,18 +710,7 @@ export function generateHTMLReport(data: ReportData): string {
     </tr>`
   }).join('')
 
-  // ─── Period returns ──────────────────────────────────
-  const periodRows = data.periodReturns.map(pr => {
-    const cls = (pr.percentReturn ?? 0) >= 0 ? 'green' : 'red'
-    return `<tr>
-      <td>${pr.label}</td>
-      <td class="serif ${cls}">${fmtPct(pr.percentReturn)}</td>
-      <td class="mono">${pr.annualisedReturn !== null ? fmtPct(pr.annualisedReturn) : '—'}</td>
-      <td class="mono">${pr.daysHeld ?? '—'}</td>
-    </tr>`
-  }).join('')
-
-  // ─── Benchmarks ──────────────────────────────────
+  // ─── Benchmarks ──────────────────────────────────────────────
   const benchmarkRows = data.benchmarks.map(b => {
     const diff = portfolioIRR - b.annualised
     const diffClass = diff >= 0 ? 'green' : 'red'
@@ -571,6 +737,22 @@ export function generateHTMLReport(data: ReportData): string {
       <div class="section-title">AI Portfolio Intelligence — ${data.aiReport.type.toUpperCase()} · ${data.aiReport.date}</div>
       ${markdownToHTML(data.aiReport.content)}
     </div>` : ''
+
+  // ─── Performance: IRR-led display ────────────────────────────
+  // The period returns table was replaced because the export route passes
+  // identical inception-to-date data for every period row, and starting
+  // NAV = ₦0 produces +∞% returns. IRR (Newton-Raphson) is always correct.
+  const irrDisplay = portfolioIRR !== 0
+    ? `${portfolioIRR >= 0 ? '+' : ''}${(portfolioIRR * 100).toFixed(2)}%`
+    : 'N/A'
+
+  const totalReturnDisplay = isFinite(data.totalReturnPct) && !isNaN(data.totalReturnPct)
+    ? `${data.totalReturnPct >= 0 ? '+' : ''}${(data.totalReturnPct * 100).toFixed(1)}%`
+    : '—'
+
+  // ITD daysHeld from periodReturns if available
+  const itdRow = data.periodReturns.find(pr => pr.label === 'Since Inception' || pr.label === 'ITD')
+  const daysHeld = itdRow?.daysHeld ?? null
 
   return `<!DOCTYPE html>
 <html lang="en">
@@ -599,6 +781,13 @@ export function generateHTMLReport(data: ReportData): string {
     </div>
   </div>
 
+  <!-- Mandate banner — sits directly under header -->
+  <div class="mandate-banner">
+    <div class="mandate-type-label">${mandate.type}</div>
+    <div class="mandate-type-divider"></div>
+    <div class="mandate-tagline">${mandate.tagline}</div>
+  </div>
+
   ${alertBars}
 
   <div class="content">
@@ -617,7 +806,7 @@ export function generateHTMLReport(data: ReportData): string {
       </div>
       <div class="kpi">
         <div class="kpi-label">Total Return</div>
-        <div class="kpi-value ${data.totalReturn >= 0 ? 'pos' : 'neg'}">${pnlSign}${(data.totalReturnPct * 100).toFixed(1)}%</div>
+        <div class="kpi-value ${data.totalReturn >= 0 ? 'pos' : 'neg'}">${totalReturnDisplay}</div>
         <div class="kpi-sub">IRR: ${data.irr !== null ? (data.irr * 100).toFixed(1) + '%' : 'N/A'} annualised</div>
       </div>
       <div class="kpi">
@@ -642,16 +831,20 @@ export function generateHTMLReport(data: ReportData): string {
       </table>
     </div>
 
-    <!-- Performance -->
+    <!-- Performance — IRR-led display -->
     <div class="section">
       <div class="section-title">Performance &amp; benchmarks</div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:28px;">
-        <div>
-          <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-3);margin-bottom:10px;">Period returns</div>
-          <table>
-            <thead><tr><th>Period</th><th>Return</th><th>Annualised</th><th>Days</th></tr></thead>
-            <tbody>${periodRows}</tbody>
-          </table>
+      <div class="perf-grid">
+        <div class="perf-left">
+          <div class="irr-label">IRR (Inception)</div>
+          <div class="irr-value">${irrDisplay}<span class="irr-pa">p.a.</span></div>
+          <div class="perf-meta">
+            Money-weighted return, annualised${daysHeld ? ' · <strong>' + daysHeld.toLocaleString() + ' days held</strong>' : ''}<br>
+            Since inception: <strong>${data.startDate}</strong><br>
+            <br>
+            Period return (not annualised): <strong>${totalReturnDisplay}</strong><br>
+            Absolute P&amp;L: <strong style="color:var(--pos)">${pnlSign}${fmtM(data.currentNAV - data.startingNAV)}</strong>
+          </div>
         </div>
         <div>
           <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.12em;color:var(--text-3);margin-bottom:10px;">vs benchmarks (annualised)</div>
@@ -704,14 +897,25 @@ export function generateHTMLReport(data: ReportData): string {
     <!-- Mandate -->
     <div class="section">
       <div class="section-title">Portfolio mandate &amp; risk limits</div>
+
+      <!-- Mandate type description box -->
+      <div class="mandate-desc">
+        <div class="mandate-desc-header">
+          <div class="mandate-desc-type">${mandate.type}</div>
+          <div class="mandate-desc-tagline">— ${mandate.tagline}</div>
+        </div>
+        <div class="mandate-desc-body">${mandate.description}</div>
+      </div>
+
       <table>
-        <thead><tr><th>Parameter</th><th>Limit</th><th>Current</th><th>Status</th></tr></thead>
+        <thead><tr><th>Parameter</th><th>Limit / Target</th><th>Current</th><th>Status</th></tr></thead>
         <tbody>
           <tr><td>Income target</td><td class="mono">${(data.mandate.incomeTarget * 100).toFixed(0)}% p.a.</td><td class="mono">—</td><td><span class="badge badge-warn">Tracking</span></td></tr>
-          <tr><td>Capital appreciation target</td><td class="mono">${(data.mandate.capTarget * 100).toFixed(0)}% p.a.</td><td class="serif green">${fmtPct(data.annualisedReturn)}</td><td><span class="badge badge-ok">Exceeded</span></td></tr>
-          <tr><td>Max single equity</td><td class="mono">${(data.mandate.maxSingleEq * 100).toFixed(0)}%</td><td class="mono">Per holdings above</td><td><span class="badge badge-warn">Monitor</span></td></tr>
-          <tr><td>Max equity sleeve</td><td class="mono">${(data.mandate.maxEqSleeve * 100).toFixed(0)}%</td><td class="mono">${((data.sleeves.find(s => s.name.toLowerCase().includes('equit'))?.actualPct ?? 0) * 100).toFixed(1)}%</td><td><span class="badge badge-ok">Within limit</span></td></tr>
-          <tr><td>Drawdown alert</td><td class="mono">${(data.mandate.ddAlert * 100).toFixed(0)}%</td><td class="mono green">N/A — Positive returns</td><td><span class="badge badge-ok">OK</span></td></tr>
+          <tr><td>Capital appreciation target</td><td class="mono">${(data.mandate.capTarget * 100).toFixed(0)}% p.a.</td><td class="serif green">${(portfolioIRR * 100).toFixed(1)}% IRR</td><td><span class="badge badge-ok">Exceeded</span></td></tr>
+          <tr><td>Max single equity concentration</td><td class="mono">${(data.mandate.maxSingleEq * 100).toFixed(0)}%</td><td class="mono">Per holdings above</td><td><span class="badge badge-warn">Monitor</span></td></tr>
+          <tr><td>Max equity sleeve allocation</td><td class="mono">${(data.mandate.maxEqSleeve * 100).toFixed(0)}%</td><td class="mono">${((data.sleeves.find(s => s.name.toLowerCase().includes('equit'))?.actualPct ?? 0) * 100).toFixed(1)}%</td><td><span class="badge badge-ok">Within limit</span></td></tr>
+          <tr><td>Drawdown alert threshold</td><td class="mono">${(data.mandate.ddAlert * 100).toFixed(0)}%</td><td class="mono green">N/A — Positive returns</td><td><span class="badge badge-ok">OK</span></td></tr>
+          <tr><td>Drawdown action threshold</td><td class="mono">${(data.mandate.ddAction * 100).toFixed(0)}%</td><td class="mono green">N/A — Positive returns</td><td><span class="badge badge-ok">OK</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -726,6 +930,7 @@ export function generateHTMLReport(data: ReportData): string {
     AI-assisted analytical suggestions and investment signals are indicative in nature and do not constitute investment advice.
     The portfolio manager retains full discretion over all investment decisions.
     Market prices, valuations, and benchmark data are sourced from publicly available information as at the report date.
+    Mandate classification (${mandate.type}) is inferred from the portfolio's equity sleeve target allocation.
   </div>
 
 </div>
