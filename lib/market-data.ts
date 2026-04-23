@@ -52,6 +52,7 @@ export interface Quote {
 // NGX's published ticker sometimes differs from our instrument_id.
 export const NGX_TICKER_ALIASES: Record<string, string> = {
   MOBIL: 'MRS', // MRS Oil Nigeria (historical Mobil ticker)
+  GUARANTY: 'GTCO',
 }
 
 const NGX_API_URL =

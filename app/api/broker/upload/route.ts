@@ -1,5 +1,5 @@
 /**
- * app/api/broker/upload/route.ts — v21b-3b-hotfix-1
+ * app/api/broker/upload/route.ts — v21c-hotfix-3
  *
  * The ingestion pipeline for broker PDFs. POST multipart/form-data:
  *   - portfolio_id: UUID of target portfolio
@@ -19,8 +19,9 @@
  * cash event. The staged rows are the preview that the inbox UI
  * shows before commit.
  *
- * Returns the broker_file IDs, staged row count, and the reconciler
- * summary so the caller can confirm what landed.
+ * Returns the broker_file IDs, staged row count, the reconciler
+ * summary, AND the upload_session_id so the caller (e.g. the
+ * /admin/broker/new form) can redirect to the session detail page.
  *
  * v21b-3b-hotfix-1: Applies NGX_TICKER_ALIASES when writing staged
  * instrument_id values (e.g. FBNH → FIRSTHOLDCO, MOBIL → MRS).
@@ -28,6 +29,19 @@
  * land under the canonical instrument_id to commit cleanly.
  * Aliasing happens at the staged-write boundary, NOT inside the
  * parser — parsers stay pure, returning raw-extracted data.
+ *
+ * v21c-hotfix-3: Two fixes to the POST handler's response:
+ *   (a) The success return now includes `upload_session_id:
+ *       uploadSessionId` — previously missing entirely. Without it,
+ *       the /admin/broker/new form couldn't redirect to the detail
+ *       page after a successful upload.
+ *   (b) Reverted a broken shorthand inside uploadPdf() at the
+ *       broker_files insert payload — that helper's parameter is
+ *       named `upload_session_id` (snake_case), so the parameter
+ *       shorthand `upload_session_id,` is correct there. An earlier
+ *       hotfix had replaced it with `upload_session_id:
+ *       uploadSessionId,`, which referenced a name not in scope and
+ *       broke the Vercel build.
  *
  * NO DEDUP in this release — v21d handles dedup via cn_number.
  * Accidental double-uploads create fresh staged rows.
@@ -333,6 +347,7 @@ export async function POST(req: NextRequest) {
       broker_files: uploadedFiles,
       staged_count: inserted,
       reconciliation_summary: reconciliation.summary,
+      upload_session_id: uploadSessionId,
       errors,
       elapsed_ms: Date.now() - started,
     },
@@ -359,15 +374,15 @@ export async function GET() {
       '  -F "statements=@Statement_2.pdf"',
     ].join('\n'),
     returns:
-      'broker_files (array), staged_count, reconciliation_summary, errors',
+      'broker_files (array), staged_count, reconciliation_summary, upload_session_id, errors',
   })
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
 // Resolve any ticker through NGX_TICKER_ALIASES. Handles post-merge
-// canonicalisation (FBNH → FIRSTHOLDCO, MOBIL → MRS) so staged
-// rows match the canonical instruments master.
+// canonicalisation (FBNH → FIRSTHOLDCO, MOBIL → MRS, GUARANTY → GTCO)
+// so staged rows match the canonical instruments master.
 function aliasTicker(t: string | null | undefined): string | null {
   if (t === null || t === undefined) return null
   const up = String(t).toUpperCase()
@@ -408,7 +423,7 @@ async function uploadPdf(
       size_bytes: file.size,
       parse_status: 'pending',
       uploaded_by,
-      upload_session_id: uploadSessionId,
+      upload_session_id,
       created_at: now,
       updated_at: now,
     })
