@@ -327,6 +327,21 @@ export default function HomePage() {
                     <span className="pill pill-hold">{client.type}</span>
                     <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
                       <Link
+                        href={`/clients/${client.id}`}
+                        style={{
+                          fontSize: 11,
+                          color: 'var(--gold)',
+                          textDecoration: 'none',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 4,
+                          fontWeight: 500,
+                          transition: 'color 0.15s',
+                        }}
+                      >
+                        Consolidated view <ChevronRight size={11} />
+                      </Link>
+                      <Link
                         href={`/admin/clients/${client.id}`}
                         style={{
                           fontSize: 11,
