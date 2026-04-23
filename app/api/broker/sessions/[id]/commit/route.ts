@@ -1,12 +1,14 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v21d
+ * app/api/broker/sessions/[id]/commit/route.ts — v21g-hotfix-1
  *
  * POST /api/broker/sessions/[id]/commit
  *
  * Moves all staged_transactions for this session where
  * include_in_commit = true into the real `transactions` table.
  * Then rebuilds the portfolio's holdings from its now-current
- * transaction history (v21d).
+ * transaction history (v21d). Then backfills the portfolio's
+ * start_date and starting_nav from transactions if they're stale
+ * (v21g-hotfix-1).
  *
  * v21b-3b-hotfix-1 additions:
  *   1. Defensive NGX_TICKER_ALIASES pass when mapping staged →
@@ -27,6 +29,18 @@
  *     transactions have already been inserted and we don't want
  *     to roll them back over a holdings derivation issue.
  *
+ * v21g-hotfix-1 additions:
+ *   - After holdings rebuild, call inferPortfolioStart() and
+ *     conditionally UPDATE portfolios.start_date / starting_nav.
+ *     Only overwrites when the existing values are CLEARLY STALE,
+ *     defined as:
+ *       starting_nav = 0 OR starting_nav IS NULL
+ *     This protects portfolios with deliberately-set historical
+ *     values (CMFB ₦14.6M, DON ₦21.5M) from being silently
+ *     overwritten, while fixing broker-first portfolios where
+ *     starting_nav was left at 0 at creation time.
+ *     Non-fatal — same pattern as holdings rebuild.
+ *
  * Side effects on success:
  *   - transactions.source_file_id is set to the staged row's
  *     broker_file_id (FK column name differs across tables).
@@ -36,6 +50,9 @@
  *     backfilled onto the portfolio.
  *   - holdings for the portfolio are fully rebuilt from the
  *     current transactions history (v21d).
+ *   - portfolio.start_date and starting_nav are inferred from
+ *     transactions if the existing starting_nav is 0 or NULL
+ *     (v21g-hotfix-1).
  *
  * Guards:
  *   - 409 if any broker_file in the session is already
@@ -44,7 +61,7 @@
  *     missing from the instruments master table.
  *
  * Returns { ok, committed, skipped, broker_files, holdings_rebuild,
- *           elapsed_ms } on success;
+ *           metadata_backfill, elapsed_ms } on success;
  * { error, missing_instruments?, hint? } on failure.
  *
  * Next.js 15: params is a Promise.
@@ -54,6 +71,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { NGX_TICKER_ALIASES } from '@/lib/market-data'
 import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
+import { inferPortfolioStart } from '@/lib/portfolio-metadata'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -305,6 +323,131 @@ export async function POST(
     //     are the source of truth; holdings are a derived cache.
     const holdingsRebuild = await rebuildPortfolioHoldings(db, portfolio_id)
 
+    // 11. v21g-hotfix-1: Infer and (conditionally) backfill
+    //     portfolios.start_date and starting_nav.
+    //
+    //     Trigger condition: existing starting_nav is 0 or NULL.
+    //     This captures portfolios that were created through the
+    //     broker-first flow with the zero-NAV-is-fine default but
+    //     never had their metadata reconciled with the transactions
+    //     the broker commit wrote.
+    //
+    //     Protection: portfolios with a deliberately-set non-zero
+    //     starting_nav (e.g. CMFB ₦14.6M, DON ₦21.5M from historical
+    //     reconstructions) are left alone — their start_date may
+    //     still be later than their earliest transaction but that's
+    //     a conscious design (start_date = "relationship began")
+    //     which we don't want to silently overwrite.
+    //
+    //     Non-fatal: same pattern as holdings rebuild.
+
+    let metadataBackfill: {
+      attempted: boolean
+      applied: boolean
+      reason: string
+      previous?: { start_date: string; starting_nav: number }
+      updated?: { start_date: string; starting_nav: number; method: string }
+      error?: string
+    } = {
+      attempted: false,
+      applied: false,
+      reason: 'not evaluated',
+    }
+
+    try {
+      const { data: portfolioRow, error: pfErr } = await db
+        .from('portfolios')
+        .select('start_date, starting_nav')
+        .eq('id', portfolio_id)
+        .single()
+
+      if (pfErr) {
+        metadataBackfill = {
+          attempted: true,
+          applied: false,
+          reason: `could not read portfolio row: ${pfErr.message}`,
+          error: pfErr.message,
+        }
+      } else {
+        const currentNav = Number(portfolioRow?.starting_nav ?? 0)
+        const isStale = currentNav === 0 || portfolioRow?.starting_nav === null
+
+        if (!isStale) {
+          metadataBackfill = {
+            attempted: true,
+            applied: false,
+            reason: `starting_nav=${currentNav} is non-zero — deliberate value preserved`,
+            previous: {
+              start_date: portfolioRow.start_date,
+              starting_nav: currentNav,
+            },
+          }
+        } else {
+          // Fire the inference.
+          metadataBackfill.attempted = true
+          const inferResult = await inferPortfolioStart(db, portfolio_id)
+
+          if (!inferResult.ok || !inferResult.inferred) {
+            metadataBackfill = {
+              attempted: true,
+              applied: false,
+              reason: `inference failed: ${inferResult.error ?? 'unknown'}`,
+              error: inferResult.error,
+              previous: {
+                start_date: portfolioRow.start_date,
+                starting_nav: currentNav,
+              },
+            }
+          } else {
+            const inferred = inferResult.inferred
+            const { error: updatePfErr } = await db
+              .from('portfolios')
+              .update({
+                start_date: inferred.start_date,
+                starting_nav: inferred.starting_nav,
+                updated_at: new Date().toISOString(),
+              })
+              .eq('id', portfolio_id)
+
+            if (updatePfErr) {
+              metadataBackfill = {
+                attempted: true,
+                applied: false,
+                reason: `UPDATE failed: ${updatePfErr.message}`,
+                error: updatePfErr.message,
+                previous: {
+                  start_date: portfolioRow.start_date,
+                  starting_nav: currentNav,
+                },
+              }
+            } else {
+              metadataBackfill = {
+                attempted: true,
+                applied: true,
+                reason: `stale metadata (starting_nav was ${currentNav}) — backfilled from transactions`,
+                previous: {
+                  start_date: portfolioRow.start_date,
+                  starting_nav: currentNav,
+                },
+                updated: {
+                  start_date: inferred.start_date,
+                  starting_nav: inferred.starting_nav,
+                  method: inferred.method,
+                },
+              }
+            }
+          }
+        }
+      }
+    } catch (e: any) {
+      metadataBackfill = {
+        attempted: true,
+        applied: false,
+        reason: `unexpected error: ${e.message || 'unknown'}`,
+        error: e.message,
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       committed,
@@ -316,6 +459,7 @@ export async function POST(
         skipped_no_instrument: holdingsRebuild.skipped_no_instrument,
         errors: holdingsRebuild.errors,
       },
+      metadata_backfill: metadataBackfill,
       elapsed_ms: Date.now() - started,
     })
   } catch (err: any) {
