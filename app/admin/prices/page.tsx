@@ -163,10 +163,10 @@ export default function MarketPricesPage() {
       // Save instrument name if changed
       if (editName.trim() && editName.trim() !== editing.name) {
         saves.push(
-          supabase
+          (supabase
             .from('instruments')
             .update({ name: editName.trim() })
-            .eq('instrument_id', editing.instrument_id)
+            .eq('instrument_id', editing.instrument_id) as any as Promise<any>)
         )
       }
 
