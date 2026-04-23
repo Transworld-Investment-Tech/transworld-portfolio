@@ -291,6 +291,7 @@ export async function POST(req: NextRequest) {
           ...errors,
           'No contract notes parsed — cannot reconcile or stage transactions',
         ],
+        upload_session_id: uploadSessionId,
         elapsed_ms: Date.now() - started,
       },
       { status: 200 }
@@ -407,7 +408,7 @@ async function uploadPdf(
       size_bytes: file.size,
       parse_status: 'pending',
       uploaded_by,
-      upload_session_id,
+      upload_session_id: uploadSessionId,
       created_at: now,
       updated_at: now,
     })
