@@ -1,50 +1,17 @@
 /**
- * app/api/broker/upload/route.ts — v21c-hotfix-3
+ * app/api/broker/upload/route.ts — v21l
  *
- * The ingestion pipeline for broker PDFs. POST multipart/form-data:
- *   - portfolio_id: UUID of target portfolio
- *   - contract_notes: one PDF (required)
- *   - statements: zero or more PDFs
- *   - uploaded_by: optional text identifier
+ * v21c-hotfix-3 baseline + v21l DB-driven alias map.
  *
- * For each file:
- *   1. Uploads raw bytes to Supabase Storage bucket `broker-files`
- *   2. Creates a broker_files row (parse_status = 'pending')
- *   3. Runs the v21a parser on the bytes
- *   4. Updates broker_files with parse results + audit outcome
+ * v21l change: Replace hardcoded NGX_TICKER_ALIASES lookup with
+ * getAliasMap(db) which loads the ticker_aliases DB table and merges
+ * it on top of the hardcoded fallback. The alias map is loaded once
+ * at the start of the POST handler and passed through buildStagedRows
+ * so any alias added via /admin/aliases takes effect on the next upload
+ * without a code deploy. The hardcoded map remains active as a permanent
+ * fallback if the DB is unavailable.
  *
- * After all files are parsed, runs the reconciler across them and
- * writes the reconciled output as staged_transactions rows — one
- * per CN row (aggregated across partial-fill splits) plus one per
- * cash event. The staged rows are the preview that the inbox UI
- * shows before commit.
- *
- * Returns the broker_file IDs, staged row count, the reconciler
- * summary, AND the upload_session_id so the caller (e.g. the
- * /admin/broker/new form) can redirect to the session detail page.
- *
- * v21b-3b-hotfix-1: Applies NGX_TICKER_ALIASES when writing staged
- * instrument_id values (e.g. FBNH → FIRSTHOLDCO, MOBIL → MRS).
- * Broker PDFs may still use pre-merge symbols; staged rows must
- * land under the canonical instrument_id to commit cleanly.
- * Aliasing happens at the staged-write boundary, NOT inside the
- * parser — parsers stay pure, returning raw-extracted data.
- *
- * v21c-hotfix-3: Two fixes to the POST handler's response:
- *   (a) The success return now includes `upload_session_id:
- *       uploadSessionId` — previously missing entirely. Without it,
- *       the /admin/broker/new form couldn't redirect to the detail
- *       page after a successful upload.
- *   (b) Reverted a broken shorthand inside uploadPdf() at the
- *       broker_files insert payload — that helper's parameter is
- *       named `upload_session_id` (snake_case), so the parameter
- *       shorthand `upload_session_id,` is correct there. An earlier
- *       hotfix had replaced it with `upload_session_id:
- *       uploadSessionId,`, which referenced a name not in scope and
- *       broke the Vercel build.
- *
- * NO DEDUP in this release — v21d handles dedup via cn_number.
- * Accidental double-uploads create fresh staged rows.
+ * All other behaviour is unchanged from v21c-hotfix-3.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -59,7 +26,7 @@ import {
   type ContractNoteRow,
   type StatementRow,
 } from '@/lib/broker-parser'
-import { NGX_TICKER_ALIASES } from '@/lib/market-data'
+import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -99,6 +66,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: err.message }, { status: 500 })
   }
 
+  // v21l: Load alias map once at the top of the handler.
+  // getAliasMap merges DB entries on top of hardcoded NGX_TICKER_ALIASES.
+  const aliasMap = await getAliasMap(supabase)
+
   // ── Parse form ───────────────────────────────────────────
   let form: FormData
   try {
@@ -111,9 +82,9 @@ export async function POST(req: NextRequest) {
   }
 
   const portfolio_id = form.get('portfolio_id')
-  const uploaded_by = form.get('uploaded_by')
-  const cnField = form.get('contract_notes')
-  const stFields = form.getAll('statements')
+  const uploaded_by  = form.get('uploaded_by')
+  const cnField      = form.get('contract_notes')
+  const stFields     = form.getAll('statements')
 
   if (typeof portfolio_id !== 'string' || !portfolio_id) {
     return NextResponse.json({ error: 'portfolio_id is required' }, { status: 400 })
@@ -141,9 +112,9 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const errors: string[] = []
+  const errors: string[]         = []
   const uploadedFiles: UploadedFile[] = []
-  const timestamp = Date.now()
+  const timestamp       = Date.now()
   const uploadSessionId = randomUUID()
 
   // ── Upload + parse contract notes ────────────────────────
@@ -166,30 +137,26 @@ export async function POST(req: NextRequest) {
       cnBrokerFileId = up.broker_file_id
       const status: Partial<UploadedFile> = {
         broker_file_id: up.broker_file_id,
-        kind: 'contract_notes',
-        filename: cnField.name,
-        storage_path: up.storage_path,
-        parse_status: 'pending',
+        kind:           'contract_notes',
+        filename:       cnField.name,
+        storage_path:   up.storage_path,
+        parse_status:   'pending',
       }
 
       try {
-        const buf = Buffer.from(await cnField.arrayBuffer())
-        parsedCN = await parseContractNotesPdf(buf)
+        const buf  = Buffer.from(await cnField.arrayBuffer())
+        parsedCN   = await parseContractNotesPdf(buf)
 
-        const parse_status = parsedCN.parse_errors.length
-          ? 'parse_failed'
-          : 'parsed'
+        const parse_status = parsedCN.parse_errors.length ? 'parse_failed' : 'parsed'
         await supabase
           .from('broker_files')
           .update({
-            parsed_at: new Date().toISOString(),
+            parsed_at:      new Date().toISOString(),
             parse_status,
-            parse_error: parsedCN.parse_errors.length
-              ? parsedCN.parse_errors.join('; ')
-              : null,
+            parse_error:    parsedCN.parse_errors.length ? parsedCN.parse_errors.join('; ') : null,
             account_holder: parsedCN.account_holder || null,
-            cscs_number: parsedCN.cscs_number || null,
-            updated_at: new Date().toISOString(),
+            cscs_number:    parsedCN.cscs_number    || null,
+            updated_at:     new Date().toISOString(),
           })
           .eq('id', up.broker_file_id)
 
@@ -203,12 +170,12 @@ export async function POST(req: NextRequest) {
           .from('broker_files')
           .update({
             parse_status: 'parse_failed',
-            parse_error: err.message,
-            updated_at: new Date().toISOString(),
+            parse_error:  err.message,
+            updated_at:   new Date().toISOString(),
           })
           .eq('id', up.broker_file_id)
         status.parse_status = 'parse_failed'
-        status.parse_error = err.message
+        status.parse_error  = err.message
         errors.push(`contract_notes parse: ${err.message}`)
         parsedCN = null
       }
@@ -218,8 +185,8 @@ export async function POST(req: NextRequest) {
   }
 
   // ── Upload + parse each statement ────────────────────────
-  const parsedStatements: ParsedStatement[] = []
-  const statementBrokerFileIds: string[] = []
+  const parsedStatements: ParsedStatement[]   = []
+  const statementBrokerFileIds: string[]      = []
 
   for (const file of statementFiles) {
     const up = await uploadPdf(
@@ -238,14 +205,14 @@ export async function POST(req: NextRequest) {
 
     const status: Partial<UploadedFile> = {
       broker_file_id: up.broker_file_id,
-      kind: 'statement',
-      filename: file.name,
-      storage_path: up.storage_path,
-      parse_status: 'pending',
+      kind:           'statement',
+      filename:       file.name,
+      storage_path:   up.storage_path,
+      parse_status:   'pending',
     }
 
     try {
-      const buf = Buffer.from(await file.arrayBuffer())
+      const buf    = Buffer.from(await file.arrayBuffer())
       const parsed = await parseStatementPdf(buf)
       parsedStatements.push(parsed)
       statementBrokerFileIds.push(up.broker_file_id)
@@ -254,20 +221,18 @@ export async function POST(req: NextRequest) {
       await supabase
         .from('broker_files')
         .update({
-          parsed_at: new Date().toISOString(),
+          parsed_at:      new Date().toISOString(),
           parse_status,
-          parse_error: parsed.parse_errors.length
-            ? parsed.parse_errors.join('; ')
-            : null,
+          parse_error:    parsed.parse_errors.length ? parsed.parse_errors.join('; ') : null,
           account_holder: parsed.account_holder || null,
-          cscs_number: parsed.cscs_number || null,
-          period_from: parsed.period.from || null,
-          period_to: parsed.period.to || null,
-          audit_opening: parsed.opening_balance,
-          audit_closing: parsed.closing_balance,
+          cscs_number:    parsed.cscs_number    || null,
+          period_from:    parsed.period.from    || null,
+          period_to:      parsed.period.to      || null,
+          audit_opening:  parsed.opening_balance,
+          audit_closing:  parsed.closing_balance,
           audit_computed: parsed.audit.computed_closing,
-          audit_passes: parsed.audit.passes,
-          updated_at: new Date().toISOString(),
+          audit_passes:   parsed.audit.passes,
+          updated_at:     new Date().toISOString(),
         })
         .eq('id', up.broker_file_id)
 
@@ -281,12 +246,12 @@ export async function POST(req: NextRequest) {
         .from('broker_files')
         .update({
           parse_status: 'parse_failed',
-          parse_error: err.message,
-          updated_at: new Date().toISOString(),
+          parse_error:  err.message,
+          updated_at:   new Date().toISOString(),
         })
         .eq('id', up.broker_file_id)
       status.parse_status = 'parse_failed'
-      status.parse_error = err.message
+      status.parse_error  = err.message
       errors.push(`${file.name} parse: ${err.message}`)
     }
 
@@ -298,15 +263,12 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(
       {
         ok: false,
-        portfolio: { id: portfolio.id, name: portfolio.name, label: portfolio.label },
-        broker_files: uploadedFiles,
-        staged_count: 0,
-        errors: [
-          ...errors,
-          'No contract notes parsed — cannot reconcile or stage transactions',
-        ],
+        portfolio:      { id: portfolio.id, name: portfolio.name, label: portfolio.label },
+        broker_files:   uploadedFiles,
+        staged_count:   0,
+        errors:         [...errors, 'No contract notes parsed — cannot reconcile or stage transactions'],
         upload_session_id: uploadSessionId,
-        elapsed_ms: Date.now() - started,
+        elapsed_ms:     Date.now() - started,
       },
       { status: 200 }
     )
@@ -314,13 +276,15 @@ export async function POST(req: NextRequest) {
 
   const reconciliation = reconcile(parsedCN, parsedStatements)
 
+  // v21l: pass aliasMap into buildStagedRows
   const stagedRows = buildStagedRows(
     parsedCN,
     parsedStatements,
     reconciliation,
     portfolio_id,
     cnBrokerFileId,
-    statementBrokerFileIds
+    statementBrokerFileIds,
+    aliasMap
   )
 
   let inserted = 0
@@ -339,17 +303,13 @@ export async function POST(req: NextRequest) {
   return NextResponse.json(
     {
       ok: errors.length === 0,
-      portfolio: {
-        id: portfolio.id,
-        name: portfolio.name,
-        label: portfolio.label,
-      },
-      broker_files: uploadedFiles,
-      staged_count: inserted,
+      portfolio:              { id: portfolio.id, name: portfolio.name, label: portfolio.label },
+      broker_files:           uploadedFiles,
+      staged_count:           inserted,
       reconciliation_summary: reconciliation.summary,
-      upload_session_id: uploadSessionId,
+      upload_session_id:      uploadSessionId,
       errors,
-      elapsed_ms: Date.now() - started,
+      elapsed_ms:             Date.now() - started,
     },
     { status: 200 }
   )
@@ -361,33 +321,25 @@ export async function GET() {
     endpoint: '/api/broker/upload',
     method: 'POST multipart/form-data',
     fields: {
-      portfolio_id: 'UUID of target portfolio (required)',
+      portfolio_id:   'UUID of target portfolio (required)',
       contract_notes: 'single PDF (required)',
-      statements: '0..N PDFs',
-      uploaded_by: 'optional text identifier',
+      statements:     '0..N PDFs',
+      uploaded_by:    'optional text identifier',
     },
-    example_curl: [
-      'curl -sS -X POST https://YOUR-DEPLOYMENT/api/broker/upload \\',
-      '  -F "portfolio_id=<uuid>" \\',
-      '  -F "contract_notes=@Contract_Notes.pdf" \\',
-      '  -F "statements=@Statement_1.pdf" \\',
-      '  -F "statements=@Statement_2.pdf"',
-    ].join('\n'),
-    returns:
-      'broker_files (array), staged_count, reconciliation_summary, upload_session_id, errors',
+    returns: 'broker_files (array), staged_count, reconciliation_summary, upload_session_id, errors',
   })
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
-// Resolve any ticker through NGX_TICKER_ALIASES. Handles post-merge
-// canonicalisation (FBNH → FIRSTHOLDCO, MOBIL → MRS, GUARANTY → GTCO)
-// so staged rows match the canonical instruments master.
-function aliasTicker(t: string | null | undefined): string | null {
-  if (t === null || t === undefined) return null
-  const up = String(t).toUpperCase()
-  if (up === '') return null
-  return NGX_TICKER_ALIASES[up] || up
+// v21l: alias resolution through the merged map (DB + hardcoded).
+// Previously called with hardcoded NGX_TICKER_ALIASES; now uses the
+// dynamic map loaded at handler start.
+function aliasTicker(
+  t: string | null | undefined,
+  aliasMap: Record<string, string>
+): string | null {
+  return applyAlias(t, aliasMap)
 }
 
 async function uploadPdf(
@@ -417,15 +369,15 @@ async function uploadPdf(
     .from('broker_files')
     .insert({
       portfolio_id,
-      file_kind: kind,
+      file_kind:         kind,
       original_filename: file.name,
       storage_path,
-      size_bytes: file.size,
-      parse_status: 'pending',
+      size_bytes:        file.size,
+      parse_status:      'pending',
       uploaded_by,
       upload_session_id,
-      created_at: now,
-      updated_at: now,
+      created_at:        now,
+      updated_at:        now,
     })
     .select('id')
     .single()
@@ -450,10 +402,10 @@ function mapReconKind(
   k: 'exact' | 'split' | 'partial_mismatch' | 'unmatched'
 ): 'matched_exact' | 'matched_split' | 'partial_mismatch' | 'unmatched' {
   switch (k) {
-    case 'exact': return 'matched_exact'
-    case 'split': return 'matched_split'
+    case 'exact':            return 'matched_exact'
+    case 'split':            return 'matched_split'
     case 'partial_mismatch': return 'partial_mismatch'
-    case 'unmatched': return 'unmatched'
+    case 'unmatched':        return 'unmatched'
   }
 }
 
@@ -463,13 +415,16 @@ function extractReference(narration: string): string | null {
   return `${m[1].toUpperCase()} ${m[2]}`
 }
 
+// v21l: aliasMap parameter added so DB aliases flow through to every
+// instrument_id written to staged_transactions.
 function buildStagedRows(
   cn: ParsedContractNotes,
   statements: ParsedStatement[],
   rec: ReturnType<typeof reconcile>,
   portfolio_id: string,
   cnBrokerFileId: string,
-  statementBrokerFileIds: string[]
+  statementBrokerFileIds: string[],
+  aliasMap: Record<string, string>
 ): any[] {
   const rows: any[] = []
 
@@ -480,7 +435,7 @@ function buildStagedRows(
     let cnNumbers = ''
     let narration = ''
     if (match.statement_refs.length > 0) {
-      const parts: string[] = []
+      const parts: string[]     = []
       const narrParts: string[] = []
       for (const ref of match.statement_refs) {
         const sRow = statements[ref.statement_index]?.rows[ref.row_index]
@@ -495,64 +450,55 @@ function buildStagedRows(
     }
 
     rows.push({
-      broker_file_id: cnBrokerFileId,
+      broker_file_id:    cnBrokerFileId,
       portfolio_id,
-      trade_date: cnRow.trade_date,
-      settlement_date: cnRow.settlement_date,
-      action: cnRow.action,
-      // v21b-3b-hotfix-1: resolve ticker through NGX_TICKER_ALIASES so
-      // FBNH staged rows land as FIRSTHOLDCO, etc.
-      instrument_id: aliasTicker(cnRow.security_code),
-      quantity: cnRow.quantity,
-      price: cnRow.price,
-      gross_value: cnRow.consideration,
-      amount: cnRow.total,
-      fee_commission: cnRow.fee_commission,
-      fee_vat: cnRow.fee_vat,
-      fee_exchange: cnRow.fee_exchange,
-      fee_clearing: cnRow.fee_clearing,
-      fee_sec: cnRow.fee_sec,
+      trade_date:        cnRow.trade_date,
+      settlement_date:   cnRow.settlement_date,
+      action:            cnRow.action,
+      instrument_id:     aliasTicker(cnRow.security_code, aliasMap),
+      quantity:          cnRow.quantity,
+      price:             cnRow.price,
+      gross_value:       cnRow.consideration,
+      amount:            cnRow.total,
+      fee_commission:    cnRow.fee_commission,
+      fee_vat:           cnRow.fee_vat,
+      fee_exchange:      cnRow.fee_exchange,
+      fee_clearing:      cnRow.fee_clearing,
+      fee_sec:           cnRow.fee_sec,
       fee_contract_stamp: cnRow.fee_contract_stamp,
-      fee_sms: cnRow.fee_sms,
-      cn_number: cnNumbers || null,
+      fee_sms:           cnRow.fee_sms,
+      cn_number:         cnNumbers || null,
       narration,
-      recon_kind: mapReconKind(match.kind),
-      recon_note: match.note || null,
-      dedup_status: 'new',
+      recon_kind:        mapReconKind(match.kind),
+      recon_note:        match.note || null,
+      dedup_status:      'new',
       include_in_commit: true,
     })
   }
 
   // ── One staged row per cash event ──────────────────────────
   for (const ev of rec.cash_events) {
-    const brokerFileId =
-      statementBrokerFileIds[ev.statement_index] ?? cnBrokerFileId
+    const brokerFileId = statementBrokerFileIds[ev.statement_index] ?? cnBrokerFileId
     const sRow: StatementRow | undefined =
       statements[ev.statement_index]?.rows[ev.row_index]
     if (!sRow) continue
 
     const row: any = {
-      broker_file_id: brokerFileId,
+      broker_file_id:    brokerFileId,
       portfolio_id,
-      trade_date: ev.date,
-      action: ev.proposed_action,
-      amount: ev.amount,
-      narration: ev.narration,
-      recon_kind: 'cash_event_auto',
-      dedup_status: 'new',
+      trade_date:        ev.date,
+      action:            ev.proposed_action,
+      amount:            ev.amount,
+      narration:         ev.narration,
+      recon_kind:        'cash_event_auto',
+      dedup_status:      'new',
       include_in_commit: true,
     }
 
     switch (ev.kind) {
-      case 'management_fee':
-        row.fee_management = ev.amount
-        break
-      case 'demat_fee':
-        row.fee_demat = ev.amount
-        break
-      case 'bank_charge':
-        row.fee_other = ev.amount
-        break
+      case 'management_fee': row.fee_management = ev.amount; break
+      case 'demat_fee':      row.fee_demat      = ev.amount; break
+      case 'bank_charge':    row.fee_other       = ev.amount; break
     }
 
     const ref = extractReference(ev.narration)
@@ -561,30 +507,27 @@ function buildStagedRows(
     rows.push(row)
   }
 
-  // ── Orphan statement trades ──
+  // ── Orphan statement trades ──────────────────────────────
   for (const orphan of rec.orphan_statement_trades) {
-    const sRow =
-      statements[orphan.statement_index]?.rows[orphan.row_index]
+    const sRow = statements[orphan.statement_index]?.rows[orphan.row_index]
     if (!sRow) continue
-    const brokerFileId =
-      statementBrokerFileIds[orphan.statement_index] ?? cnBrokerFileId
+    const brokerFileId = statementBrokerFileIds[orphan.statement_index] ?? cnBrokerFileId
 
     rows.push({
-      broker_file_id: brokerFileId,
+      broker_file_id:    brokerFileId,
       portfolio_id,
-      trade_date: sRow.trans_date,
-      action: sRow.kind === 'trade_buy' ? 'BUY' : 'SELL',
-      // v21b-3b-hotfix-1: alias here too
-      instrument_id: aliasTicker(sRow.ticker),
-      quantity: sRow.quantity,
-      price: sRow.price,
-      amount: sRow.debit > 0 ? sRow.debit : sRow.credit,
-      cn_number: sRow.cn_number || null,
-      narration: sRow.narration,
-      recon_kind: 'unmatched',
-      recon_note: orphan.reason,
-      dedup_status: 'new',
-      include_in_commit: false, // default off for orphans — user reviews
+      trade_date:        sRow.trans_date,
+      action:            sRow.kind === 'trade_buy' ? 'BUY' : 'SELL',
+      instrument_id:     aliasTicker(sRow.ticker, aliasMap),
+      quantity:          sRow.quantity,
+      price:             sRow.price,
+      amount:            sRow.debit > 0 ? sRow.debit : sRow.credit,
+      cn_number:         sRow.cn_number || null,
+      narration:         sRow.narration,
+      recon_kind:        'unmatched',
+      recon_note:        orphan.reason,
+      dedup_status:      'new',
+      include_in_commit: false,
     })
   }
 

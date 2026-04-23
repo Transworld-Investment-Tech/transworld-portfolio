@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { fetchAllMarketData } from '@/lib/market-data'
+import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
 
 // v19: added GET handler for Vercel Cron.
 // v20h: write richer per-day data (OHLC, volume, trades, value, change_ngn)
@@ -9,21 +10,19 @@ import { fetchAllMarketData } from '@/lib/market-data'
 // v20i: instruments metadata path uses direct UPDATE instead of upsert
 //       (partial upsert would null out NOT NULL columns — pitfall #39).
 // v21i: Auto-register unknown NGX instruments.
-//       Previously, fetchAllMarketData was called with `validInstrumentIds`
-//       so only our 74 known tickers got prices; 78 NGX equities were
-//       silently dropped every run. Now:
-//       1. fetchAllMarketData() returns all ~146 NGX equities.
-//       2. Any ticker not yet in `instruments` is batch-upserted as a new
-//          instrument (approved=false, type=Stock, sleeve_id=eq). This
-//          makes them findable in holdings search immediately while keeping
-//          them out of the investment-universe until explicitly approved.
-//       3. Price upsert covers all instruments (known + newly registered).
-//       Response now includes `newlyRegistered` count.
+// v21l: DB-driven ticker alias map. After fetching quotes (which already
+//       have hardcoded NGX_TICKER_ALIASES applied by fetchNGXPrices),
+//       we apply a second alias pass using the DB table so any alias
+//       added via /admin/aliases takes effect on the next refresh without
+//       a code deploy. The hardcoded map remains as a permanent fallback.
 export const maxDuration = 60
 
 // ─── Shared work: the actual price refresh ──────────────────────────
 async function runPriceRefresh() {
   const db = supabaseAdmin()
+
+  // Load alias map from DB (merges on top of hardcoded NGX_TICKER_ALIASES).
+  const aliasMap = await getAliasMap(db)
 
   // Load all known instrument_ids for the auto-registration check.
   const { data: instruments, error: instErr } = await db
@@ -37,9 +36,10 @@ async function runPriceRefresh() {
   )
 
   // v21i: call without validInstrumentIds — get every equity NGX publishes.
-  const { quotes, fxRate, errors } = await fetchAllMarketData()
+  // fetchNGXPrices already applies the hardcoded NGX_TICKER_ALIASES.
+  const { quotes: rawQuotes, fxRate, errors } = await fetchAllMarketData()
 
-  if (quotes.length === 0) {
+  if (rawQuotes.length === 0) {
     return {
       status: 502,
       body: {
@@ -52,10 +52,18 @@ async function runPriceRefresh() {
     }
   }
 
+  // v21l: Apply DB alias pass to any quote whose instrument_id needs
+  // further remapping (e.g. aliases added via admin UI that aren't in
+  // the hardcoded map). No-op for tickers already aliased by fetchNGXPrices.
+  const quotes = rawQuotes.map(q => {
+    const remapped = applyAlias(q.instrument_id, aliasMap)
+    if (remapped && remapped !== q.instrument_id) {
+      return { ...q, instrument_id: remapped }
+    }
+    return q
+  })
+
   // ─── v21i: Auto-register unknown instruments ──────────────────────
-  // Any NGX ticker not yet in our instruments master gets inserted now.
-  // approved=false keeps them out of investment proposals; they are
-  // immediately searchable for manual portfolio building.
   const unknownQuotes = quotes.filter(
     (q) => !validInstrumentIds.has(q.instrument_id)
   )
@@ -64,7 +72,7 @@ async function runPriceRefresh() {
   if (unknownQuotes.length > 0) {
     const newInstruments = unknownQuotes.map((q) => ({
       instrument_id: q.instrument_id,
-      name:          q.name || q.instrument_id, // Company2 from API, fallback to ticker
+      name:          q.name || q.instrument_id,
       type:          'Stock',
       sleeve_id:     'eq',
       asset_class:   'Equity',
@@ -74,10 +82,6 @@ async function runPriceRefresh() {
       ngx_market:    q.ngx_market ?? null,
     }))
 
-    // upsert with ignoreDuplicates=true (ON CONFLICT DO NOTHING) — safe
-    // because we provide every NOT NULL column. If the batch fails for
-    // any reason we log and fall back to pricing only known instruments
-    // this run; the registration will be retried on the next refresh.
     const { error: regErr } = await (db.from('instruments') as any).upsert(
       newInstruments,
       { onConflict: 'instrument_id', ignoreDuplicates: true }
@@ -88,10 +92,8 @@ async function runPriceRefresh() {
         `[prices] auto-register ${unknownQuotes.length} new instruments failed:`,
         regErr.message
       )
-      // Leave validInstrumentIds unchanged; unknowns skipped this run.
     } else {
       newlyRegistered = unknownQuotes.length
-      // Add to valid set so price upsert covers them immediately.
       unknownQuotes.forEach((q) => validInstrumentIds.add(q.instrument_id))
       console.log(
         `[prices] auto-registered ${newlyRegistered} new instruments:`,
@@ -101,8 +103,6 @@ async function runPriceRefresh() {
   }
 
   // ─── market_prices upsert ─────────────────────────────────────────
-  // Only upsert prices for instruments that exist (known + newly registered).
-  // UNIQUE constraint on (instrument_id, price_date) — onConflict is safe here.
   const serverToday = new Date().toISOString().slice(0, 10)
 
   const quotesToUpsert = quotes.filter((q) =>
@@ -132,9 +132,6 @@ async function runPriceRefresh() {
   if (priceErr) throw priceErr
 
   // ─── instruments metadata updates (v20i) ──────────────────────────
-  // Sector and board classification are per-security, not per-day.
-  // Uses UPDATE (not upsert) to avoid nulling out NOT NULL columns
-  // (pitfall #39 / v20i header comment). Parallel UPDATEs are non-fatal.
   let metaUpdated = 0
   const metaErrors: string[] = []
 

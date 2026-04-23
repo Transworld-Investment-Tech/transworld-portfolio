@@ -1,75 +1,21 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v21g-hotfix-1
+ * app/api/broker/sessions/[id]/commit/route.ts — v21l
  *
- * POST /api/broker/sessions/[id]/commit
+ * v21g-hotfix-1 baseline + v21l DB-driven alias map.
  *
- * Moves all staged_transactions for this session where
- * include_in_commit = true into the real `transactions` table.
- * Then rebuilds the portfolio's holdings from its now-current
- * transaction history (v21d). Then backfills the portfolio's
- * start_date and starting_nav from transactions if they're stale
- * (v21g-hotfix-1).
+ * v21l change: Replace inline NGX_TICKER_ALIASES lookup in aliasTicker()
+ * with getAliasMap(db) + applyAlias(). The merged alias map (DB + hardcoded)
+ * is loaded once at handler start and used for the defensive second pass on
+ * every instrument_id being committed to transactions. Behaviour is
+ * identical to v21g-hotfix-1 for the existing hardcoded aliases; new DB
+ * aliases now also take effect on commit without a code deploy.
  *
- * v21b-3b-hotfix-1 additions:
- *   1. Defensive NGX_TICKER_ALIASES pass when mapping staged →
- *      transactions, so legacy staged rows (written before the
- *      upload-route alias fix) still commit cleanly.
- *   2. Pre-check: before INSERT, query `instruments` for every
- *      distinct instrument_id in the rows-to-commit. If any are
- *      missing from the master table, return a structured 400
- *      with `missing_instruments: string[]` so the UI can render
- *      a helpful error instead of a raw FK violation.
- *
- * v21d additions:
- *   - After a successful transactions INSERT (and before returning
- *     success), call rebuildPortfolioHoldings(). Recomputes the
- *     holdings table from the portfolio's full transaction history.
- *     Failure of the rebuild is surfaced as a warning in the
- *     response but does NOT cause the commit itself to fail —
- *     transactions have already been inserted and we don't want
- *     to roll them back over a holdings derivation issue.
- *
- * v21g-hotfix-1 additions:
- *   - After holdings rebuild, call inferPortfolioStart() and
- *     conditionally UPDATE portfolios.start_date / starting_nav.
- *     Only overwrites when the existing values are CLEARLY STALE,
- *     defined as:
- *       starting_nav = 0 OR starting_nav IS NULL
- *     This protects portfolios with deliberately-set historical
- *     values (CMFB ₦14.6M, DON ₦21.5M) from being silently
- *     overwritten, while fixing broker-first portfolios where
- *     starting_nav was left at 0 at creation time.
- *     Non-fatal — same pattern as holdings rebuild.
- *
- * Side effects on success:
- *   - transactions.source_file_id is set to the staged row's
- *     broker_file_id (FK column name differs across tables).
- *   - broker_files.parse_status transitions to 'committed'.
- *   - If the target portfolio has a NULL cscs_number and any
- *     broker_file in the session has one populated, it's
- *     backfilled onto the portfolio.
- *   - holdings for the portfolio are fully rebuilt from the
- *     current transactions history (v21d).
- *   - portfolio.start_date and starting_nav are inferred from
- *     transactions if the existing starting_nav is 0 or NULL
- *     (v21g-hotfix-1).
- *
- * Guards:
- *   - 409 if any broker_file in the session is already
- *     parse_status='committed'. Rollback first to re-commit.
- *   - 400 if any instrument_id on a to-be-committed row is
- *     missing from the instruments master table.
- *
- * Returns { ok, committed, skipped, broker_files, holdings_rebuild,
- *           metadata_backfill, elapsed_ms } on success;
- * { error, missing_instruments?, hint? } on failure.
- *
- * Next.js 15: params is a Promise.
+ * All other behaviour unchanged from v21g-hotfix-1.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
-import { NGX_TICKER_ALIASES } from '@/lib/market-data'
+import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
 import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 import { inferPortfolioStart } from '@/lib/portfolio-metadata'
 
@@ -81,9 +27,7 @@ function admin(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY
   if (!url || !key) {
-    throw new Error(
-      'Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars'
-    )
+    throw new Error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars')
   }
   return createClient(url, key, {
     auth: { autoRefreshToken: false, persistSession: false },
@@ -94,16 +38,6 @@ function sumNonNull(xs: Array<number | null | undefined>): number | null {
   const nn = xs.filter((x): x is number => x !== null && x !== undefined)
   if (nn.length === 0) return null
   return nn.reduce((a, b) => a + b, 0)
-}
-
-// Defensive second pass of the same alias resolution used at upload
-// time. Covers pre-hotfix staged rows that were written with raw
-// tickers (e.g. FBNH). No-op on rows that were already aliased.
-function aliasTicker(t: string | null | undefined): string | null {
-  if (t === null || t === undefined) return null
-  const up = String(t).toUpperCase()
-  if (up === '') return null
-  return NGX_TICKER_ALIASES[up] || up
 }
 
 export async function POST(
@@ -118,6 +52,9 @@ export async function POST(
     }
 
     const db = admin()
+
+    // v21l: Load merged alias map (DB + hardcoded) once at handler start.
+    const aliasMap = await getAliasMap(db)
 
     // 1. Fetch all broker_files in session.
     const { data: files, error: filesErr } = await db
@@ -144,7 +81,7 @@ export async function POST(
     }
 
     const portfolio_id = files[0].portfolio_id
-    const fileIds = files.map((f) => f.id)
+    const fileIds      = files.map((f) => f.id)
 
     // 3. Fetch staged rows to commit (include_in_commit=true).
     const { data: staged, error: stagedErr } = await db
@@ -177,53 +114,48 @@ export async function POST(
       .select('*', { count: 'exact', head: true })
       .in('broker_file_id', fileIds)
 
-    const total = totalStaged ?? toCommit.length
+    const total   = totalStaged ?? toCommit.length
     const skipped = total - toCommit.length
 
-    // 5. Build transactions rows — defensive alias pass on instrument_id.
+    // 5. Build transactions rows.
+    // v21l: defensive alias pass uses the merged aliasMap (DB + hardcoded).
+    // Covers pre-hotfix staged rows written with raw broker tickers AND any
+    // new aliases added via the admin UI after those rows were staged.
     const txRows = toCommit.map((s: any) => {
       const fees = sumNonNull([
-        s.fee_commission,
-        s.fee_vat,
-        s.fee_contract_stamp,
-        s.fee_exchange,
-        s.fee_clearing,
-        s.fee_sec,
-        s.fee_sms,
-        s.fee_management,
-        s.fee_demat,
-        s.fee_other,
+        s.fee_commission, s.fee_vat, s.fee_contract_stamp,
+        s.fee_exchange,   s.fee_clearing, s.fee_sec, s.fee_sms,
+        s.fee_management, s.fee_demat, s.fee_other,
       ])
       return {
-        portfolio_id: s.portfolio_id,
-        trade_date: s.trade_date,
-        action: s.action,
-        instrument_id: aliasTicker(s.instrument_id),
-        quantity: s.quantity,
-        price: s.price,
-        gross_value: s.gross_value,
-        amount: s.amount,
+        portfolio_id:       s.portfolio_id,
+        trade_date:         s.trade_date,
+        action:             s.action,
+        instrument_id:      applyAlias(s.instrument_id, aliasMap),
+        quantity:           s.quantity,
+        price:              s.price,
+        gross_value:        s.gross_value,
+        amount:             s.amount,
         fees,
-        fee_commission: s.fee_commission,
-        fee_vat: s.fee_vat,
+        fee_commission:     s.fee_commission,
+        fee_vat:            s.fee_vat,
         fee_contract_stamp: s.fee_contract_stamp,
-        fee_exchange: s.fee_exchange,
-        fee_clearing: s.fee_clearing,
-        fee_sec: s.fee_sec,
-        fee_sms: s.fee_sms,
-        fee_management: s.fee_management,
-        fee_demat: s.fee_demat,
-        fee_other: s.fee_other,
-        notes: s.narration,
-        cn_number: s.cn_number,
-        settlement_date: s.settlement_date,
-        external_ref: s.external_ref,
-        source_file_id: s.broker_file_id,
+        fee_exchange:       s.fee_exchange,
+        fee_clearing:       s.fee_clearing,
+        fee_sec:            s.fee_sec,
+        fee_sms:            s.fee_sms,
+        fee_management:     s.fee_management,
+        fee_demat:          s.fee_demat,
+        fee_other:          s.fee_other,
+        notes:              s.narration,
+        cn_number:          s.cn_number,
+        settlement_date:    s.settlement_date,
+        external_ref:       s.external_ref,
+        source_file_id:     s.broker_file_id,
       }
     })
 
-    // 6. PRE-CHECK: surface missing instruments as a structured 400
-    //    rather than letting PostgreSQL raise a cryptic FK violation.
+    // 6. PRE-CHECK: surface missing instruments as a structured 400.
     const distinctTickers = Array.from(
       new Set(
         txRows
@@ -246,7 +178,7 @@ export async function POST(
       }
 
       const foundSet = new Set((found || []).map((r: any) => r.instrument_id))
-      const missing = distinctTickers.filter((t) => !foundSet.has(t))
+      const missing  = distinctTickers.filter((t) => !foundSet.has(t))
 
       if (missing.length > 0) {
         return NextResponse.json(
@@ -281,23 +213,22 @@ export async function POST(
       .from('broker_files')
       .update({
         parse_status: 'committed',
-        updated_at: new Date().toISOString(),
+        updated_at:   new Date().toISOString(),
       })
       .in('id', fileIds)
 
     if (updErr) {
       return NextResponse.json(
         {
-          error: `broker_files status update failed: ${updErr.message}`,
+          error:   `broker_files status update failed: ${updErr.message}`,
           committed,
-          warning:
-            'Transactions were inserted but broker_files state not updated. Manual cleanup may be needed.',
+          warning: 'Transactions were inserted but broker_files state not updated. Manual cleanup may be needed.',
         },
         { status: 500 }
       )
     }
 
-    // 9. CSCS backfill on the portfolio (non-fatal if it errors).
+    // 9. CSCS backfill on the portfolio (non-fatal).
     try {
       const { data: portfolio } = await db
         .from('portfolios')
@@ -307,40 +238,15 @@ export async function POST(
       if (portfolio && !portfolio.cscs_number) {
         const firstCscs = files.find((f) => f.cscs_number)?.cscs_number
         if (firstCscs) {
-          await db
-            .from('portfolios')
-            .update({ cscs_number: firstCscs })
-            .eq('id', portfolio_id)
+          await db.from('portfolios').update({ cscs_number: firstCscs }).eq('id', portfolio_id)
         }
       }
-    } catch {
-      // best-effort; continue
-    }
+    } catch { /* best-effort */ }
 
-    // 10. v21d: Rebuild holdings from the portfolio's transaction
-    //     history. Non-fatal — if the rebuild errors, we surface it
-    //     as a warning but keep the commit successful. Transactions
-    //     are the source of truth; holdings are a derived cache.
+    // 10. v21d: Rebuild holdings.
     const holdingsRebuild = await rebuildPortfolioHoldings(db, portfolio_id)
 
-    // 11. v21g-hotfix-1: Infer and (conditionally) backfill
-    //     portfolios.start_date and starting_nav.
-    //
-    //     Trigger condition: existing starting_nav is 0 or NULL.
-    //     This captures portfolios that were created through the
-    //     broker-first flow with the zero-NAV-is-fine default but
-    //     never had their metadata reconciled with the transactions
-    //     the broker commit wrote.
-    //
-    //     Protection: portfolios with a deliberately-set non-zero
-    //     starting_nav (e.g. CMFB ₦14.6M, DON ₦21.5M from historical
-    //     reconstructions) are left alone — their start_date may
-    //     still be later than their earliest transaction but that's
-    //     a conscious design (start_date = "relationship began")
-    //     which we don't want to silently overwrite.
-    //
-    //     Non-fatal: same pattern as holdings rebuild.
-
+    // 11. v21g-hotfix-1: Infer and backfill portfolio start metadata.
     let metadataBackfill: {
       attempted: boolean
       applied: boolean
@@ -348,11 +254,7 @@ export async function POST(
       previous?: { start_date: string; starting_nav: number }
       updated?: { start_date: string; starting_nav: number; method: string }
       error?: string
-    } = {
-      attempted: false,
-      applied: false,
-      reason: 'not evaluated',
-    }
+    } = { attempted: false, applied: false, reason: 'not evaluated' }
 
     try {
       const { data: portfolioRow, error: pfErr } = await db
@@ -363,76 +265,58 @@ export async function POST(
 
       if (pfErr) {
         metadataBackfill = {
-          attempted: true,
-          applied: false,
+          attempted: true, applied: false,
           reason: `could not read portfolio row: ${pfErr.message}`,
           error: pfErr.message,
         }
       } else {
         const currentNav = Number(portfolioRow?.starting_nav ?? 0)
-        const isStale = currentNav === 0 || portfolioRow?.starting_nav === null
+        const isStale    = currentNav === 0 || portfolioRow?.starting_nav === null
 
         if (!isStale) {
           metadataBackfill = {
-            attempted: true,
-            applied: false,
+            attempted: true, applied: false,
             reason: `starting_nav=${currentNav} is non-zero — deliberate value preserved`,
-            previous: {
-              start_date: portfolioRow.start_date,
-              starting_nav: currentNav,
-            },
+            previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
           }
         } else {
-          // Fire the inference.
           metadataBackfill.attempted = true
           const inferResult = await inferPortfolioStart(db, portfolio_id)
 
           if (!inferResult.ok || !inferResult.inferred) {
             metadataBackfill = {
-              attempted: true,
-              applied: false,
+              attempted: true, applied: false,
               reason: `inference failed: ${inferResult.error ?? 'unknown'}`,
               error: inferResult.error,
-              previous: {
-                start_date: portfolioRow.start_date,
-                starting_nav: currentNav,
-              },
+              previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
             }
           } else {
             const inferred = inferResult.inferred
             const { error: updatePfErr } = await db
               .from('portfolios')
               .update({
-                start_date: inferred.start_date,
+                start_date:   inferred.start_date,
                 starting_nav: inferred.starting_nav,
-                updated_at: new Date().toISOString(),
+                updated_at:   new Date().toISOString(),
               })
               .eq('id', portfolio_id)
 
             if (updatePfErr) {
               metadataBackfill = {
-                attempted: true,
-                applied: false,
+                attempted: true, applied: false,
                 reason: `UPDATE failed: ${updatePfErr.message}`,
                 error: updatePfErr.message,
-                previous: {
-                  start_date: portfolioRow.start_date,
-                  starting_nav: currentNav,
-                },
+                previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
               }
             } else {
               metadataBackfill = {
-                attempted: true,
-                applied: true,
+                attempted: true, applied: true,
                 reason: `stale metadata (starting_nav was ${currentNav}) — backfilled from transactions`,
-                previous: {
-                  start_date: portfolioRow.start_date,
-                  starting_nav: currentNav,
-                },
+                previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
                 updated: {
-                  start_date: inferred.start_date,
+                  start_date:   inferred.start_date,
                   starting_nav: inferred.starting_nav,
-                  method: inferred.method,
+                  method:       inferred.method,
                 },
               }
             }
@@ -441,8 +325,7 @@ export async function POST(
       }
     } catch (e: any) {
       metadataBackfill = {
-        attempted: true,
-        applied: false,
+        attempted: true, applied: false,
         reason: `unexpected error: ${e.message || 'unknown'}`,
         error: e.message,
       }
@@ -454,10 +337,10 @@ export async function POST(
       skipped,
       broker_files: fileIds.length,
       holdings_rebuild: {
-        upserted: holdingsRebuild.upserted,
-        deleted: holdingsRebuild.deleted,
+        upserted:             holdingsRebuild.upserted,
+        deleted:              holdingsRebuild.deleted,
         skipped_no_instrument: holdingsRebuild.skipped_no_instrument,
-        errors: holdingsRebuild.errors,
+        errors:               holdingsRebuild.errors,
       },
       metadata_backfill: metadataBackfill,
       elapsed_ms: Date.now() - started,

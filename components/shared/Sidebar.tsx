@@ -66,7 +66,8 @@ export default function Sidebar({
     { href: '/admin', label: 'Admin panel', icon: '◉', exact: true },
     { href: '/admin/prices', label: 'Market prices', icon: '⟡' },
     { href: '/admin/broker', label: 'Broker files', icon: '▣' },
-    { href: '/watchlist', label: 'NGX Watchlist', icon: '❈' },
+    { href: '/watchlist',      label: 'NGX Watchlist',   icon: '❈' },
+  { href: '/admin/aliases', label: 'Ticker aliases',  icon: '⇄' },
   ]
 
   const portfolioNav = portfolioId ? [

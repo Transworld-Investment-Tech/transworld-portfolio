@@ -6,10 +6,11 @@ import { ArrowLeft, RefreshCw, Edit2, Search, AlertCircle, X, Save, Info, Downlo
 
 // v20e: Hybrid rewrite of the v17 Market Prices admin page.
 // v21h: Adds Prev close, Volume, and Trades columns to surface v20h data.
-// v21j-hotfix-2: HTML export. "Download HTML" button in header generates a
-//   self-contained styled HTML file of the current filtered view. Open in
-//   any browser and use File → Print → Save as PDF to produce a PDF.
-//   No server route required — generated client-side from live state.
+// v21j-hotfix-2: HTML export.
+// v21l: Add "Display name" field to the price override modal. Saves
+//   the instrument name directly to the instruments table via the anon
+//   Supabase client (authenticated users have full access per RLS policy).
+//   Name is saved in parallel with the manual price override.
 
 const STALE_DAYS = 3
 
@@ -59,20 +60,22 @@ function titleCase(s: string): string {
 }
 
 export default function MarketPricesPage() {
-  const [rows, setRows] = useState<Row[]>([])
-  const [loading, setLoading] = useState(true)
+  const [rows, setRows]             = useState<Row[]>([])
+  const [loading, setLoading]       = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshMsg, setRefreshMsg] = useState('')
-  const [search, setSearch] = useState('')
-  const [staleOnly, setStaleOnly] = useState(false)
-  const [heldOnly, setHeldOnly] = useState(false)
+  const [search, setSearch]         = useState('')
+  const [staleOnly, setStaleOnly]   = useState(false)
+  const [heldOnly, setHeldOnly]     = useState(false)
   const [sourceFilter, setSourceFilter] = useState<string>('all')
 
-  const [editing, setEditing] = useState<Row | null>(null)
+  // Override modal state
+  const [editing, setEditing]     = useState<Row | null>(null)
+  const [editName, setEditName]   = useState('')   // v21l
   const [editPrice, setEditPrice] = useState('')
-  const [editDate, setEditDate] = useState('')
+  const [editDate, setEditDate]   = useState('')
   const [editSaving, setEditSaving] = useState(false)
-  const [editError, setEditError] = useState('')
+  const [editError, setEditError]   = useState('')
 
   useEffect(() => { load() }, [])
 
@@ -100,19 +103,19 @@ export default function MarketPricesPage() {
       const p = priceMap.get(i.instrument_id)
       return {
         instrument_id: i.instrument_id,
-        name: i.name,
-        type: i.type,
-        sleeve_id: i.sleeve_id,
-        approved: i.approved,
-        sector: i.sector ?? null,
-        ngx_market: i.ngx_market ?? null,
-        price: p?.price !== undefined ? Number(p.price) : undefined,
-        day_change: p?.day_change !== undefined && p?.day_change !== null ? Number(p.day_change) : undefined,
-        prev_close: p?.prev_close !== undefined && p?.prev_close !== null ? Number(p.prev_close) : null,
-        volume: p?.volume !== undefined && p?.volume !== null ? Number(p.volume) : null,
-        trades: p?.trades !== undefined && p?.trades !== null ? Number(p.trades) : null,
-        price_date: p?.price_date,
-        source: p?.source,
+        name:          i.name,
+        type:          i.type,
+        sleeve_id:     i.sleeve_id,
+        approved:      i.approved,
+        sector:        i.sector    ?? null,
+        ngx_market:    i.ngx_market ?? null,
+        price:         p?.price !== undefined ? Number(p.price) : undefined,
+        day_change:    p?.day_change !== undefined && p?.day_change !== null ? Number(p.day_change) : undefined,
+        prev_close:    p?.prev_close !== undefined && p?.prev_close !== null ? Number(p.prev_close) : null,
+        volume:        p?.volume !== undefined && p?.volume !== null ? Number(p.volume) : null,
+        trades:        p?.trades !== undefined && p?.trades !== null ? Number(p.trades) : null,
+        price_date:    p?.price_date,
+        source:        p?.source,
         holdingsCount: holdingCounts.get(i.instrument_id) ?? 0,
       }
     })
@@ -125,7 +128,7 @@ export default function MarketPricesPage() {
     setRefreshing(true)
     setRefreshMsg('')
     try {
-      const res = await fetch('/api/prices', { method: 'POST' })
+      const res  = await fetch('/api/prices', { method: 'POST' })
       const data = await res.json().catch(() => ({}))
       if (!res.ok) {
         setRefreshMsg(`✗ ${data.error || 'Refresh failed'}`)
@@ -143,32 +146,66 @@ export default function MarketPricesPage() {
 
   function openEdit(row: Row) {
     setEditing(row)
+    setEditName(row.name)                                           // v21l
     setEditPrice(row.price !== undefined ? row.price.toString() : '')
     setEditDate(new Date().toISOString().slice(0, 10))
     setEditError('')
   }
 
-  async function saveManualPrice() {
+  // v21l: save name change (to instruments) + price override (to market_prices)
+  async function saveOverride() {
     if (!editing) return
     setEditSaving(true)
     setEditError('')
     try {
-      const res = await fetch('/api/prices/manual', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          instrument_id: editing.instrument_id,
-          price: Number(editPrice),
-          price_date: editDate,
-        }),
-      })
-      const data = await res.json().catch(() => ({}))
-      if (!res.ok) {
-        setEditError(data.error || 'Save failed')
-      } else {
-        setEditing(null)
-        await load()
+      const saves: Promise<any>[] = []
+
+      // Save instrument name if changed
+      if (editName.trim() && editName.trim() !== editing.name) {
+        saves.push(
+          supabase
+            .from('instruments')
+            .update({ name: editName.trim() })
+            .eq('instrument_id', editing.instrument_id)
+        )
       }
+
+      // Save manual price override if a price was entered
+      if (editPrice && Number(editPrice) > 0) {
+        saves.push(
+          fetch('/api/prices/manual', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              instrument_id: editing.instrument_id,
+              price:         Number(editPrice),
+              price_date:    editDate,
+            }),
+          }).then(r => r.json())
+        )
+      }
+
+      if (saves.length === 0) {
+        setEditing(null)
+        return
+      }
+
+      const results = await Promise.all(saves)
+      // Check for errors in any of the saves
+      for (const r of results) {
+        if (r?.error && typeof r.error === 'string') {
+          setEditError(r.error)
+          return
+        }
+        // Supabase returns {data, error}; fetch returns parsed JSON
+        if (r?.error && r.error?.message) {
+          setEditError(r.error.message)
+          return
+        }
+      }
+
+      setEditing(null)
+      await load()
     } catch (e) {
       setEditError((e as Error).message)
     } finally {
@@ -176,24 +213,22 @@ export default function MarketPricesPage() {
     }
   }
 
-  // v21j-hotfix-2: generate and download a styled HTML snapshot of the
-  // current filtered view. Open in browser → File → Print → Save as PDF.
   function downloadHTML() {
-    const today = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+    const today    = new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
     const fileDate = new Date().toISOString().slice(0, 10)
 
     const filterDesc = [
       search ? `Search: "${search}"` : null,
-      heldOnly ? 'Held only' : null,
+      heldOnly  ? 'Held only'          : null,
       staleOnly ? 'Stale/missing only' : null,
       sourceFilter !== 'all' ? `Source: ${sourceFilter}` : null,
     ].filter(Boolean).join(' · ') || 'All instruments'
 
     const tableRows = filtered.map(r => {
-      const stale = stalenessOf(r.price_date)
-      const dotColor = stale === 'fresh' ? '#2d6e4e' : stale === 'stale' ? '#a67c2a' : '#b8bcc5'
-      const dateColor = stale === 'stale' ? '#a67c2a' : stale === 'none' ? '#8a8f9a' : '#5c6573'
-      const rowStyle = r.holdingsCount > 0 ? '' : 'opacity:0.5'
+      const stale      = stalenessOf(r.price_date)
+      const dotColor   = stale === 'fresh' ? '#2d6e4e' : stale === 'stale' ? '#a67c2a' : '#b8bcc5'
+      const dateColor  = stale === 'stale' ? '#a67c2a' : stale === 'none' ? '#8a8f9a' : '#5c6573'
+      const rowStyle   = r.holdingsCount > 0 ? '' : 'opacity:0.5'
       const dayChgColor = r.day_change === undefined ? '#b8bcc5'
         : r.day_change > 0 ? '#2d6e4e'
         : r.day_change < 0 ? '#a63b3b'
@@ -203,7 +238,9 @@ export default function MarketPricesPage() {
         ? `<span style="font-size:9px;padding:1px 5px;border-radius:2px;margin-left:5px;background:${r.ngx_market === 'Premium Board' ? 'rgba(176,139,62,0.12)' : '#f0ead8'};color:${r.ngx_market === 'Premium Board' ? '#b08b3e' : '#8a8f9a'};border:1px solid #e0d8c8;font-weight:600;letter-spacing:.04em">${r.ngx_market === 'Premium Board' ? 'PREMIUM' : 'MAIN'}</span>`
         : ''
 
-      const sectorText = r.sector ? `<span style="color:#b8bcc5;margin-left:5px;font-family:sans-serif"> · ${titleCase(r.sector)}</span>` : ''
+      const sectorText = r.sector
+        ? `<span style="color:#b8bcc5;margin-left:5px;font-family:sans-serif"> · ${titleCase(r.sector)}</span>`
+        : ''
 
       return `<tr style="${rowStyle}">
   <td>
@@ -256,17 +293,12 @@ tbody td{padding:10px 12px;border-bottom:1px solid rgba(15,41,71,.05);vertical-a
 tbody tr:last-child td{border-bottom:none}
 td.num{text-align:right}
 .footer{margin-top:20px;font-size:10px;color:#b8bcc5;text-align:center;line-height:1.8}
-@media print{
-  body{background:#fff;padding:16px 20px}
-  .no-print{display:none}
-  table{border:1px solid #ccc}
-  @page{size:A4 landscape;margin:1cm}
-}
+@media print{body{background:#fff;padding:16px 20px}.no-print{display:none}table{border:1px solid #ccc}@page{size:A4 landscape;margin:1cm}}
 </style>
 </head>
 <body>
 <div class="no-print" style="background:#0a1f3a;color:#c9a556;padding:10px 20px;margin:-40px -48px 32px;font-size:11px;letter-spacing:.08em">
-  &#128438; To save as PDF: use File → Print → Change destination to "Save as PDF" → Landscape orientation → Save
+  &#128438; To save as PDF: File → Print → "Save as PDF" → Landscape orientation → Save
 </div>
 <div class="header">
   <div>
@@ -288,33 +320,24 @@ td.num{text-align:right}
 <table>
 <thead>
 <tr>
-  <th>Instrument</th>
-  <th>Type</th>
-  <th class="num">Prev close</th>
-  <th class="num">Price</th>
-  <th class="num">Day chg %</th>
-  <th class="num">Volume</th>
-  <th class="num">Trades</th>
-  <th>Source</th>
-  <th>As of</th>
-  <th class="num">Holdings</th>
+  <th>Instrument</th><th>Type</th><th class="num">Prev close</th><th class="num">Price</th>
+  <th class="num">Day chg %</th><th class="num">Volume</th><th class="num">Trades</th>
+  <th>Source</th><th>As of</th><th class="num">Holdings</th>
 </tr>
 </thead>
-<tbody>
-${tableRows}
-</tbody>
+<tbody>${tableRows}</tbody>
 </table>
 <div class="footer">
   Transworld Asset Management &nbsp;·&nbsp; Market Prices &nbsp;·&nbsp; ${today}<br>
-  Prices sourced from the Nigerian Exchange Group (NGX). For investment decision-making use only. Not for external distribution.
+  Prices sourced from the Nigerian Exchange Group (NGX). For investment decision-making use only.
 </div>
 </body>
 </html>`
 
     const blob = new Blob([html], { type: 'text/html;charset=utf-8' })
-    const url = URL.createObjectURL(blob)
-    const a = document.createElement('a')
-    a.href = url
+    const url  = URL.createObjectURL(blob)
+    const a    = document.createElement('a')
+    a.href     = url
     a.download = `Market Prices ${fileDate}.html`
     document.body.appendChild(a)
     a.click()
@@ -337,7 +360,7 @@ ${tableRows}
     return true
   })
 
-  const held = rows.filter(r => r.holdingsCount > 0)
+  const held           = rows.filter(r => r.holdingsCount > 0)
   const heldStaleCount = held.filter(r => stalenessOf(r.price_date) !== 'fresh').length
 
   return (
@@ -361,7 +384,6 @@ ${tableRows}
               {refreshMsg}
             </span>
           )}
-          {/* v21j-hotfix-2: HTML download */}
           <button className="btn-h" onClick={downloadHTML} disabled={loading || filtered.length === 0}>
             <Download size={12} /> Download HTML
           </button>
@@ -397,20 +419,12 @@ ${tableRows}
           <div style={{ position: 'relative', flex: 1, minWidth: 200, maxWidth: 320 }}>
             <Search size={12} style={{ position: 'absolute', left: 11, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }} />
             <input
-              type="text"
-              value={search}
-              onChange={e => setSearch(e.target.value)}
-              placeholder="Search by ticker or name…"
-              className="input-h input-h-sm"
+              type="text" value={search} onChange={e => setSearch(e.target.value)}
+              placeholder="Search by ticker or name…" className="input-h input-h-sm"
               style={{ paddingLeft: 32 }}
             />
           </div>
-          <select
-            value={sourceFilter}
-            onChange={e => setSourceFilter(e.target.value)}
-            className="select-h"
-            style={{ width: 180, padding: '5px 32px 5px 10px', fontSize: 12 }}
-          >
+          <select value={sourceFilter} onChange={e => setSourceFilter(e.target.value)} className="select-h" style={{ width: 180, padding: '5px 32px 5px 10px', fontSize: 12 }}>
             <option value="all">All sources</option>
             <option value="ngx">NGX (auto)</option>
             <option value="manual">Manual override</option>
@@ -456,10 +470,10 @@ ${tableRows}
               </thead>
               <tbody>
                 {filtered.map(r => {
-                  const stale = stalenessOf(r.price_date)
+                  const stale    = stalenessOf(r.price_date)
                   const dotColor = stale === 'fresh' ? 'var(--pos)' : stale === 'stale' ? 'var(--warn)' : 'var(--text-4)'
                   const dotTitle = stale === 'fresh' ? `Fresh (within ${STALE_DAYS} days)` : stale === 'stale' ? `Stale (older than ${STALE_DAYS} days)` : 'No price recorded'
-                  const isHeld = r.holdingsCount > 0
+                  const isHeld   = r.holdingsCount > 0
                   return (
                     <tr key={r.instrument_id} style={isHeld ? {} : { opacity: 0.55 }}>
                       <td>
@@ -467,13 +481,7 @@ ${tableRows}
                           <span style={{ fontWeight: 500 }}>{r.name}</span>
                           {r.ngx_market && (
                             <span
-                              style={{
-                                fontSize: 9, padding: '1px 6px', borderRadius: 2,
-                                background: r.ngx_market === 'Premium Board' ? 'var(--gold-soft)' : 'var(--bg-soft)',
-                                color: r.ngx_market === 'Premium Board' ? 'var(--gold)' : 'var(--text-3)',
-                                border: '1px solid var(--border)', fontWeight: 600,
-                                letterSpacing: '0.04em', whiteSpace: 'nowrap' as const,
-                              }}
+                              style={{ fontSize: 9, padding: '1px 6px', borderRadius: 2, background: r.ngx_market === 'Premium Board' ? 'var(--gold-soft)' : 'var(--bg-soft)', color: r.ngx_market === 'Premium Board' ? 'var(--gold)' : 'var(--text-3)', border: '1px solid var(--border)', fontWeight: 600, letterSpacing: '0.04em', whiteSpace: 'nowrap' as const }}
                               title={`NGX board: ${r.ngx_market}`}
                             >
                               {r.ngx_market === 'Premium Board' ? 'PREMIUM' : r.ngx_market === 'Main Board' ? 'MAIN' : r.ngx_market}
@@ -482,46 +490,23 @@ ${tableRows}
                         </div>
                         <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
                           {r.instrument_id}
-                          {r.sector && (
-                            <span style={{ color: 'var(--text-4)', marginLeft: 6, fontFamily: 'var(--font-sans)' }}>
-                              · {titleCase(r.sector)}
-                            </span>
-                          )}
+                          {r.sector && <span style={{ color: 'var(--text-4)', marginLeft: 6, fontFamily: 'var(--font-sans)' }}>· {titleCase(r.sector)}</span>}
                         </div>
                       </td>
-                      <td>
-                        <span style={{ fontSize: 10, color: 'var(--text-2)', textTransform: 'uppercase' as const, letterSpacing: '0.08em' }}>
-                          {r.type}
-                        </span>
-                      </td>
+                      <td><span style={{ fontSize: 10, color: 'var(--text-2)', textTransform: 'uppercase' as const, letterSpacing: '0.08em' }}>{r.type}</span></td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)', color: r.prev_close !== null && r.prev_close !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
-                        {r.prev_close !== null && r.prev_close !== undefined
-                          ? `₦${r.prev_close.toFixed(r.type === 'Stock' ? 2 : 4)}`
-                          : '—'}
+                        {r.prev_close !== null && r.prev_close !== undefined ? `₦${r.prev_close.toFixed(r.type === 'Stock' ? 2 : 4)}` : '—'}
                       </td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
                         {r.price !== undefined ? `₦${r.price.toFixed(r.type === 'Stock' ? 2 : 4)}` : <span style={{ color: 'var(--text-4)' }}>—</span>}
                       </td>
-                      <td
-                        className="num"
-                        style={{
-                          fontFamily: 'var(--font-mono)', fontSize: 12,
-                          color: r.day_change === undefined ? 'var(--text-4)' : r.day_change > 0 ? 'var(--pos)' : r.day_change < 0 ? 'var(--neg)' : 'var(--text-3)',
-                        }}
-                      >
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: r.day_change === undefined ? 'var(--text-4)' : r.day_change > 0 ? 'var(--pos)' : r.day_change < 0 ? 'var(--neg)' : 'var(--text-3)' }}>
                         {r.day_change !== undefined ? <>{r.day_change > 0 ? '+' : ''}{r.day_change.toFixed(2)}%</> : '—'}
                       </td>
-                      <td
-                        className="num"
-                        style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.volume !== null && r.volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
-                        title={r.volume !== null && r.volume !== undefined ? r.volume.toLocaleString() : undefined}
-                      >
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.volume !== null && r.volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }} title={r.volume !== null && r.volume !== undefined ? r.volume.toLocaleString() : undefined}>
                         {formatVolume(r.volume)}
                       </td>
-                      <td
-                        className="num"
-                        style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.trades !== null && r.trades !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
-                      >
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.trades !== null && r.trades !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
                         {r.trades !== null && r.trades !== undefined ? r.trades.toLocaleString() : '—'}
                       </td>
                       <td>
@@ -557,23 +542,23 @@ ${tableRows}
           <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
             Manual overrides write a row with <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>source='manual'</span>.
-            A later "Refresh from NGX" will overwrite the same (instrument, date) row if NGX publishes a price.
-            Use overrides for suspended tickers, transferred-in holdings, or securities NGX doesn't list.
+            A later NGX refresh will overwrite the same (instrument, date) row if NGX publishes a price.
             The HTML download respects active filters — use "Held only" to export a clean held-positions price sheet.
+            Instrument names edited here update the instruments master immediately.
           </span>
         </div>
       </div>
 
-      {/* Edit modal */}
+      {/* Override modal */}
       {editing && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: '0 16px' }}
           onClick={() => setEditing(null)}
         >
-          <div className="panel" style={{ maxWidth: 440, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
+          <div className="panel" style={{ maxWidth: 480, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 18 }}>
               <div>
-                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Manual price override</div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Manual override</div>
                 <div className="hybrid-serif" style={{ fontSize: 20, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>{editing.name}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>{editing.instrument_id} · {editing.type}</div>
               </div>
@@ -582,31 +567,71 @@ ${tableRows}
               </button>
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+              {/* Current price info */}
               {editing.price !== undefined ? (
                 <div style={{ fontSize: 11, color: 'var(--text-2)', background: 'var(--bg-soft)', borderRadius: 3, padding: '8px 12px', border: '1px solid var(--border-soft)' }}>
-                  <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.1em', marginBottom: 3 }}>Current</div>
+                  <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.1em', marginBottom: 3 }}>Current price</div>
                   <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>₦{editing.price.toFixed(editing.type === 'Stock' ? 2 : 4)}</span>{' · '}
                   <span style={{ fontFamily: 'var(--font-mono)', textTransform: 'uppercase' as const, fontSize: 10 }}>{editing.source}</span>{' · as of '}{formatDate(editing.price_date)}
                 </div>
               ) : (
                 <div className="alert-h alert-h-warn" style={{ fontSize: 11 }}>No price recorded yet for this instrument.</div>
               )}
+
+              {/* v21l: Display name field */}
               <div>
-                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>New price (₦)</label>
-                <input type="number" value={editPrice} onChange={e => setEditPrice(e.target.value)} step="0.01" className="input-h input-h-mono" autoFocus />
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Display name
+                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— updates instruments master</span>
+                </label>
+                <input
+                  type="text"
+                  value={editName}
+                  onChange={e => setEditName(e.target.value)}
+                  placeholder="Full instrument name"
+                  className="input-h"
+                />
               </div>
+
+              {/* Price field */}
               <div>
-                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>As of date</label>
-                <input type="date" value={editDate} onChange={e => setEditDate(e.target.value)} className="input-h input-h-mono" />
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  New price (₦)
+                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— leave blank to save name only</span>
+                </label>
+                <input
+                  type="number"
+                  value={editPrice}
+                  onChange={e => setEditPrice(e.target.value)}
+                  step="0.01"
+                  className="input-h input-h-mono"
+                  autoFocus
+                />
               </div>
+
+              {/* Date field */}
+              {editPrice && Number(editPrice) > 0 && (
+                <div>
+                  <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>As of date</label>
+                  <input type="date" value={editDate} onChange={e => setEditDate(e.target.value)} className="input-h input-h-mono" />
+                </div>
+              )}
+
               {editError && (
                 <div className="alert-h alert-h-critical" style={{ fontSize: 11 }}>
                   <AlertCircle size={11} style={{ flexShrink: 0, marginTop: 1 }} /><span>{editError}</span>
                 </div>
               )}
+
               <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
-                <button onClick={saveManualPrice} disabled={editSaving || !editPrice || Number(editPrice) <= 0} className="btn-h btn-h-primary" style={{ flex: 1, justifyContent: 'center' }}>
-                  <Save size={12} /> {editSaving ? 'Saving…' : 'Save override'}
+                <button
+                  onClick={saveOverride}
+                  disabled={editSaving || (!editName.trim() && (!editPrice || Number(editPrice) <= 0))}
+                  className="btn-h btn-h-primary"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
+                  <Save size={12} /> {editSaving ? 'Saving…' : 'Save changes'}
                 </button>
                 <button onClick={() => setEditing(null)} className="btn-h">Cancel</button>
               </div>
