@@ -78,7 +78,7 @@ function renderMd(md: string): string {
     .replace(/^(\d+)\. (.+)$/gm, '<li class="rpt-li rpt-oli">$1. $2</li>')
 
   // Wrap consecutive li elements in a ul
-  html = html.replace(/((?:<li class="rpt-li">.*?<\/li>\n?)+)/gs, '<ul class="rpt-ul">$1</ul>')
+  html = html.replace(/((?:<li class="rpt-li">.*?<\/li>\n?)+)/g,  '<ul class="rpt-ul">$1</ul>')
 
   // Lines that aren't block-level tags become paragraphs
   html = html.split('\n').map(line => {
