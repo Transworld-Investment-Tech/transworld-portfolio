@@ -265,7 +265,7 @@ Include any eagle-eye watchlist items approaching a trigger point.
 
   const response = await client.messages.create({
     model:      'claude-sonnet-4-20250514',
-    max_tokens: (reportType === 'annual' ? 5500 : reportType === 'quarterly' ? 4500 : reportType === 'monthly' ? 3500 : 2500),
+    max_tokens: (reportType === 'annual' ? 3500 : reportType === 'quarterly' ? 4500 : reportType === 'monthly' ? 3500 : 2500),
     messages:   [{ role: 'user', content: prompt }],
   } as any)
 
