@@ -22,6 +22,11 @@ import {
 // (allocation / market / transactions) and the redundant holdings/reports
 // tabs from the legacy implementation.
 //
+// v21g: Added Performance panel that surfaces IRR + period returns +
+// benchmarks from /api/analytics. Period selector defaults to ITD. All
+// nine periods supported (1W through ITD). Math lives in lib/analytics.ts
+// and has not been touched.
+//
 // Pitfall #7: the "Download report" button MUST remain in the header and
 // MUST call /api/export?portfolioId=... The apply-update.sh greps for it.
 
@@ -33,6 +38,39 @@ const SLEEVE_FILL: Record<string, string> = {
   liq: 'var(--sidebar-bg)',
   eq:  'linear-gradient(90deg, var(--gold), var(--gold-bright))',
   fi:  'var(--pos)',
+}
+
+// v21g: Period definitions mirror lib/analytics.ts PERIODS.
+// Kept locally to avoid importing the full analytics lib into a client component.
+const PERIOD_TABS: { key: string; label: string }[] = [
+  { key: '1W',  label: '1W'  },
+  { key: '1M',  label: '1M'  },
+  { key: '3M',  label: '3M'  },
+  { key: '6M',  label: '6M'  },
+  { key: '1Y',  label: '1Y'  },
+  { key: '2Y',  label: '2Y'  },
+  { key: '3Y',  label: '3Y'  },
+  { key: '5Y',  label: '5Y'  },
+  { key: 'ITD', label: 'ITD' },
+]
+
+function fmtPctSigned(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || isNaN(v)) return '—'
+  const s = (v * 100).toFixed(digits)
+  return (v >= 0 ? '+' : '') + s + '%'
+}
+
+function fmtPctPlain(v: number | null | undefined, digits = 2): string {
+  if (v === null || v === undefined || isNaN(v)) return '—'
+  return (v * 100).toFixed(digits) + '%'
+}
+
+// IRR-specific formatter: show nothing when null (caption explains why);
+// always show trailing " p.a." to reinforce that this is an annual rate.
+function fmtIRR(v: number | null | undefined, digits = 2): { value: string; hasValue: boolean } {
+  if (v === null || v === undefined || isNaN(v)) return { value: '—', hasValue: false }
+  const s = (v * 100).toFixed(digits)
+  return { value: (v >= 0 ? '+' : '') + s + '%', hasValue: true }
 }
 
 export default function PortfolioOverviewPage() {
@@ -50,6 +88,11 @@ export default function PortfolioOverviewPage() {
   const [divRefreshing, setDivRefreshing] = useState(false)
   const [divRefreshMsg, setDivRefreshMsg] = useState('')
   const [divFreshness, setDivFreshness] = useState<Date | null>(null)
+
+  // v21g: analytics state
+  const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('ITD')
+  const [analytics, setAnalytics] = useState<any>(null)
+  const [analyticsLoading, setAnalyticsLoading] = useState(false)
 
   const load = useCallback(async () => {
     const [portRes, holdRes, sleeveRes] = await Promise.all([
@@ -124,6 +167,17 @@ export default function PortfolioOverviewPage() {
       })
   }, [])
 
+  // v21g: fetch analytics whenever portfolio or selected period changes.
+  // Runs after initial portfolio load (loading=false) so we don't double-fire.
+  useEffect(() => {
+    if (!portfolioId || loading) return
+    setAnalyticsLoading(true)
+    fetch(`/api/analytics?portfolioId=${portfolioId}&period=${analyticsPeriod}`)
+      .then(r => r.json())
+      .then(d => { setAnalytics(d); setAnalyticsLoading(false) })
+      .catch(() => { setAnalyticsLoading(false) })
+  }, [portfolioId, analyticsPeriod, loading])
+
   async function refreshDividends() {
     setDivRefreshing(true); setDivRefreshMsg('')
     try {
@@ -196,6 +250,13 @@ export default function PortfolioOverviewPage() {
     if (days <= 14) return { cls: 'fresh', text: `Fresh · refreshed ${fmtDate}` }
     return { cls: 'stale', text: `Data ${days}d old · refreshed ${fmtDate}` }
   })()
+
+  // v21g: derived analytics values for display
+  const metrics = analytics?.period
+  const irrDisplay = fmtIRR(metrics?.irr)
+  const periodLabel = metrics?.periodLabel ?? PERIOD_TABS.find(t => t.key === analyticsPeriod)?.label ?? analyticsPeriod
+  const daysHeld = metrics?.daysHeld ?? null
+  const hasEnoughDataForIRR = metrics?.startNAV !== null && metrics?.startNAV !== undefined && metrics.startNAV > 0 && (daysHeld ?? 0) > 0
 
   return (
     <main
@@ -332,6 +393,335 @@ export default function PortfolioOverviewPage() {
               ) : ''}
             </div>
           </div>
+        </div>
+
+        {/* v21g: Performance panel — IRR + period returns + benchmarks */}
+        <div className="panel" style={{ marginBottom: 20 }}>
+          <div className="panel-header">
+            <div>
+              <div className="panel-title">Performance</div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                {metrics
+                  ? `${metrics.startDate} → ${metrics.endDate} · ${daysHeld ?? 0} days held`
+                  : 'Loading period metrics…'}
+              </div>
+            </div>
+            {/* Period tabs */}
+            <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              {PERIOD_TABS.map(t => {
+                const active = t.key === analyticsPeriod
+                return (
+                  <button
+                    key={t.key}
+                    onClick={() => setAnalyticsPeriod(t.key)}
+                    disabled={analyticsLoading}
+                    style={{
+                      padding: '5px 10px',
+                      fontSize: 11,
+                      fontWeight: 600,
+                      letterSpacing: '0.04em',
+                      fontFamily: 'var(--font-sans)',
+                      border: `1px solid ${active ? 'var(--gold)' : 'var(--border-strong)'}`,
+                      background: active ? 'var(--gold-soft)' : 'transparent',
+                      color: active ? 'var(--gold)' : 'var(--text-2)',
+                      borderRadius: 3,
+                      cursor: analyticsLoading ? 'wait' : 'pointer',
+                      transition: 'all 0.15s',
+                    }}
+                  >
+                    {t.label}
+                  </button>
+                )
+              })}
+            </div>
+          </div>
+
+          {/* Headline IRR + sub-metrics */}
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1.3fr 1fr 1fr 1fr',
+              gap: 24,
+              paddingBottom: 20,
+              borderBottom: '1px solid var(--border-soft)',
+              marginBottom: 18,
+            }}
+          >
+            {/* IRR */}
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  letterSpacing: '0.16em',
+                  fontWeight: 600,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase',
+                  marginBottom: 10,
+                }}
+              >
+                IRR ({periodLabel})
+              </div>
+              <div
+                className="hybrid-serif"
+                style={{
+                  fontSize: 44,
+                  fontWeight: 500,
+                  letterSpacing: '-0.015em',
+                  lineHeight: 1,
+                  color: irrDisplay.hasValue
+                    ? (metrics?.irr >= 0 ? 'var(--pos)' : 'var(--neg)')
+                    : 'var(--text-3)',
+                  marginBottom: 8,
+                }}
+              >
+                {irrDisplay.value}
+                {irrDisplay.hasValue && (
+                  <span
+                    style={{
+                      fontSize: 18,
+                      color: 'var(--text-2)',
+                      fontWeight: 400,
+                      marginLeft: 6,
+                      letterSpacing: '0.01em',
+                    }}
+                  >
+                    p.a.
+                  </span>
+                )}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)', lineHeight: 1.4 }}>
+                {irrDisplay.hasValue ? (
+                  'Money-weighted return, annualised'
+                ) : !hasEnoughDataForIRR ? (
+                  <span style={{ color: 'var(--warn)' }}>
+                    Need starting NAV &gt; 0 and ≥1 day held
+                  </span>
+                ) : (
+                  'Insufficient cashflow data for this period'
+                )}
+              </div>
+            </div>
+
+            {/* Period return */}
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  letterSpacing: '0.14em',
+                  fontWeight: 600,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase',
+                  marginBottom: 10,
+                }}
+              >
+                Period return
+              </div>
+              <div
+                className="hybrid-serif"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 500,
+                  letterSpacing: '-0.01em',
+                  color: metrics?.simplePeriodReturn !== null && metrics?.simplePeriodReturn !== undefined
+                    ? (metrics.simplePeriodReturn >= 0 ? 'var(--pos)' : 'var(--neg)')
+                    : 'var(--text-3)',
+                  marginBottom: 4,
+                }}
+              >
+                {fmtPctSigned(metrics?.simplePeriodReturn)}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                Un-annualised
+              </div>
+            </div>
+
+            {/* Absolute P&L */}
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  letterSpacing: '0.14em',
+                  fontWeight: 600,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase',
+                  marginBottom: 10,
+                }}
+              >
+                Absolute P&amp;L
+              </div>
+              <div
+                className="hybrid-serif"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 500,
+                  letterSpacing: '-0.01em',
+                  color: metrics?.absoluteReturn !== null && metrics?.absoluteReturn !== undefined
+                    ? (metrics.absoluteReturn >= 0 ? 'var(--pos)' : 'var(--neg)')
+                    : 'var(--text-3)',
+                  marginBottom: 4,
+                }}
+              >
+                {metrics?.absoluteReturn !== null && metrics?.absoluteReturn !== undefined
+                  ? `${metrics.absoluteReturn >= 0 ? '+' : '−'}${fmt.ngnM(Math.abs(metrics.absoluteReturn))}`
+                  : '—'}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                Net of external flows
+              </div>
+            </div>
+
+            {/* TWR — only shown when non-null */}
+            <div>
+              <div
+                style={{
+                  fontSize: 10,
+                  letterSpacing: '0.14em',
+                  fontWeight: 600,
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase',
+                  marginBottom: 10,
+                }}
+              >
+                TWR {metrics?.twrAnnualised !== null && metrics?.twrAnnualised !== undefined ? '(ann.)' : ''}
+              </div>
+              <div
+                className="hybrid-serif"
+                style={{
+                  fontSize: 22,
+                  fontWeight: 500,
+                  letterSpacing: '-0.01em',
+                  color: metrics?.twr !== null && metrics?.twr !== undefined && metrics.twr !== 0
+                    ? (metrics.twr >= 0 ? 'var(--pos)' : 'var(--neg)')
+                    : 'var(--text-3)',
+                  marginBottom: 4,
+                }}
+              >
+                {metrics?.twrAnnualised !== null && metrics?.twrAnnualised !== undefined
+                  ? fmtPctSigned(metrics.twrAnnualised)
+                  : fmtPctSigned(metrics?.twr)}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
+                Time-weighted
+                {daysHeld !== null && daysHeld <= 365 && metrics?.twr !== null
+                  ? ' · period return'
+                  : ''}
+              </div>
+            </div>
+          </div>
+
+          {/* Benchmarks row */}
+          <div>
+            <div
+              style={{
+                fontSize: 10,
+                letterSpacing: '0.14em',
+                fontWeight: 600,
+                color: 'var(--text-3)',
+                textTransform: 'uppercase',
+                marginBottom: 12,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+              }}
+            >
+              <span>Benchmarks ({periodLabel}, annual rate)</span>
+              {daysHeld !== null && daysHeld < 365 && (
+                <span
+                  style={{
+                    fontSize: 9,
+                    color: 'var(--text-3)',
+                    fontWeight: 400,
+                    letterSpacing: 0,
+                    textTransform: 'none',
+                    fontStyle: 'italic',
+                  }}
+                >
+                  Sub-year periods show annual equivalent for fair comparison
+                </span>
+              )}
+            </div>
+            <div
+              style={{
+                display: 'grid',
+                gridTemplateColumns: 'repeat(5, 1fr)',
+                gap: 12,
+              }}
+            >
+              {(metrics?.benchmarks ?? []).map((b: any) => (
+                <div
+                  key={b.shortName}
+                  style={{
+                    padding: '10px 12px',
+                    background: 'var(--bg-soft)',
+                    border: '1px solid var(--border-soft)',
+                    borderRadius: 4,
+                  }}
+                >
+                  <div
+                    style={{
+                      fontSize: 10,
+                      color: 'var(--text-3)',
+                      letterSpacing: '0.06em',
+                      fontWeight: 600,
+                      marginBottom: 4,
+                    }}
+                  >
+                    {b.shortName}
+                  </div>
+                  <div
+                    className="hybrid-serif"
+                    style={{
+                      fontSize: 16,
+                      fontWeight: 500,
+                      letterSpacing: '-0.005em',
+                      color: b.annualRate >= 0 ? 'var(--pos)' : 'var(--neg)',
+                    }}
+                  >
+                    {fmtPctSigned(b.annualRate, 1)}
+                  </div>
+                </div>
+              ))}
+              {(!metrics?.benchmarks || metrics.benchmarks.length === 0) && (
+                <div style={{ gridColumn: '1 / -1', fontSize: 11, color: 'var(--text-3)' }}>
+                  Benchmarks unavailable for this period
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Footer note: cashflows */}
+          {metrics && (metrics.inflows > 0 || metrics.outflows > 0) && (
+            <div
+              style={{
+                marginTop: 16,
+                paddingTop: 12,
+                borderTop: '1px solid var(--border-soft)',
+                display: 'flex',
+                gap: 24,
+                fontSize: 11,
+                color: 'var(--text-2)',
+              }}
+            >
+              <span>
+                Inflows:{' '}
+                <strong style={{ color: 'var(--text)' }}>
+                  {fmt.ngnM(metrics.inflows)}
+                </strong>
+              </span>
+              <span>
+                Outflows:{' '}
+                <strong style={{ color: 'var(--text)' }}>
+                  {fmt.ngnM(metrics.outflows)}
+                </strong>
+              </span>
+              <span>
+                Net:{' '}
+                <strong style={{ color: metrics.netCashFlows >= 0 ? 'var(--pos)' : 'var(--neg)' }}>
+                  {metrics.netCashFlows >= 0 ? '+' : '−'}{fmt.ngnM(Math.abs(metrics.netCashFlows))}
+                </strong>
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Two-col: allocation bars + donut */}
