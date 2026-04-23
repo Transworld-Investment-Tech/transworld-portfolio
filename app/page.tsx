@@ -14,6 +14,20 @@ import {
 // gold brand bars, Cormorant display type. Portfolio cards carry v19d's
 // zero-starting-nav safety (show "Awaiting transactions" / "built from
 // transactions" when starting_nav = 0).
+//
+// v21g-2: Filter out archived portfolios from the rendered list.
+// Supabase .eq('status', 'active') on the parent clients query does
+// NOT cascade into the embedded portfolios() relation, so the fetch
+// was returning all portfolios regardless of status. When a user
+// clicked archive, the API call succeeded (status → 'archived' in
+// DB) but the card stayed on screen, which felt like archive was
+// broken. Now we filter client-side when flattening into
+// `activePortfoliosByClient` so archived cards disappear immediately
+// after the reload.
+//
+// The archive API (/api/portfolios/[id] DELETE) itself is correct
+// and unchanged; v21g fixed the DB check constraint that was
+// previously blocking 'archived' as a value.
 
 const AUMBarChart = dynamic(() => import('@/components/portfolio/AUMBarChart'), { ssr: false })
 
@@ -51,7 +65,17 @@ export default function HomePage() {
 
     if (!data) { setLoading(false); return }
 
-    const allPortfolioIds = data.flatMap((c: any) => (c.portfolios || []).map((p: any) => p.id))
+    // v21g-2: filter embedded portfolios down to status='active' only.
+    // The parent .eq('status', 'active') on clients does not apply to
+    // the embed — this is the fix.
+    const clientsWithActivePortfolios = data.map((c: any) => ({
+      ...c,
+      portfolios: (c.portfolios || []).filter((p: any) => p.status === 'active'),
+    }))
+
+    const allPortfolioIds = clientsWithActivePortfolios.flatMap((c: any) =>
+      (c.portfolios || []).map((p: any) => p.id)
+    )
 
     const [holdingsRes, pricesRes] = await Promise.all([
       supabase.from('holdings').select('portfolio_id, instrument_id, quantity').in('portfolio_id', allPortfolioIds),
@@ -69,14 +93,14 @@ export default function HomePage() {
       navByPortfolio[h.portfolio_id] = (navByPortfolio[h.portfolio_id] ?? 0) + h.quantity * price
     }
     setNavMap(navByPortfolio)
-    setClients(data)
+    setClients(clientsWithActivePortfolios)
 
     const totalNAV = Object.values(navByPortfolio).reduce((s, v) => s + v, 0)
     setStats({
-      totalPortfolios: data.reduce((s: number, c: any) => s + (c.portfolios?.length || 0), 0),
-      totalNAV: totalNAV || data.reduce((s: number, c: any) =>
+      totalPortfolios: clientsWithActivePortfolios.reduce((s: number, c: any) => s + (c.portfolios?.length || 0), 0),
+      totalNAV: totalNAV || clientsWithActivePortfolios.reduce((s: number, c: any) =>
         s + (c.portfolios || []).reduce((ps: number, p: any) => ps + p.starting_nav, 0), 0),
-      activeClients: data.length,
+      activeClients: clientsWithActivePortfolios.length,
     })
     setLoading(false)
   }, [])

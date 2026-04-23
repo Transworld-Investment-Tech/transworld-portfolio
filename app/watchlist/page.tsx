@@ -10,10 +10,17 @@ import {
 // Preserves:
 //   • Internal two-pane layout (section tabs left · items right)
 //   • CRUD (/api/watchlist POST/PATCH/DELETE)
-//   • AI insight fetch (browser-side call to api.anthropic.com — unchanged)
 //   • Section colour coding via hybrid palette
 //   • Search, sort, filter logic
 // Sidebar is rendered by app/watchlist/layout.tsx — do NOT render here.
+//
+// v21g-2: AI insight fetch now routes through /api/watchlist/insight
+// (server-side proxy). The old code tried to call Anthropic directly
+// from the browser, which cannot work:
+// there is no safe way to expose the API key client-side, and
+// Anthropic does not send CORS headers permitting browser calls.
+// The new endpoint also enables web_search so insights include
+// current market context instead of only training-cutoff knowledge.
 
 type Section = 'all' | 'equity' | 'fixed_income' | 'other' | 'watch'
 
@@ -161,43 +168,43 @@ export default function WatchlistPage() {
     setAdding(false)
   }
 
-  async function fetchAIInsight(item: WatchItem) {
-    if (aiInsight[item.id]) { setExpanded(item.id); return }
+  // v21g-2: route through server-side /api/watchlist/insight endpoint
+  // so the Anthropic API key stays on the server and we can enable
+  // web_search for current market context.
+  //
+  // forceRefresh lets the "↻ Refresh" button bypass the cache without
+  // the old `item.id + '_refresh'` trick, which polluted aiInsight
+  // state with fake IDs.
+  async function fetchAIInsight(item: WatchItem, forceRefresh = false) {
+    if (aiInsight[item.id] && !forceRefresh) { setExpanded(item.id); return }
     setLoadingAI(item.id)
     setExpanded(item.id)
     try {
-      const res = await fetch('https://api.anthropic.com/v1/messages', {
+      const res = await fetch('/api/watchlist/insight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          model: 'claude-sonnet-4-20250514',
-          max_tokens: 600,
-          messages: [{
-            role: 'user',
-            content: `You are a Nigerian capital markets analyst at Transworld Asset Management, Lagos.
-Provide a brief, current market intelligence note for this security:
-
-Name: ${item.name}
-Ticker: ${item.ticker || 'N/A'}
-Type: ${item.section} ${item.sub_type ? '— ' + item.sub_type : ''}
-Watchlist rationale: ${item.rationale || 'N/A'}
-
-Write 3-4 sentences covering:
-1. Current market context / recent developments you know about
-2. Key metrics or yield (P/E, dividend yield, or bond yield as applicable)
-3. Key risk or opportunity to watch right now
-4. One specific catalyst or event to monitor
-
-Be specific and factual. Acknowledge if data is from training knowledge with approximate date.
-Write in plain text, no markdown headers.`
-          }],
-        })
+          name: item.name,
+          ticker: item.ticker,
+          section: item.section,
+          sub_type: item.sub_type,
+          rationale: item.rationale,
+        }),
       })
       const d = await res.json()
-      const text = d.content?.[0]?.text ?? 'No insight available.'
-      setAiInsight(prev => ({ ...prev, [item.id]: text }))
-    } catch {
-      setAiInsight(prev => ({ ...prev, [item.id]: 'Could not load AI insight at this time.' }))
+      if (d.ok && d.text) {
+        setAiInsight(prev => ({ ...prev, [item.id]: d.text }))
+      } else {
+        const errMsg = d.error
+          ? `Could not load AI insight: ${d.error}`
+          : 'Could not load AI insight at this time.'
+        setAiInsight(prev => ({ ...prev, [item.id]: errMsg }))
+      }
+    } catch (e: any) {
+      setAiInsight(prev => ({
+        ...prev,
+        [item.id]: `Could not load AI insight: ${e?.message || 'network error'}`,
+      }))
     }
     setLoadingAI(null)
   }
@@ -817,7 +824,7 @@ Write in plain text, no markdown headers.`
                                       animation: 'spin 0.7s linear infinite',
                                     }}
                                   />
-                                  Getting market intelligence…
+                                  Getting market intelligence… (web search can take ~20s)
                                 </div>
                               )}
                               {insight && (
@@ -843,9 +850,9 @@ Write in plain text, no markdown headers.`
                                       AI Market Intelligence
                                     </span>
                                   </div>
-                                  <p style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6 }}>{insight}</p>
+                                  <p style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6, whiteSpace: 'pre-wrap' as const }}>{insight}</p>
                                   <button
-                                    onClick={() => fetchAIInsight({ ...item, id: item.id + '_refresh' } as any)}
+                                    onClick={() => fetchAIInsight(item, true)}
                                     style={{
                                       marginTop: 8,
                                       fontSize: 10,
