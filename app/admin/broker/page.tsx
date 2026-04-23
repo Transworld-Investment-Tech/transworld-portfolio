@@ -1,12 +1,17 @@
 /**
- * app/admin/broker/page.tsx — v21b-3a
+ * app/admin/broker/page.tsx — v21c
  *
  * Broker upload sessions inbox. Lists all upload sessions (groups
  * of broker_files that were uploaded in a single POST) with summary
  * pills for parse status, audit, and staged row count.
  *
- * Read-only in v21b-3a. Interactive commit/rollback ships in
- * v21b-3b.
+ * v21c: Added "Upload broker files" button in page header and
+ * replaced the curl-command empty-state copy with a direct link
+ * to the new upload form at /admin/broker/new.
+ *
+ * Read-only sessions list. Per-row interactivity (commit/rollback,
+ * include_in_commit toggle) lives on the detail page at
+ * /admin/broker/[sessionId].
  *
  * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
  * render its own (pitfall #38).
@@ -82,6 +87,11 @@ export default function BrokerInboxPage() {
           <div className="eyebrow">Admin</div>
           <h1 className="hybrid-serif">Broker files</h1>
         </div>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Link href="/admin/broker/new" className="btn-h btn-h-primary">
+            Upload broker files
+          </Link>
+        </div>
       </div>
 
       <div className="panel">
@@ -103,25 +113,22 @@ export default function BrokerInboxPage() {
         {sessions !== null && sessions.length === 0 && !error && (
           <div
             style={{
-              padding: '32px 12px',
+              padding: '40px 12px',
               textAlign: 'center',
-              color: 'var(--text-3)',
+              color: 'var(--text-2)',
               fontSize: 13,
             }}
           >
-            No broker files have been uploaded yet. Use the{' '}
-            <code
-              style={{
-                fontFamily: 'DM Sans',
-                background: 'var(--bg-soft)',
-                padding: '1px 6px',
-                borderRadius: 3,
-                border: '1px solid var(--border-soft)',
-              }}
+            <div style={{ marginBottom: 12 }}>
+              No broker files have been uploaded yet.
+            </div>
+            <Link
+              href="/admin/broker/new"
+              className="btn-h btn-h-primary"
+              style={{ display: 'inline-block' }}
             >
-              /api/broker/upload
-            </code>{' '}
-            endpoint to ingest files.
+              Upload your first session
+            </Link>
           </div>
         )}
 
