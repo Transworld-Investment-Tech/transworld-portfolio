@@ -16,19 +16,24 @@ import {
 // v20c: Sidebar is rendered by app/portfolio/[id]/layout.tsx.
 // v20: Hybrid Portfolio Overview — single page, no internal tabs.
 // v21g: Performance panel surfaces IRR + period returns + benchmarks.
-// v21h: Sector Concentration panel surfaces NAV-weighted sector
-//   breakdown of held equities.
-// v21j: Excel export via SheetJS. "Export Excel" button added between
-//   "Live prices" and "Download report". Four-sheet workbook:
-//   Summary (KPIs + performance), Allocation (sleeve targets vs actuals),
-//   Holdings (all positions with market values), Dividends (if loaded).
+// v21h: Sector Concentration panel surfaces NAV-weighted sector breakdown.
+// v21j: Excel export via SheetJS.
+// v21n: KPI strip sub-labels fixed. "Current NAV" sub and "Unrealised P&L"
+//   sub now show ITD IRR p.a. (from the analytics route) instead of raw HPR.
+//   Raw HPR is misleading when large capital additions have been made since
+//   inception — e.g. a portfolio that started at ₦0.05M and received ₦9.6M
+//   in TRANSFER_IN shows a 20,090% HPR which is not the investment return.
+//   The correct metric is the money-weighted IRR which accounts for the timing
+//   and size of all cash flows. The Performance panel below has always been
+//   correct (it uses computePeriodMetrics with proper cash flows). The KPI
+//   strip sub-labels were the only place still showing raw HPR.
 //
 // Pitfall #7: the "Download report" button MUST remain in the header
 // and MUST call /api/export?portfolioId=... The apply-update.sh greps
 // for both "Download report" and "/api/export".
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
-const SectorDonut = dynamic(() => import('@/components/portfolio/SectorDonut'), { ssr: false })
+const SectorDonut     = dynamic(() => import('@/components/portfolio/SectorDonut'),     { ssr: false })
 
 const SLEEVE_FILL: Record<string, string> = {
   liq: 'var(--sidebar-bg)',
@@ -67,7 +72,7 @@ function buildSectorSlices(holdings: any[]): { slices: any[]; totalEquityNAV: nu
   const bySector = new Map<string, { value: number; count: number }>()
   for (const h of equities) {
     const sector = h.instrument?.sector || 'Unclassified'
-    const value = h.quantity * (h.latest_price ?? h.avg_cost ?? 0)
+    const value  = h.quantity * (h.latest_price ?? h.avg_cost ?? 0)
     if (value <= 0) continue
     const prev = bySector.get(sector) ?? { value: 0, count: 0 }
     bySector.set(sector, { value: prev.value + value, count: prev.count + 1 })
@@ -81,23 +86,23 @@ function buildSectorSlices(holdings: any[]): { slices: any[]; totalEquityNAV: nu
 }
 
 export default function PortfolioOverviewPage() {
-  const params = useParams()
+  const params      = useParams()
   const portfolioId = params.id as string
 
-  const [portfolio, setPortfolio] = useState<Portfolio | null>(null)
-  const [holdings, setHoldings] = useState<Holding[]>([])
-  const [sleeveDefs, setSleeveDefs] = useState<SleeveTarget[]>([])
-  const [loading, setLoading] = useState(true)
-  const [refreshing, setRefreshing] = useState(false)
-  const [fxRate, setFxRate] = useState<number>(1665)
-  const [dividends, setDividends] = useState<any>(null)
-  const [divLoading, setDivLoading] = useState(false)
+  const [portfolio, setPortfolio]       = useState<Portfolio | null>(null)
+  const [holdings, setHoldings]         = useState<Holding[]>([])
+  const [sleeveDefs, setSleeveDefs]     = useState<SleeveTarget[]>([])
+  const [loading, setLoading]           = useState(true)
+  const [refreshing, setRefreshing]     = useState(false)
+  const [fxRate, setFxRate]             = useState<number>(1665)
+  const [dividends, setDividends]       = useState<any>(null)
+  const [divLoading, setDivLoading]     = useState(false)
   const [divRefreshing, setDivRefreshing] = useState(false)
   const [divRefreshMsg, setDivRefreshMsg] = useState('')
   const [divFreshness, setDivFreshness] = useState<Date | null>(null)
 
   const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('ITD')
-  const [analytics, setAnalytics] = useState<any>(null)
+  const [analytics, setAnalytics]             = useState<any>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
 
   const load = useCallback(async () => {
@@ -106,7 +111,7 @@ export default function PortfolioOverviewPage() {
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId),
       supabase.from('sleeve_targets').select('*').eq('portfolio_id', portfolioId).order('sort_order'),
     ])
-    if (portRes.data) setPortfolio(portRes.data)
+    if (portRes.data)  setPortfolio(portRes.data)
     if (sleeveRes.data) setSleeveDefs(sleeveRes.data)
     if (holdRes.data) {
       const { data: prices } = await supabase
@@ -123,7 +128,7 @@ export default function PortfolioOverviewPage() {
       setHoldings(holdRes.data.map((h: any) => ({
         ...h,
         latest_price: priceMap[h.instrument_id]?.price ?? h.avg_cost,
-        day_change: priceMap[h.instrument_id]?.day_change ?? 0,
+        day_change:   priceMap[h.instrument_id]?.day_change ?? 0,
       })))
     }
     setLoading(false)
@@ -173,7 +178,7 @@ export default function PortfolioOverviewPage() {
     setDivRefreshing(true); setDivRefreshMsg('')
     try {
       const res = await fetch('/api/dividends/refresh', { method: 'POST' })
-      const d = await res.json()
+      const d   = await res.json()
       setDivRefreshMsg(d.ok ? `✓ ${d.message ?? 'refreshed'}` : 'Refresh failed')
       const r2 = await fetch(`/api/dividends?portfolioId=${portfolioId}`)
       setDividends(await r2.json())
@@ -205,34 +210,41 @@ export default function PortfolioOverviewPage() {
     )
   }
 
-  const tot = computeNAV(holdings)
-  const sv = computeSleeveData(holdings, sleeveDefs, tot)
+  const tot            = computeNAV(holdings)
+  const sv             = computeSleeveData(holdings, sleeveDefs, tot)
   const hasStartingNav = portfolio.starting_nav > 0
-  const pl = tot - portfolio.starting_nav
-  const ret = hasStartingNav ? pl / portfolio.starting_nav : 0
-  const incPA = dividends?.totalEstimatedIncome ?? estimatedIncomePA(holdings)
-  const alerts = complianceAlerts(portfolio as any, holdings as any, sv as any, tot)
+  const pl             = tot - portfolio.starting_nav
+  const ret            = hasStartingNav ? pl / portfolio.starting_nav : 0   // raw HPR — only used as fallback
+  const incPA          = dividends?.totalEstimatedIncome ?? estimatedIncomePA(holdings)
+  const alerts         = complianceAlerts(portfolio as any, holdings as any, sv as any, tot)
   const { slices: sectorSlices, totalEquityNAV } = buildSectorSlices(holdings)
+
+  // v21n: derive ITD IRR from analytics.allPeriods (loaded asynchronously).
+  // This is the correct headline return metric for the KPI strip sub-labels.
+  // Falls back gracefully: null while loading, null if not computable.
+  const itdAnalytics   = analytics?.allPeriods?.find((p: any) => p.period === 'ITD')
+  const itdIRR: number | null = itdAnalytics?.irr ?? null
+  const itdIRRDisplay  = fmtIRR(itdIRR)
 
   const divStaleInfo = (() => {
     if (!divFreshness) return { cls: 'none', text: 'Dividend data: never refreshed' }
-    const days = Math.floor((Date.now() - divFreshness.getTime()) / 86_400_000)
+    const days    = Math.floor((Date.now() - divFreshness.getTime()) / 86_400_000)
     const fmtDate = divFreshness.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' })
     if (days <= 14) return { cls: 'fresh', text: `Fresh · refreshed ${fmtDate}` }
     return { cls: 'stale', text: `Data ${days}d old · refreshed ${fmtDate}` }
   })()
 
-  const metrics = analytics?.period
-  const irrDisplay = fmtIRR(metrics?.irr)
-  const periodLabel = metrics?.periodLabel ?? PERIOD_TABS.find(t => t.key === analyticsPeriod)?.label ?? analyticsPeriod
-  const daysHeld = metrics?.daysHeld ?? null
+  const metrics          = analytics?.period
+  const irrDisplay       = fmtIRR(metrics?.irr)
+  const periodLabel      = metrics?.periodLabel ?? PERIOD_TABS.find(t => t.key === analyticsPeriod)?.label ?? analyticsPeriod
+  const daysHeld         = metrics?.daysHeld ?? null
   const hasEnoughDataForIRR = metrics?.startNAV !== null && metrics?.startNAV !== undefined && metrics.startNAV > 0 && (daysHeld ?? 0) > 0
 
   // v21j: Excel export — 4-sheet workbook
   function downloadExcel() {
     if (!portfolio) return
-    const wb = XLSX.utils.book_new()
-    const today = new Date().toLocaleDateString('en-GB')
+    const wb         = XLSX.utils.book_new()
+    const today      = new Date().toLocaleDateString('en-GB')
     const clientName = (portfolio as any).client?.name ?? ''
     const portfolioName = portfolio.name
 
@@ -247,7 +259,8 @@ export default function PortfolioOverviewPage() {
       ['Current NAV (₦)', tot],
       ['Starting NAV (₦)', portfolio.starting_nav ?? 0],
       ['Unrealised P&L (₦)', tot - (portfolio.starting_nav ?? 0)],
-      ['Total return', hasStartingNav ? ret : ''],
+      ['ITD IRR p.a.', itdIRR !== null ? itdIRR : ''],
+      ['Raw HPR (unadjusted)', hasStartingNav ? ret : ''],
       ['Est. income p.a. (₦)', incPA ?? 0],
       ['Income target', portfolio.income_target ?? ''],
       ['Start date', portfolio.start_date ?? ''],
@@ -277,7 +290,7 @@ export default function PortfolioOverviewPage() {
       'Target Value (₦)', 'Actual Value (₦)', 'Deviation (₦)', 'Status', 'Suggested',
     ]
     const allocRows = (sv as any[]).map((s: any) => {
-      const d = s.diff ?? 0
+      const d      = s.diff ?? 0
       const action = d > 50000 ? 'Buy' : d < -50000 ? 'Sell' : 'Hold'
       return [
         s.name,
@@ -304,10 +317,10 @@ export default function PortfolioOverviewPage() {
       'Market Value (₦)', 'Unrealised P&L (₦)', 'Weight %',
     ]
     const holdRows = (holdings as any[]).map(h => {
-      const p = h.latest_price ?? h.avg_cost ?? 1
-      const v = Number(h.quantity) * p
+      const p   = h.latest_price ?? h.avg_cost ?? 1
+      const v   = Number(h.quantity) * p
       const pnl = Number(h.quantity) * (p - Number(h.avg_cost))
-      const wt = tot > 0 ? Number((v / tot * 100).toFixed(2)) : 0
+      const wt  = tot > 0 ? Number((v / tot * 100).toFixed(2)) : 0
       return [
         h.instrument?.name ?? h.instrument_id,
         h.instrument_id,
@@ -316,10 +329,7 @@ export default function PortfolioOverviewPage() {
         h.sleeve_id ?? '',
         Number(h.quantity),
         Number(h.avg_cost),
-        p,
-        v,
-        pnl,
-        wt,
+        p, v, pnl, wt,
       ]
     })
     const holdWs = XLSX.utils.aoa_to_sheet([holdHeaders, ...holdRows])
@@ -384,7 +394,6 @@ export default function PortfolioOverviewPage() {
             <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
             {refreshing ? 'Fetching…' : 'Live prices'}
           </button>
-          {/* v21j: Excel export — sits between Live prices and Download report */}
           <button className="btn-h" onClick={downloadExcel}>
             <FileSpreadsheet size={12} /> Export Excel
           </button>
@@ -415,31 +424,77 @@ export default function PortfolioOverviewPage() {
         </div>
       )}
 
-      {/* KPI row */}
+      {/* ── KPI row ──────────────────────────────────────────────────────────
+          v21n: KPI 1 and KPI 3 sub-labels now show ITD IRR p.a. (the
+          money-weighted return from the analytics route) instead of raw HPR.
+          Raw HPR = (currentNAV − startingNAV) / startingNAV is misleading
+          when large capital additions have been made. IRR accounts for the
+          timing and size of every cash flow. The large Performance panel
+          below has always been correct; only these two sub-labels needed fixing.
+      ─────────────────────────────────────────────────────────────────────── */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 28 }}>
+
+        {/* KPI 1: Current NAV */}
         <div className="h-kpi">
           <div className="h-kpi-label">Current NAV</div>
           <div className={`h-kpi-value ${tot > 0 ? 'pos' : ''}`}>{fmt.ngnM(tot)}</div>
           <div className="h-kpi-sub">
-            {hasStartingNav ? (
-              <><span className={ret >= 0 ? 'delta-pos' : 'delta-neg'}>{ret >= 0 ? '▲' : '▼'} {(ret * 100).toFixed(2)}%</span>{' '}vs starting</>
-            ) : ('Built from transactions')}
+            {/* v21n: show ITD IRR p.a. as the return sub-label.
+                While analytics loads or if IRR not computable, fall back
+                to a plain "vs starting" label without a misleading percentage. */}
+            {analyticsLoading && !analytics ? (
+              <span style={{ color: 'var(--text-4)' }}>Loading IRR…</span>
+            ) : itdIRRDisplay.hasValue ? (
+              <>
+                <span className={itdIRR! >= 0 ? 'delta-pos' : 'delta-neg'}>
+                  {itdIRR! >= 0 ? '▲' : '▼'} {itdIRRDisplay.value} p.a.
+                </span>
+                {' '}IRR (ITD)
+              </>
+            ) : hasStartingNav ? (
+              <span style={{ color: 'var(--text-3)', fontSize: 10 }}>
+                vs ₦{fmt.ngnM(portfolio.starting_nav)} starting
+              </span>
+            ) : (
+              'Built from transactions'
+            )}
           </div>
         </div>
+
+        {/* KPI 2: Starting NAV — unchanged */}
         <div className="h-kpi">
           <div className="h-kpi-label">Starting NAV</div>
           <div className="h-kpi-value">{hasStartingNav ? fmt.ngnM(portfolio.starting_nav) : '—'}</div>
           <div className="h-kpi-sub">Inception {fmt.date(portfolio.start_date)}</div>
         </div>
+
+        {/* KPI 3: Unrealised P&L
+            The ₦ absolute value is correct: (currentNAV − startingNAV).
+            v21n: sub-label now shows IRR p.a. instead of raw HPR %.
+            The raw HPR % was misleading — see comment on KPI 1. */}
         <div className="h-kpi">
           <div className="h-kpi-label">Unrealised P&amp;L</div>
-          <div className={`h-kpi-value ${pl >= 0 ? 'pos' : 'neg'}`}>{pl >= 0 ? '+' : ''}{fmt.ngnM(pl)}</div>
+          <div className={`h-kpi-value ${pl >= 0 ? 'pos' : 'neg'}`}>
+            {pl >= 0 ? '+' : ''}{fmt.ngnM(pl)}
+          </div>
           <div className="h-kpi-sub">
-            {hasStartingNav ? (
-              <span className={pl >= 0 ? 'delta-pos' : 'delta-neg'}>{pl >= 0 ? '+' : ''}{(ret * 100).toFixed(2)}% return</span>
-            ) : ('No reference basis')}
+            {analyticsLoading && !analytics ? (
+              <span style={{ color: 'var(--text-4)' }}>Loading IRR…</span>
+            ) : itdIRRDisplay.hasValue ? (
+              <span className={itdIRR! >= 0 ? 'delta-pos' : 'delta-neg'}>
+                {itdIRRDisplay.value} p.a. IRR
+              </span>
+            ) : hasStartingNav ? (
+              <span style={{ color: 'var(--text-3)', fontSize: 10 }}>
+                net gain over starting capital
+              </span>
+            ) : (
+              'No reference basis'
+            )}
           </div>
         </div>
+
+        {/* KPI 4: Est. Income — unchanged */}
         <div className="h-kpi">
           <div className="h-kpi-label">Est. Income p.a.</div>
           <div className="h-kpi-value accent">{fmt.ngnM(incPA || 0)}</div>
@@ -452,7 +507,7 @@ export default function PortfolioOverviewPage() {
         </div>
       </div>
 
-      {/* Performance panel (v21g) */}
+      {/* Performance panel (v21g) — unchanged, was always correct */}
       <div className="panel" style={{ marginBottom: 20 }}>
         <div className="panel-header">
           <div>
@@ -581,13 +636,13 @@ export default function PortfolioOverviewPage() {
             <div className="panel-meta">{sv.length} Sleeves</div>
           </div>
           {sv.map((s: any) => {
-            const act = (s.act ?? 0) * 100
+            const act    = (s.act ?? 0) * 100
             const target = (s.target_pct ?? 0) * 100
-            const min = (s.min_pct ?? 0) * 100
-            const max = (s.max_pct ?? 1) * 100
+            const min    = (s.min_pct ?? 0) * 100
+            const max    = (s.max_pct ?? 1) * 100
             const status = s.status === 'OK' || s.status === 'ok' ? 'ok' : s.status === 'BREACH' || s.status === 'breach' ? 'breach' : 'warn'
             const pillClass = status === 'ok' ? 'pill pill-ok' : status === 'breach' ? 'pill pill-breach' : 'pill pill-warn'
-            const fill = SLEEVE_FILL[s.sleeve_id] ?? 'var(--text-4)'
+            const fill   = SLEEVE_FILL[s.sleeve_id] ?? 'var(--text-4)'
             return (
               <div key={s.sleeve_id} className="sleeve-bar-row">
                 <div className="sleeve-bar-head">
@@ -650,8 +705,8 @@ export default function PortfolioOverviewPage() {
           </thead>
           <tbody>
             {sv.map((s: any) => {
-              const d = s.diff ?? 0
-              const action = d > 50000 ? 'Buy' : d < -50000 ? 'Sell' : 'Hold'
+              const d          = s.diff ?? 0
+              const action     = d > 50000 ? 'Buy' : d < -50000 ? 'Sell' : 'Hold'
               const actionPill = action === 'Buy' ? 'pill pill-buy' : action === 'Sell' ? 'pill pill-sell' : 'pill pill-hold'
               const statusPill = s.status === 'OK' ? 'pill pill-ok' : s.status === 'BREACH' ? 'pill pill-breach' : 'pill pill-warn'
               const sleeveColor = s.sleeve_id === 'liq' ? 'var(--sidebar-bg)' : s.sleeve_id === 'eq' ? 'var(--gold)' : 'var(--pos)'
