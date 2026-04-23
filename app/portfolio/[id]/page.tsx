@@ -230,6 +230,7 @@ export default function PortfolioOverviewPage() {
 
   // v21j: Excel export — 4-sheet workbook
   function downloadExcel() {
+    if (!portfolio) return
     const wb = XLSX.utils.book_new()
     const today = new Date().toLocaleDateString('en-GB')
     const clientName = (portfolio as any).client?.name ?? ''
