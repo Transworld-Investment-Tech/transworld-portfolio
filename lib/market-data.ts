@@ -175,13 +175,20 @@ export async function fetchNGXPrices(): Promise<Quote[]> {
     const rawSymbol = cleanBracketSuffix((row.Symbol || '').trim().toUpperCase())
     if (!rawSymbol) continue
 
-    // ClosePrice must be a positive number. Suspended / untraded equities
-    // come through with null or zero ClosePrice and are skipped.
-    const price = num(row.ClosePrice)
+    // v21j-hotfix-3: use PrevClosingPrice as fallback when ClosePrice is
+    // null or zero. Many NGX equities show "--" for Close on days where
+    // they didn't trade (low-volume names, market-making halts, etc.).
+    // Previously those rows were silently dropped, causing ~34 securities
+    // to never be registered. Now they are priced at their last known
+    // close. day_change is forced to 0 when using the fallback — no trade
+    // means no movement to report.
+    const closePrice = num(row.ClosePrice)
+    const prevClose  = num(row.PrevClosingPrice)
+    const price = (closePrice !== null && closePrice > 0) ? closePrice : prevClose
     if (price === null || price <= 0) continue
 
-    // PercChange is nullable on zero-volume days; treat as 0.
-    const pct = num(row.PercChange)
+    // PercChange is only meaningful when the stock actually traded today.
+    const pct = (closePrice !== null && closePrice > 0) ? num(row.PercChange) : null
     const day_change = pct === null ? 0 : pct
 
     const instrument_id = NGX_TICKER_ALIASES[rawSymbol] || rawSymbol
