@@ -1,16 +1,24 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v21b-3b
+ * app/api/broker/sessions/[id]/commit/route.ts — v21b-3b-hotfix-1
  *
  * POST /api/broker/sessions/[id]/commit
  *
  * Moves all staged_transactions for this session where
  * include_in_commit = true into the real `transactions` table.
  *
- * Side effects:
+ * v21b-3b-hotfix-1 additions:
+ *   1. Defensive NGX_TICKER_ALIASES pass when mapping staged →
+ *      transactions, so legacy staged rows (written before the
+ *      upload-route alias fix) still commit cleanly.
+ *   2. Pre-check: before INSERT, query `instruments` for every
+ *      distinct instrument_id in the rows-to-commit. If any are
+ *      missing from the master table, return a structured 400
+ *      with `missing_instruments: string[]` so the UI can render
+ *      a helpful error instead of a raw FK violation.
+ *
+ * Side effects on success:
  *   - transactions.source_file_id is set to the staged row's
- *     broker_file_id (the FK column name differs across the two
- *     tables — staged uses broker_file_id, transactions uses
- *     source_file_id).
+ *     broker_file_id (FK column name differs across tables).
  *   - broker_files.parse_status transitions to 'committed'.
  *   - If the target portfolio has a NULL cscs_number and any
  *     broker_file in the session has one populated, it's
@@ -19,14 +27,18 @@
  * Guards:
  *   - 409 if any broker_file in the session is already
  *     parse_status='committed'. Rollback first to re-commit.
+ *   - 400 if any instrument_id on a to-be-committed row is
+ *     missing from the instruments master table.
  *
- * Returns { ok, committed, skipped, broker_files, elapsed_ms }.
+ * Returns { ok, committed, skipped, broker_files, elapsed_ms }
+ * on success; { error, missing_instruments?, hint? } on failure.
  *
  * Next.js 15: params is a Promise.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
+import { NGX_TICKER_ALIASES } from '@/lib/market-data'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -49,6 +61,16 @@ function sumNonNull(xs: Array<number | null | undefined>): number | null {
   const nn = xs.filter((x): x is number => x !== null && x !== undefined)
   if (nn.length === 0) return null
   return nn.reduce((a, b) => a + b, 0)
+}
+
+// Defensive second pass of the same alias resolution used at upload
+// time. Covers pre-hotfix staged rows that were written with raw
+// tickers (e.g. FBNH). No-op on rows that were already aliased.
+function aliasTicker(t: string | null | undefined): string | null {
+  if (t === null || t === undefined) return null
+  const up = String(t).toUpperCase()
+  if (up === '') return null
+  return NGX_TICKER_ALIASES[up] || up
 }
 
 export async function POST(
@@ -125,7 +147,7 @@ export async function POST(
     const total = totalStaged ?? toCommit.length
     const skipped = total - toCommit.length
 
-    // 5. Build transactions rows.
+    // 5. Build transactions rows — defensive alias pass on instrument_id.
     const txRows = toCommit.map((s: any) => {
       const fees = sumNonNull([
         s.fee_commission,
@@ -143,7 +165,7 @@ export async function POST(
         portfolio_id: s.portfolio_id,
         trade_date: s.trade_date,
         action: s.action,
-        instrument_id: s.instrument_id,
+        instrument_id: aliasTicker(s.instrument_id),
         quantity: s.quantity,
         price: s.price,
         gross_value: s.gross_value,
@@ -163,13 +185,49 @@ export async function POST(
         cn_number: s.cn_number,
         settlement_date: s.settlement_date,
         external_ref: s.external_ref,
-        // staged.broker_file_id → transactions.source_file_id (column
-        // name differs between the two tables; the value is the same).
         source_file_id: s.broker_file_id,
       }
     })
 
-    // 6. Insert into transactions.
+    // 6. PRE-CHECK: surface missing instruments as a structured 400
+    //    rather than letting PostgreSQL raise a cryptic FK violation.
+    const distinctTickers = Array.from(
+      new Set(
+        txRows
+          .map((r) => r.instrument_id)
+          .filter((t): t is string => typeof t === 'string' && t.length > 0)
+      )
+    )
+
+    if (distinctTickers.length > 0) {
+      const { data: found, error: lookupErr } = await db
+        .from('instruments')
+        .select('instrument_id')
+        .in('instrument_id', distinctTickers)
+
+      if (lookupErr) {
+        return NextResponse.json(
+          { error: `instruments lookup: ${lookupErr.message}` },
+          { status: 500 }
+        )
+      }
+
+      const foundSet = new Set((found || []).map((r: any) => r.instrument_id))
+      const missing = distinctTickers.filter((t) => !foundSet.has(t))
+
+      if (missing.length > 0) {
+        return NextResponse.json(
+          {
+            error: `Commit blocked: ${missing.length} ticker${missing.length === 1 ? '' : 's'} not in instruments master.`,
+            missing_instruments: missing,
+            hint: 'Add these tickers to the instruments table (INSERT via SQL or admin UI), then retry commit.',
+          },
+          { status: 400 }
+        )
+      }
+    }
+
+    // 7. Insert into transactions.
     let committed = 0
     if (txRows.length > 0) {
       const { data: inserted, error: insErr } = await db
@@ -185,7 +243,7 @@ export async function POST(
       committed = inserted?.length || 0
     }
 
-    // 7. Transition broker_files.parse_status → 'committed'.
+    // 8. Transition broker_files.parse_status → 'committed'.
     const { error: updErr } = await db
       .from('broker_files')
       .update({
@@ -206,7 +264,7 @@ export async function POST(
       )
     }
 
-    // 8. CSCS backfill on the portfolio (non-fatal if it errors).
+    // 9. CSCS backfill on the portfolio (non-fatal if it errors).
     try {
       const { data: portfolio } = await db
         .from('portfolios')

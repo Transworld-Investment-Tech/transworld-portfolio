@@ -1,5 +1,5 @@
 /**
- * app/api/broker/upload/route.ts — v21b-2
+ * app/api/broker/upload/route.ts — v21b-3b-hotfix-1
  *
  * The ingestion pipeline for broker PDFs. POST multipart/form-data:
  *   - portfolio_id: UUID of target portfolio
@@ -17,14 +17,20 @@
  * writes the reconciled output as staged_transactions rows — one
  * per CN row (aggregated across partial-fill splits) plus one per
  * cash event. The staged rows are the preview that the inbox UI
- * (v21b-3) will show before commit.
+ * shows before commit.
  *
  * Returns the broker_file IDs, staged row count, and the reconciler
  * summary so the caller can confirm what landed.
  *
+ * v21b-3b-hotfix-1: Applies NGX_TICKER_ALIASES when writing staged
+ * instrument_id values (e.g. FBNH → FIRSTHOLDCO, MOBIL → MRS).
+ * Broker PDFs may still use pre-merge symbols; staged rows must
+ * land under the canonical instrument_id to commit cleanly.
+ * Aliasing happens at the staged-write boundary, NOT inside the
+ * parser — parsers stay pure, returning raw-extracted data.
+ *
  * NO DEDUP in this release — v21d handles dedup via cn_number.
- * Accidental double-uploads create fresh staged rows; user can
- * delete broker_files rows manually until dedup ships.
+ * Accidental double-uploads create fresh staged rows.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -38,9 +44,8 @@ import {
   type ParsedStatement,
   type ContractNoteRow,
   type StatementRow,
-  type TradeMatch,
-  type CashEvent,
 } from '@/lib/broker-parser'
+import { NGX_TICKER_ALIASES } from '@/lib/market-data'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -125,7 +130,7 @@ export async function POST(req: NextRequest) {
   const errors: string[] = []
   const uploadedFiles: UploadedFile[] = []
   const timestamp = Date.now()
-  const uploadSessionId = randomUUID()  // v21b-3a: groups all files from this POST
+  const uploadSessionId = randomUUID()
 
   // ── Upload + parse contract notes ────────────────────────
   let parsedCN: ParsedContractNotes | null = null
@@ -305,8 +310,6 @@ export async function POST(req: NextRequest) {
 
   let inserted = 0
   if (stagedRows.length > 0) {
-    // Batch insert. Supabase handles large arrays fine; we keep a
-    // single call for atomicity.
     const { data: insData, error: insErr } = await supabase
       .from('staged_transactions')
       .insert(stagedRows)
@@ -361,6 +364,16 @@ export async function GET() {
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
+// Resolve any ticker through NGX_TICKER_ALIASES. Handles post-merge
+// canonicalisation (FBNH → FIRSTHOLDCO, MOBIL → MRS) so staged
+// rows match the canonical instruments master.
+function aliasTicker(t: string | null | undefined): string | null {
+  if (t === null || t === undefined) return null
+  const up = String(t).toUpperCase()
+  if (up === '') return null
+  return NGX_TICKER_ALIASES[up] || up
+}
+
 async function uploadPdf(
   supabase: SupabaseClient,
   portfolio_id: string,
@@ -402,7 +415,6 @@ async function uploadPdf(
     .single()
 
   if (error || !data) {
-    // Best-effort cleanup of the storage object on DB insert failure
     await supabase.storage.from('broker-files').remove([storage_path])
     return {
       broker_file_id: '',
@@ -418,11 +430,6 @@ function sanitize(s: string): string {
   return s.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 200)
 }
 
-// Maps the parser's internal TradeMatch.kind values to the
-// staged_transactions.recon_kind check-constraint values.
-// The parser uses terse names ('exact', 'split') while the DB
-// uses 'matched_exact' / 'matched_split' for clarity when
-// reading recon_kind alongside 'cash_event_auto' etc. v21b-2-hotfix-2.
 function mapReconKind(
   k: 'exact' | 'split' | 'partial_mismatch' | 'unmatched'
 ): 'matched_exact' | 'matched_split' | 'partial_mismatch' | 'unmatched' {
@@ -451,10 +458,6 @@ function buildStagedRows(
   const rows: any[] = []
 
   // ── One staged row per CN row (trade) ──────────────────────
-  // For splits (N statement rows → 1 CN row), we aggregate:
-  //   quantity/price/fees from CN (authoritative totals)
-  //   cn_number = comma-separated list of statement CN#s
-  //   narration = concat of statement narrations
   for (const match of rec.trade_matches) {
     const cnRow: ContractNoteRow = cn.rows[match.cn_row_index]
 
@@ -472,7 +475,6 @@ function buildStagedRows(
       cnNumbers = parts.join(',')
       narration = narrParts.join(' | ')
     } else {
-      // Unmatched CN — synthesise a narration from CN data
       narration = `${cnRow.action === 'BUY' ? 'Purchase' : 'Sale'} of ${cnRow.quantity} unit(s) of ${cnRow.security_code} @ ${cnRow.price} (no statement match)`
     }
 
@@ -482,7 +484,9 @@ function buildStagedRows(
       trade_date: cnRow.trade_date,
       settlement_date: cnRow.settlement_date,
       action: cnRow.action,
-      instrument_id: cnRow.security_code,
+      // v21b-3b-hotfix-1: resolve ticker through NGX_TICKER_ALIASES so
+      // FBNH staged rows land as FIRSTHOLDCO, etc.
+      instrument_id: aliasTicker(cnRow.security_code),
       quantity: cnRow.quantity,
       price: cnRow.price,
       gross_value: cnRow.consideration,
@@ -523,7 +527,6 @@ function buildStagedRows(
       include_in_commit: true,
     }
 
-    // Populate fee breakdown based on the underlying kind
     switch (ev.kind) {
       case 'management_fee':
         row.fee_management = ev.amount
@@ -534,21 +537,15 @@ function buildStagedRows(
       case 'bank_charge':
         row.fee_other = ev.amount
         break
-      // deposit / withdrawal / refund: no fee column; the action
-      // alone carries the meaning.
     }
 
-    // Pull NIBSS / CHEQUE / TRANSFER reference from narration.
     const ref = extractReference(ev.narration)
     if (ref) row.external_ref = ref
 
     rows.push(row)
   }
 
-  // ── Orphan statement trades (statement rows with no CN match) ──
-  // These are unusual — it means the statement recorded a trade
-  // that the contract notes don't show. We stage them as-is so
-  // the user can inspect and decide in the inbox.
+  // ── Orphan statement trades ──
   for (const orphan of rec.orphan_statement_trades) {
     const sRow =
       statements[orphan.statement_index]?.rows[orphan.row_index]
@@ -561,7 +558,8 @@ function buildStagedRows(
       portfolio_id,
       trade_date: sRow.trans_date,
       action: sRow.kind === 'trade_buy' ? 'BUY' : 'SELL',
-      instrument_id: sRow.ticker,
+      // v21b-3b-hotfix-1: alias here too
+      instrument_id: aliasTicker(sRow.ticker),
       quantity: sRow.quantity,
       price: sRow.price,
       amount: sRow.debit > 0 ? sRow.debit : sRow.credit,

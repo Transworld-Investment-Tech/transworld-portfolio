@@ -1,22 +1,17 @@
 /**
- * app/admin/broker/[sessionId]/page.tsx — v21b-3b
+ * app/admin/broker/[sessionId]/page.tsx — v21b-3b-hotfix-1
  *
- * Full detail view for one upload session. Shows:
- *   - KPI tiles: file count, staged rows, audit status, parse status
- *   - Commit + Rollback buttons with inline-confirm safety pattern
- *   - Files panel: every broker_file in the session with audit stats
- *   - Staged transactions table with recon_kind filter pills,
- *     per-row include_in_commit checkbox, audit warning banner
+ * v21b-3b-hotfix-1: richer error rendering for commit failures that
+ * include a `missing_instruments` array — renders the ticker list
+ * inline so users know exactly what to add to the instruments
+ * master before retrying.
  *
- * v21b-3b changes vs v21b-3a:
- *   - TypeScript type renamed source_file_id → broker_file_id
- *     (matches production column; v21b-3a docs drift fixed)
- *   - Added include-in-commit checkboxes with PATCH optimistic UI
- *   - Added Commit + Rollback buttons with 4-second inline confirm
- *   - Disables Commit when session is already committed or when
- *     parse failed on any file
+ * Earlier v21b-3b features preserved:
+ *   - include-in-commit checkboxes with optimistic PATCH
+ *   - Commit + Rollback with 4-second inline confirm
+ *   - Disables Commit when session is committed or parse failed
  *   - Disables Rollback unless session is committed
- *   - Unbalanced-audit banner when any statement audit fails
+ *   - Unbalanced-audit banner
  *
  * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
  * render its own (pitfall #38).
@@ -214,8 +209,6 @@ function totalFee(row: StagedRow): number | null {
 }
 
 // ─── Inline confirm button ──────────────────────────────────────
-// Click once → "Click again to confirm" for 4s. Click within that
-// window → fire action. No modal, matches hybrid aesthetic.
 type ConfirmState = 'idle' | 'confirming' | 'running'
 
 function ConfirmButton({
@@ -261,9 +254,7 @@ function ConfirmButton({
   const baseClass =
     variant === 'primary'
       ? 'btn-h btn-h-primary'
-      : variant === 'danger'
-        ? 'btn-h'
-        : 'btn-h'
+      : 'btn-h'
 
   const bg =
     state === 'confirming'
@@ -297,6 +288,11 @@ function ConfirmButton({
   )
 }
 
+// ─── Notice type — supports structured missing-instruments payload ──
+type Notice =
+  | { kind: 'ok'; text: string }
+  | { kind: 'error'; text: string; missingInstruments?: string[]; hint?: string }
+
 export default function BrokerSessionDetailPage(props: {
   params: Promise<{ sessionId: string }>
 }) {
@@ -304,10 +300,7 @@ export default function BrokerSessionDetailPage(props: {
   const [data, setData] = useState<SessionDetail | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [filterKind, setFilterKind] = useState<string | 'all'>('all')
-  const [notice, setNotice] = useState<{
-    kind: 'ok' | 'error'
-    text: string
-  } | null>(null)
+  const [notice, setNotice] = useState<Notice | null>(null)
 
   async function load() {
     try {
@@ -339,7 +332,6 @@ export default function BrokerSessionDetailPage(props: {
 
   async function toggleRow(rowId: string, next: boolean) {
     if (!data) return
-    // Optimistic update
     const snapshot = data.staged
     setData({
       ...data,
@@ -358,10 +350,7 @@ export default function BrokerSessionDetailPage(props: {
         throw new Error(j.error || `HTTP ${res.status}`)
       }
     } catch (err: any) {
-      // Revert on failure
-      setData((prev) =>
-        prev ? { ...prev, staged: snapshot } : prev
-      )
+      setData((prev) => (prev ? { ...prev, staged: snapshot } : prev))
       setNotice({ kind: 'error', text: `Toggle failed: ${err.message}` })
       setTimeout(() => setNotice(null), 6000)
     }
@@ -375,6 +364,19 @@ export default function BrokerSessionDetailPage(props: {
       })
       const j = await res.json()
       if (!res.ok) {
+        // Structured missing-instruments response from the commit
+        // route's pre-check — render as a sticky error (no auto-dismiss)
+        // so the user has time to copy the list.
+        if (Array.isArray(j.missing_instruments) && j.missing_instruments.length > 0) {
+          setNotice({
+            kind: 'error',
+            text: j.error || 'Commit blocked — missing instruments',
+            missingInstruments: j.missing_instruments,
+            hint: j.hint,
+          })
+          // No timeout — user dismisses by clicking X or by retrying
+          return
+        }
         setNotice({ kind: 'error', text: j.error || `HTTP ${res.status}` })
         setTimeout(() => setNotice(null), 8000)
         return
@@ -545,9 +547,59 @@ export default function BrokerSessionDetailPage(props: {
               ? 'alert-h alert-h-info'
               : 'alert-h alert-h-critical'
           }
-          style={{ marginBottom: 20 }}
+          style={{
+            marginBottom: 20,
+            position: 'relative',
+            paddingRight: notice.kind === 'error' ? 40 : undefined,
+          }}
         >
-          {notice.text}
+          <div>{notice.text}</div>
+
+          {/* Missing instruments — render as a pill list */}
+          {notice.kind === 'error' && notice.missingInstruments && notice.missingInstruments.length > 0 && (
+            <div style={{ marginTop: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: 'var(--text-2)' }}>
+                Missing tickers:
+              </div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
+                {notice.missingInstruments.map((t) => (
+                  <span
+                    key={t}
+                    className="pill pill-breach"
+                    style={{ fontFamily: 'monospace' }}
+                  >
+                    {t}
+                  </span>
+                ))}
+              </div>
+              {notice.hint && (
+                <div style={{ fontSize: 11, marginTop: 8, color: 'var(--text-2)', fontStyle: 'italic' }}>
+                  {notice.hint}
+                </div>
+              )}
+            </div>
+          )}
+
+          {notice.kind === 'error' && (
+            <button
+              onClick={() => setNotice(null)}
+              aria-label="Dismiss"
+              style={{
+                position: 'absolute',
+                top: 10,
+                right: 12,
+                background: 'transparent',
+                border: 'none',
+                color: 'inherit',
+                cursor: 'pointer',
+                fontSize: 16,
+                lineHeight: 1,
+                opacity: 0.6,
+              }}
+            >
+              ×
+            </button>
+          )}
         </div>
       )}
 
