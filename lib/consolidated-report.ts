@@ -149,7 +149,7 @@ ${equities.map(h => {
 
 ${combinedHoldings.filter(h => h.type !== 'Stock').length > 0
   ? 'FIXED INCOME / CASH:\n' + combinedHoldings.filter(h => h.type !== 'Stock').map(h =>
-      `  ${h.name}: ₦${(h.totalValue / 1e6).toFixed(2)}M | yield ${h.coupon_pct ?? 0}%`
+      `  ${h.name}: ₦${(h.totalValue / 1e6).toFixed(2)}M | yield ${(h as any).coupon_pct ?? 0}%`
     ).join('\n')
   : 'FIXED INCOME / CASH: None held across any portfolio.'}
 
