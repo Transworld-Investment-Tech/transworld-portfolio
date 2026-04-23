@@ -614,8 +614,7 @@ export function generateHTMLReport(data: ReportData): string {
 
     /* Print */
     @media print {
-      @page { size: A4; margin: 0; }
-      html { padding: 14mm 12mm !important; box-sizing: border-box; }
+      @page { size: A4; margin: 12mm; }
       body { background: white; }
       .page { max-width: 100%; border: none; }
       .no-print { display: none !important; }
