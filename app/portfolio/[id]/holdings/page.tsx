@@ -8,10 +8,12 @@ import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle } from 'lucid
 
 // v20d: Hybrid rewrite.
 // Sidebar is rendered by app/portfolio/[id]/layout.tsx — do NOT render one here.
-// PageActions dropped from this page; replaced with an inline hybrid Copy button
-// wired to the existing getHoldingsText() formatter.
-
 // v17: prices display an "As of" date with a stale indicator.
+// v21h: new Sector, NGX Board, Volume, Prev close, and Day change %
+//   columns surface v20h data. Volume/prev-close/day-change live in
+//   market_prices (populated from NGX REST feed); sector + ngx_market
+//   live on instruments. All additive; null-safe.
+
 const STALE_DAYS = 3
 
 function stalenessOf(priceDate?: string): 'fresh' | 'stale' | 'none' {
@@ -29,6 +31,16 @@ function formatShortDate(iso?: string): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
 }
 
+// v21h: compact volume formatter. NGX volumes can get huge (50M+) so
+// we want K/M/B suffixes for scannability.
+function formatVolume(v?: number | null): string {
+  if (v === undefined || v === null) return '—'
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return v.toFixed(0)
+}
+
 const SLEEVE_NAMES: Record<string, string> = {
   liq: 'Cash & Liquidity',
   eq:  'Equities (NGX)',
@@ -39,13 +51,20 @@ const SLEEVE_NAMES: Record<string, string> = {
 
 const SLEEVE_ORDER: Record<string, number> = { liq: 0, ntb: 1, fgn: 2, fi: 3, eq: 4 }
 
+interface PriceRow {
+  price: number
+  day_change: number | null      // percent
+  prev_close: number | null
+  volume: number | null
+  price_date: string
+}
+
 export default function HoldingsPage() {
   const { id: portfolioId } = useParams() as { id: string }
   const [portfolio, setPortfolio] = useState<any>(null)
   const [holdings, setHoldings] = useState<any[]>([])
   const [instruments, setInstruments] = useState<any[]>([])
-  const [prices, setPrices] = useState<Record<string, number>>({})
-  const [priceDates, setPriceDates] = useState<Record<string, string>>({})
+  const [priceData, setPriceData] = useState<Record<string, PriceRow>>({})
   const [saving, setSaving] = useState<Record<string, boolean>>({})
   const [adding, setAdding] = useState(false)
   const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '' })
@@ -60,21 +79,28 @@ export default function HoldingsPage() {
       supabase.from('portfolios').select('*, client:clients(name)').eq('id', portfolioId).single(),
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId).order('sleeve_id'),
       supabase.from('instruments').select('*').eq('approved', true).order('name'),
-      supabase.from('market_prices').select('instrument_id, price, price_date').order('price_date', { ascending: false }),
+      // v21h: pull day_change, prev_close, volume alongside price
+      supabase.from('market_prices')
+        .select('instrument_id, price, day_change, prev_close, volume, price_date')
+        .order('price_date', { ascending: false }),
     ])
     setPortfolio(portRes.data)
     setHoldings(holdRes.data ?? [])
     setInstruments(instrRes.data ?? [])
-    const pm: Record<string, number> = {}
-    const pd: Record<string, string> = {}
+
+    const pData: Record<string, PriceRow> = {}
     priceRes.data?.forEach((p: any) => {
-      if (!(p.instrument_id in pm)) {
-        pm[p.instrument_id] = p.price
-        pd[p.instrument_id] = p.price_date
+      if (!(p.instrument_id in pData)) {
+        pData[p.instrument_id] = {
+          price: Number(p.price),
+          day_change: p.day_change !== null ? Number(p.day_change) : null,
+          prev_close: p.prev_close !== null ? Number(p.prev_close) : null,
+          volume: p.volume !== null ? Number(p.volume) : null,
+          price_date: p.price_date,
+        }
       }
     })
-    setPrices(pm)
-    setPriceDates(pd)
+    setPriceData(pData)
     setLoading(false)
   }
 
@@ -97,7 +123,7 @@ export default function HoldingsPage() {
       instrument_id: newHolding.instrument_id,
       sleeve_id: instr?.sleeve_id,
       quantity: Number(newHolding.quantity),
-      avg_cost: Number(newHolding.avg_cost) || prices[newHolding.instrument_id] || 1,
+      avg_cost: Number(newHolding.avg_cost) || priceData[newHolding.instrument_id]?.price || 1,
       as_of_date: new Date().toISOString().slice(0, 10),
     }, { onConflict: 'portfolio_id,instrument_id' })
     setAdding(false)
@@ -121,21 +147,26 @@ export default function HoldingsPage() {
   function getHoldingsText(): string {
     const lines: string[] = []
     const totalNav = holdings.reduce((sum, h) => {
-      const p = prices[h.instrument_id] ?? h.avg_cost ?? 1
+      const p = priceData[h.instrument_id]?.price ?? h.avg_cost ?? 1
       return sum + Number(h.quantity) * p
     }, 0)
     lines.push(`Total portfolio value: ₦${(totalNav / 1e6).toFixed(2)}M`)
     lines.push(`Holdings as at: ${new Date().toLocaleDateString('en-GB')}`)
     lines.push('')
-    lines.push('Instrument       | Sleeve | Quantity        | Avg Cost  | Mkt Price | Mkt Value  | Unrl P&L   | Weight')
-    lines.push('─'.repeat(110))
+    lines.push('Instrument       | Sector             | Sleeve | Quantity        | Avg Cost  | Mkt Price | Day chg  | Mkt Value  | Unrl P&L   | Weight')
+    lines.push('─'.repeat(140))
     holdings.forEach(h => {
-      const p   = prices[h.instrument_id] ?? h.avg_cost ?? 1
-      const v   = Number(h.quantity) * p
+      const pr = priceData[h.instrument_id]
+      const p = pr?.price ?? h.avg_cost ?? 1
+      const v = Number(h.quantity) * p
       const pnl = Number(h.quantity) * (p - Number(h.avg_cost))
-      const wt  = totalNav > 0 ? (v / totalNav * 100).toFixed(1) + '%' : '0%'
+      const wt = totalNav > 0 ? (v / totalNav * 100).toFixed(1) + '%' : '0%'
+      const sector = (h.instrument?.sector ?? '—').slice(0, 18)
+      const dayChg = pr?.day_change !== null && pr?.day_change !== undefined
+        ? (pr.day_change >= 0 ? '+' : '') + pr.day_change.toFixed(2) + '%'
+        : '—'
       lines.push(
-        `${(h.instrument?.name ?? h.instrument_id).padEnd(16)} | ${(h.sleeve_id ?? '').padEnd(6)} | ${Number(h.quantity).toLocaleString().padEnd(15)} | ₦${Number(h.avg_cost).toFixed(2).padEnd(8)} | ₦${p.toFixed(2).padEnd(8)} | ₦${(v/1e6).toFixed(2)}M${' '.repeat(3)} | ${pnl >= 0 ? '+' : ''}₦${(pnl/1e6).toFixed(2)}M | ${wt}`
+        `${(h.instrument?.name ?? h.instrument_id).padEnd(16)} | ${sector.padEnd(18)} | ${(h.sleeve_id ?? '').padEnd(6)} | ${Number(h.quantity).toLocaleString().padEnd(15)} | ₦${Number(h.avg_cost).toFixed(2).padEnd(8)} | ₦${p.toFixed(2).padEnd(8)} | ${dayChg.padStart(8)} | ₦${(v/1e6).toFixed(2)}M${' '.repeat(3)} | ${pnl >= 0 ? '+' : ''}₦${(pnl/1e6).toFixed(2)}M | ${wt}`
       )
     })
     return lines.join('\n')
@@ -154,7 +185,7 @@ export default function HoldingsPage() {
     return acc
   }, {} as Record<string, any[]>)
 
-  const staleHeldCount = holdings.filter(h => stalenessOf(priceDates[h.instrument_id]) !== 'fresh').length
+  const staleHeldCount = holdings.filter(h => stalenessOf(priceData[h.instrument_id]?.price_date) !== 'fresh').length
 
   if (loading) {
     return (
@@ -166,7 +197,6 @@ export default function HoldingsPage() {
 
   return (
     <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
-      {/* Page header */}
       <div className="page-head">
         <div>
           <div className="eyebrow" style={{ marginBottom: 10 }}>
@@ -255,7 +285,7 @@ export default function HoldingsPage() {
                 type="number"
                 value={newHolding.avg_cost}
                 onChange={e => setNewHolding(n => ({ ...n, avg_cost: e.target.value }))}
-                placeholder={prices[newHolding.instrument_id]?.toString() || '1'}
+                placeholder={priceData[newHolding.instrument_id]?.price.toString() || '1'}
                 className="input-h input-h-mono"
                 step="0.01"
               />
@@ -280,14 +310,18 @@ export default function HoldingsPage() {
               </div>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table className="h-table" style={{ minWidth: 900 }}>
+              <table className="h-table" style={{ minWidth: 1200 }}>
                 <thead>
                   <tr>
                     <th>Instrument</th>
                     <th>Type</th>
+                    <th>Sector</th>
                     <th className="num">Quantity / Face (₦)</th>
                     <th className="num">Avg cost</th>
+                    <th className="num">Prev close</th>
                     <th className="num">Current price</th>
+                    <th className="num">Day chg %</th>
+                    <th className="num">Volume</th>
                     <th>As of</th>
                     <th className="num">Market value</th>
                     <th className="num">Unreal. P&amp;L</th>
@@ -296,8 +330,9 @@ export default function HoldingsPage() {
                 </thead>
                 <tbody>
                   {(items as any[]).map(h => {
-                    const mktPrice = prices[h.instrument_id] ?? h.avg_cost ?? 1
-                    const priceDate = priceDates[h.instrument_id]
+                    const pr = priceData[h.instrument_id]
+                    const mktPrice = pr?.price ?? h.avg_cost ?? 1
+                    const priceDate = pr?.price_date
                     const stale = stalenessOf(priceDate)
                     const dotColor =
                       stale === 'fresh' ? 'var(--pos)' :
@@ -313,16 +348,54 @@ export default function HoldingsPage() {
                       h.instrument?.type === 'Bond' ? 'pill-buy' :
                       h.instrument?.type === 'NTB' ? 'pill-warn' :
                       'pill-hold'
+
+                    const sectorRaw = h.instrument?.sector as string | null | undefined
+                    const ngxMarket = h.instrument?.ngx_market as string | null | undefined
+                    const dayChgVal = pr?.day_change
+                    const prevClose = pr?.prev_close
+                    const volume = pr?.volume
+
                     return (
                       <tr key={h.instrument_id}>
                         <td>
-                          <div style={{ fontWeight: 500 }}>{h.instrument?.name}</div>
+                          <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                            <span style={{ fontWeight: 500 }}>{h.instrument?.name}</span>
+                            {ngxMarket && (
+                              <span
+                                style={{
+                                  fontSize: 9,
+                                  padding: '1px 6px',
+                                  borderRadius: 2,
+                                  background: ngxMarket === 'Premium Board' ? 'var(--gold-soft)' : 'var(--bg-soft)',
+                                  color: ngxMarket === 'Premium Board' ? 'var(--gold)' : 'var(--text-3)',
+                                  border: '1px solid var(--border)',
+                                  fontWeight: 600,
+                                  letterSpacing: '0.04em',
+                                  whiteSpace: 'nowrap' as const,
+                                }}
+                                title={`NGX board: ${ngxMarket}`}
+                              >
+                                {ngxMarket === 'Premium Board' ? 'PREMIUM' : ngxMarket === 'Main Board' ? 'MAIN' : ngxMarket}
+                              </span>
+                            )}
+                          </div>
                           <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
                             {h.instrument_id}
                           </div>
                         </td>
                         <td>
                           <span className={`pill ${typePill}`}>{h.instrument?.type}</span>
+                        </td>
+                        <td style={{ fontSize: 11, color: sectorRaw ? 'var(--text-2)' : 'var(--text-4)' }}>
+                          {sectorRaw ? (
+                            <span title={sectorRaw}>
+                              {sectorRaw
+                                .toLowerCase()
+                                .split(/\s+/)
+                                .map(w => w.charAt(0).toUpperCase() + w.slice(1))
+                                .join(' ')}
+                            </span>
+                          ) : '—'}
                         </td>
                         <td className="num">
                           <input
@@ -343,8 +416,31 @@ export default function HoldingsPage() {
                             style={{ width: 110 }}
                           />
                         </td>
-                        <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', color: prevClose !== null && prevClose !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
+                          {prevClose !== null && prevClose !== undefined
+                            ? `₦${prevClose.toFixed(h.instrument?.type === 'Stock' ? 2 : 4)}`
+                            : '—'}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500 }}>
                           ₦{mktPrice.toFixed(h.instrument?.type === 'Stock' ? 2 : 4)}
+                        </td>
+                        <td
+                          className="num"
+                          style={{
+                            fontFamily: 'var(--font-mono)',
+                            fontSize: 11,
+                            color:
+                              dayChgVal === null || dayChgVal === undefined ? 'var(--text-4)' :
+                              dayChgVal > 0 ? 'var(--pos)' :
+                              dayChgVal < 0 ? 'var(--neg)' : 'var(--text-3)',
+                          }}
+                        >
+                          {dayChgVal === null || dayChgVal === undefined
+                            ? '—'
+                            : <>{dayChgVal > 0 ? '+' : ''}{dayChgVal.toFixed(2)}%</>}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: volume !== null && volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }} title={volume !== null && volume !== undefined ? volume.toLocaleString() : undefined}>
+                          {formatVolume(volume)}
                         </td>
                         <td>
                           <span

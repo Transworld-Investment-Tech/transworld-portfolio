@@ -5,8 +5,12 @@ import { supabase } from '@/lib/supabase'
 import { ArrowLeft, RefreshCw, Edit2, Search, AlertCircle, X, Save, Info } from 'lucide-react'
 
 // v20e: Hybrid rewrite of the v17 Market Prices admin page.
-// Preserves the 3-day staleness threshold, source filter, held-only
-// toggle, and the manual-override modal which writes source='manual'.
+// v21h: Adds Prev close, Volume, and Trades columns to surface
+//   v20h data. Also pulls prev_close, volume, trades, ngx_market
+//   from market_prices / instruments. All additive; null-safe.
+//   The new columns help sense-check NGX-published values
+//   (pitfall #25: occasionally implausible) by showing volume
+//   alongside price.
 
 const STALE_DAYS = 3
 
@@ -16,8 +20,13 @@ interface Row {
   type: string
   sleeve_id: string
   approved: boolean
+  sector?: string | null
+  ngx_market?: string | null
   price?: number
-  day_change?: number
+  day_change?: number       // percent
+  prev_close?: number | null
+  volume?: number | null
+  trades?: number | null
   price_date?: string
   source?: string
   holdingsCount: number
@@ -36,6 +45,14 @@ function formatDate(iso?: string): string {
   if (!iso) return '—'
   const d = new Date(iso + 'T00:00:00Z')
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' })
+}
+
+function formatVolume(v?: number | null): string {
+  if (v === undefined || v === null) return '—'
+  if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return v.toFixed(0)
 }
 
 export default function MarketPricesPage() {
@@ -60,7 +77,10 @@ export default function MarketPricesPage() {
     setLoading(true)
     const [instrRes, priceRes, holdRes] = await Promise.all([
       supabase.from('instruments').select('*').order('instrument_id'),
-      supabase.from('market_prices').select('instrument_id, price, day_change, price_date, source').order('price_date', { ascending: false }),
+      // v21h: pull prev_close, volume, trades alongside price
+      supabase.from('market_prices')
+        .select('instrument_id, price, day_change, prev_close, volume, trades, price_date, source')
+        .order('price_date', { ascending: false }),
       supabase.from('holdings').select('instrument_id'),
     ])
 
@@ -82,8 +102,13 @@ export default function MarketPricesPage() {
         type: i.type,
         sleeve_id: i.sleeve_id,
         approved: i.approved,
+        sector: i.sector ?? null,
+        ngx_market: i.ngx_market ?? null,
         price: p?.price !== undefined ? Number(p.price) : undefined,
         day_change: p?.day_change !== undefined && p?.day_change !== null ? Number(p.day_change) : undefined,
+        prev_close: p?.prev_close !== undefined && p?.prev_close !== null ? Number(p.prev_close) : null,
+        volume: p?.volume !== undefined && p?.volume !== null ? Number(p.volume) : null,
+        trades: p?.trades !== undefined && p?.trades !== null ? Number(p.trades) : null,
         price_date: p?.price_date,
         source: p?.source,
         holdingsCount: holdingCounts.get(i.instrument_id) ?? 0,
@@ -201,7 +226,6 @@ export default function MarketPricesPage() {
 
       <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
 
-      {/* Status line */}
       <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 18, lineHeight: 1.6 }}>
         <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{rows.length}</span> instruments in master ·{' '}
         <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{held.length}</span> currently held ·{' '}
@@ -215,7 +239,7 @@ export default function MarketPricesPage() {
         . Updates flow automatically to every portfolio.
       </div>
 
-      <div style={{ maxWidth: 1200 }}>
+      <div style={{ maxWidth: 1400 }}>
         {/* Filters */}
         <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 12, marginBottom: 14 }}>
           <div style={{ position: 'relative', flex: 1, minWidth: 200, maxWidth: 320 }}>
@@ -279,13 +303,16 @@ export default function MarketPricesPage() {
               No instruments match your filters
             </div>
           ) : (
-            <table className="h-table" style={{ width: '100%' }}>
+            <table className="h-table" style={{ width: '100%', minWidth: 1200 }}>
               <thead>
                 <tr>
                   <th>Instrument</th>
                   <th>Type</th>
+                  <th className="num">Prev close</th>
                   <th className="num">Price</th>
-                  <th className="num">Day chg</th>
+                  <th className="num">Day chg %</th>
+                  <th className="num">Volume</th>
+                  <th className="num">Trades</th>
                   <th>Source</th>
                   <th>As of</th>
                   <th className="num">Holdings</th>
@@ -306,15 +333,45 @@ export default function MarketPricesPage() {
                   return (
                     <tr key={r.instrument_id} style={isHeld ? {} : { opacity: 0.55 }}>
                       <td>
-                        <div style={{ fontWeight: 500 }}>{r.name}</div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ fontWeight: 500 }}>{r.name}</span>
+                          {r.ngx_market && (
+                            <span
+                              style={{
+                                fontSize: 9,
+                                padding: '1px 6px',
+                                borderRadius: 2,
+                                background: r.ngx_market === 'Premium Board' ? 'var(--gold-soft)' : 'var(--bg-soft)',
+                                color: r.ngx_market === 'Premium Board' ? 'var(--gold)' : 'var(--text-3)',
+                                border: '1px solid var(--border)',
+                                fontWeight: 600,
+                                letterSpacing: '0.04em',
+                                whiteSpace: 'nowrap' as const,
+                              }}
+                              title={`NGX board: ${r.ngx_market}`}
+                            >
+                              {r.ngx_market === 'Premium Board' ? 'PREMIUM' : r.ngx_market === 'Main Board' ? 'MAIN' : r.ngx_market}
+                            </span>
+                          )}
+                        </div>
                         <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
                           {r.instrument_id}
+                          {r.sector && (
+                            <span style={{ color: 'var(--text-4)', marginLeft: 6, fontFamily: 'var(--font-sans)' }}>
+                              · {r.sector.toLowerCase().split(/\s+/).map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ')}
+                            </span>
+                          )}
                         </div>
                       </td>
                       <td>
                         <span style={{ fontSize: 10, color: 'var(--text-2)', textTransform: 'uppercase' as const, letterSpacing: '0.08em' }}>
                           {r.type}
                         </span>
+                      </td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', color: r.prev_close !== null && r.prev_close !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
+                        {r.prev_close !== null && r.prev_close !== undefined
+                          ? `₦${r.prev_close.toFixed(r.type === 'Stock' ? 2 : 4)}`
+                          : '—'}
                       </td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
                         {r.price !== undefined ? (
@@ -329,13 +386,27 @@ export default function MarketPricesPage() {
                           fontFamily: 'var(--font-mono)',
                           fontSize: 12,
                           color:
-                            (r.day_change ?? 0) > 0 ? 'var(--pos)' :
-                            (r.day_change ?? 0) < 0 ? 'var(--neg)' : 'var(--text-3)',
+                            r.day_change === undefined ? 'var(--text-4)' :
+                            r.day_change > 0 ? 'var(--pos)' :
+                            r.day_change < 0 ? 'var(--neg)' : 'var(--text-3)',
                         }}
                       >
                         {r.day_change !== undefined ? (
-                          <>{r.day_change > 0 ? '+' : ''}{r.day_change.toFixed(2)}</>
+                          <>{r.day_change > 0 ? '+' : ''}{r.day_change.toFixed(2)}%</>
                         ) : '—'}
+                      </td>
+                      <td
+                        className="num"
+                        style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.volume !== null && r.volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
+                        title={r.volume !== null && r.volume !== undefined ? r.volume.toLocaleString() : undefined}
+                      >
+                        {formatVolume(r.volume)}
+                      </td>
+                      <td
+                        className="num"
+                        style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.trades !== null && r.trades !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
+                      >
+                        {r.trades !== null && r.trades !== undefined ? r.trades.toLocaleString() : '—'}
                       </td>
                       <td>
                         {r.source ? (
@@ -394,12 +465,13 @@ export default function MarketPricesPage() {
           )}
         </div>
 
-        <div style={{ marginTop: 16, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6, maxWidth: 700 }}>
+        <div style={{ marginTop: 16, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6, maxWidth: 800 }}>
           <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
             Manual overrides write a row with <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-2)' }}>source='manual'</span>.
             A later "Refresh from NGX" will overwrite the same (instrument, date) row if NGX publishes a price.
             Use overrides for suspended tickers, transferred-in holdings, or securities NGX doesn't list under the ticker our records use.
+            Volume / Prev close / Trades populate on the daily NGX refresh; low / missing volume alongside a big price move is a good signal to sense-check before trusting the value.
           </span>
         </div>
       </div>

@@ -12,36 +12,27 @@ import {
   fmt, type Portfolio, type Holding, type SleeveTarget,
 } from '@/lib/portfolio'
 
-// v20c: Sidebar is rendered by app/portfolio/[id]/layout.tsx. This page
-// only returns the <main> content that fills the layout's right column.
-// Previously rendered Sidebar locally, causing a double sidebar.
-
+// v20c: Sidebar is rendered by app/portfolio/[id]/layout.tsx.
 // v20: Hybrid Portfolio Overview — single page, no internal tabs.
-// Holdings / Transactions / Reports / Settings now live solely on their
-// own routes (accessed via the sidebar). This removes three dead tabs
-// (allocation / market / transactions) and the redundant holdings/reports
-// tabs from the legacy implementation.
+// v21g: Performance panel surfaces IRR + period returns + benchmarks.
+// v21h: Sector Concentration panel surfaces NAV-weighted sector
+//   breakdown of held equities. Uses v20h's instruments.sector data.
+//   Appears between the Allocation/Composition row and the
+//   Rebalancing Guide. Hidden when no equities are held.
 //
-// v21g: Added Performance panel that surfaces IRR + period returns +
-// benchmarks from /api/analytics. Period selector defaults to ITD. All
-// nine periods supported (1W through ITD). Math lives in lib/analytics.ts
-// and has not been touched.
-//
-// Pitfall #7: the "Download report" button MUST remain in the header and
-// MUST call /api/export?portfolioId=... The apply-update.sh greps for it.
+// Pitfall #7: the "Download report" button MUST remain in the header
+// and MUST call /api/export?portfolioId=... The apply-update.sh
+// greps for it.
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
+const SectorDonut = dynamic(() => import('@/components/portfolio/SectorDonut'), { ssr: false })
 
-// Hybrid sleeve fill palette — explicit so the allocation bars match the
-// mock regardless of SLEEVE_COLOURS's legacy values.
 const SLEEVE_FILL: Record<string, string> = {
   liq: 'var(--sidebar-bg)',
   eq:  'linear-gradient(90deg, var(--gold), var(--gold-bright))',
   fi:  'var(--pos)',
 }
 
-// v21g: Period definitions mirror lib/analytics.ts PERIODS.
-// Kept locally to avoid importing the full analytics lib into a client component.
 const PERIOD_TABS: { key: string; label: string }[] = [
   { key: '1W',  label: '1W'  },
   { key: '1M',  label: '1M'  },
@@ -60,17 +51,40 @@ function fmtPctSigned(v: number | null | undefined, digits = 2): string {
   return (v >= 0 ? '+' : '') + s + '%'
 }
 
-function fmtPctPlain(v: number | null | undefined, digits = 2): string {
-  if (v === null || v === undefined || isNaN(v)) return '—'
-  return (v * 100).toFixed(digits) + '%'
-}
-
-// IRR-specific formatter: show nothing when null (caption explains why);
-// always show trailing " p.a." to reinforce that this is an annual rate.
 function fmtIRR(v: number | null | undefined, digits = 2): { value: string; hasValue: boolean } {
   if (v === null || v === undefined || isNaN(v)) return { value: '—', hasValue: false }
   const s = (v * 100).toFixed(digits)
   return { value: (v >= 0 ? '+' : '') + s + '%', hasValue: true }
+}
+
+// v21h: Build sector concentration slices from held equities.
+// Only includes instruments with type='Stock' (skip bonds/cash).
+// NULL sectors bucket into 'Unclassified' so coverage gaps are visible.
+function buildSectorSlices(holdings: any[]): { slices: any[]; totalEquityNAV: number } {
+  const equities = holdings.filter(h => h.instrument?.type === 'Stock')
+  const totalEquityNAV = equities.reduce((s, h) => s + (h.quantity * (h.latest_price ?? h.avg_cost ?? 0)), 0)
+
+  if (totalEquityNAV <= 0) return { slices: [], totalEquityNAV: 0 }
+
+  const bySector = new Map<string, { value: number; count: number }>()
+  for (const h of equities) {
+    const sector = h.instrument?.sector || 'Unclassified'
+    const value = h.quantity * (h.latest_price ?? h.avg_cost ?? 0)
+    if (value <= 0) continue
+    const prev = bySector.get(sector) ?? { value: 0, count: 0 }
+    bySector.set(sector, { value: prev.value + value, count: prev.count + 1 })
+  }
+
+  const slices = Array.from(bySector.entries())
+    .map(([sector, { value, count }]) => ({
+      sector,
+      value,
+      pct: value / totalEquityNAV,
+      count,
+    }))
+    .sort((a, b) => b.value - a.value)
+
+  return { slices, totalEquityNAV }
 }
 
 export default function PortfolioOverviewPage() {
@@ -89,7 +103,6 @@ export default function PortfolioOverviewPage() {
   const [divRefreshMsg, setDivRefreshMsg] = useState('')
   const [divFreshness, setDivFreshness] = useState<Date | null>(null)
 
-  // v21g: analytics state
   const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('ITD')
   const [analytics, setAnalytics] = useState<any>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
@@ -97,6 +110,7 @@ export default function PortfolioOverviewPage() {
   const load = useCallback(async () => {
     const [portRes, holdRes, sleeveRes] = await Promise.all([
       supabase.from('portfolios').select('*, client:clients(name,code,type)').eq('id', portfolioId).single(),
+      // v21h: pull sector + ngx_market alongside the instrument embed
       supabase.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId),
       supabase.from('sleeve_targets').select('*').eq('portfolio_id', portfolioId).order('sort_order'),
     ])
@@ -130,7 +144,6 @@ export default function PortfolioOverviewPage() {
 
   useEffect(() => { load() }, [load])
 
-  // FX rate
   useEffect(() => {
     fetch('https://api.exchangerate-api.com/v4/latest/USD')
       .then(r => r.json())
@@ -138,7 +151,6 @@ export default function PortfolioOverviewPage() {
       .catch(() => {})
   }, [])
 
-  // Dividend data
   useEffect(() => {
     if (!portfolioId) return
     setDivLoading(true)
@@ -148,8 +160,6 @@ export default function PortfolioOverviewPage() {
       .catch(() => setDivLoading(false))
   }, [portfolioId, holdings.length])
 
-  // Dividend freshness — find the most recent refresh timestamp across
-  // approved equities. Drives the stale/fresh dot on the dividend panel.
   useEffect(() => {
     supabase
       .from('instruments')
@@ -167,8 +177,6 @@ export default function PortfolioOverviewPage() {
       })
   }, [])
 
-  // v21g: fetch analytics whenever portfolio or selected period changes.
-  // Runs after initial portfolio load (loading=false) so we don't double-fire.
   useEffect(() => {
     if (!portfolioId || loading) return
     setAnalyticsLoading(true)
@@ -186,7 +194,6 @@ export default function PortfolioOverviewPage() {
       setDivRefreshMsg(d.ok ? `✓ ${d.message ?? 'refreshed'}` : 'Refresh failed')
       const r2 = await fetch(`/api/dividends?portfolioId=${portfolioId}`)
       setDividends(await r2.json())
-      // Re-read freshness after refresh
       const { data: f } = await supabase
         .from('instruments')
         .select('div_last_refreshed_at')
@@ -237,12 +244,11 @@ export default function PortfolioOverviewPage() {
   const pl = tot - portfolio.starting_nav
   const ret = hasStartingNav ? pl / portfolio.starting_nav : 0
   const incPA = dividends?.totalEstimatedIncome ?? estimatedIncomePA(holdings)
-  // NOTE: complianceAlerts signature mismatch between this file and
-  // /api/export/route.ts is flagged for audit in v20b. Using the production
-  // call order (portfolio, holdings, sv, tot) here.
   const alerts = complianceAlerts(portfolio as any, holdings as any, sv as any, tot)
 
-  // Dividend panel staleness
+  // v21h: compute sector slices
+  const { slices: sectorSlices, totalEquityNAV } = buildSectorSlices(holdings)
+
   const divStaleInfo = (() => {
     if (!divFreshness) return { cls: 'none', text: 'Dividend data: never refreshed' }
     const days = Math.floor((Date.now() - divFreshness.getTime()) / 86_400_000)
@@ -251,7 +257,6 @@ export default function PortfolioOverviewPage() {
     return { cls: 'stale', text: `Data ${days}d old · refreshed ${fmtDate}` }
   })()
 
-  // v21g: derived analytics values for display
   const metrics = analytics?.period
   const irrDisplay = fmtIRR(metrics?.irr)
   const periodLabel = metrics?.periodLabel ?? PERIOD_TABS.find(t => t.key === analyticsPeriod)?.label ?? analyticsPeriod
@@ -263,7 +268,6 @@ export default function PortfolioOverviewPage() {
       className="hybrid-page"
       style={{ padding: '32px 44px 64px', minHeight: '100vh' }}
     >
-        {/* Page header — Image 1 preference: clean, no subtitle, full-width border */}
         <div className="page-head">
           <div>
             <div className="eyebrow" style={{ marginBottom: 10 }}>
@@ -313,7 +317,6 @@ export default function PortfolioOverviewPage() {
           </div>
         </div>
 
-        {/* Compliance alerts */}
         {alerts && alerts.length > 0 && (
           <div style={{ marginBottom: 24 }}>
             {alerts.map((a: any, i: number) => (
@@ -395,7 +398,7 @@ export default function PortfolioOverviewPage() {
           </div>
         </div>
 
-        {/* v21g: Performance panel — IRR + period returns + benchmarks */}
+        {/* Performance panel (v21g) */}
         <div className="panel" style={{ marginBottom: 20 }}>
           <div className="panel-header">
             <div>
@@ -406,7 +409,6 @@ export default function PortfolioOverviewPage() {
                   : 'Loading period metrics…'}
               </div>
             </div>
-            {/* Period tabs */}
             <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               {PERIOD_TABS.map(t => {
                 const active = t.key === analyticsPeriod
@@ -436,7 +438,6 @@ export default function PortfolioOverviewPage() {
             </div>
           </div>
 
-          {/* Headline IRR + sub-metrics */}
           <div
             style={{
               display: 'grid',
@@ -447,7 +448,6 @@ export default function PortfolioOverviewPage() {
               marginBottom: 18,
             }}
           >
-            {/* IRR */}
             <div>
               <div
                 style={{
@@ -502,7 +502,6 @@ export default function PortfolioOverviewPage() {
               </div>
             </div>
 
-            {/* Period return */}
             <div>
               <div
                 style={{
@@ -530,12 +529,9 @@ export default function PortfolioOverviewPage() {
               >
                 {fmtPctSigned(metrics?.simplePeriodReturn)}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
-                Un-annualised
-              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>Un-annualised</div>
             </div>
 
-            {/* Absolute P&L */}
             <div>
               <div
                 style={{
@@ -565,12 +561,9 @@ export default function PortfolioOverviewPage() {
                   ? `${metrics.absoluteReturn >= 0 ? '+' : '−'}${fmt.ngnM(Math.abs(metrics.absoluteReturn))}`
                   : '—'}
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>
-                Net of external flows
-              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-2)' }}>Net of external flows</div>
             </div>
 
-            {/* TWR — only shown when non-null */}
             <div>
               <div
                 style={{
@@ -609,7 +602,6 @@ export default function PortfolioOverviewPage() {
             </div>
           </div>
 
-          {/* Benchmarks row */}
           <div>
             <div
               style={{
@@ -689,7 +681,6 @@ export default function PortfolioOverviewPage() {
             </div>
           </div>
 
-          {/* Footer note: cashflows */}
           {metrics && (metrics.inflows > 0 || metrics.outflows > 0) && (
             <div
               style={{
@@ -724,7 +715,7 @@ export default function PortfolioOverviewPage() {
           )}
         </div>
 
-        {/* Two-col: allocation bars + donut */}
+        {/* Allocation bars + Composition donut */}
         <div
           style={{
             display: 'grid',
@@ -788,6 +779,24 @@ export default function PortfolioOverviewPage() {
             <AllocationDonut sleeves={sv as any} totalNAV={tot} />
           </div>
         </div>
+
+        {/* v21h: Sector Concentration panel — only render if there are held equities */}
+        {sectorSlices.length > 0 && (
+          <div className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <div className="panel-title">Sector Concentration</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                  NAV-weighted breakdown of held equities by NGX sector
+                </div>
+              </div>
+              <div className="panel-meta">
+                {sectorSlices.length} sector{sectorSlices.length === 1 ? '' : 's'}
+              </div>
+            </div>
+            <SectorDonut slices={sectorSlices} totalEquityNAV={totalEquityNAV} />
+          </div>
+        )}
 
         {/* Rebalancing */}
         <div className="panel" style={{ marginBottom: 20 }}>
@@ -889,7 +898,6 @@ export default function PortfolioOverviewPage() {
               </div>
             </div>
 
-            {/* 4 KPI tiles */}
             <div
               style={{
                 display: 'grid',
@@ -939,7 +947,6 @@ export default function PortfolioOverviewPage() {
               </div>
             </div>
 
-            {/* Per-stock table */}
             <table className="h-table">
               <thead>
                 <tr>
