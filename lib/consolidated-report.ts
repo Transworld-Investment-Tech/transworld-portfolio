@@ -1,3 +1,4 @@
+import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
 
 // v21k: generateConsolidatedReport()
@@ -109,6 +110,8 @@ export async function generateConsolidatedReport(input: ConsolidatedReportInput)
   const watchCtx = buildConsolidatedWatchlistContext(combinedHoldings, watchlist)
 
   const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
+
+${REPORT_TONE_INSTRUCTION}
 
 Generate a rigorous, insightful CONSOLIDATED ${reportType.toUpperCase()} portfolio intelligence report for: ${period}
 Generated: ${today}

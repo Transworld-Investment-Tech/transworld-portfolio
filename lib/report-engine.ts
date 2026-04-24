@@ -1,3 +1,4 @@
+import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
 import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
 import { buildCashFlows, solveIRR } from './analytics'
@@ -260,6 +261,8 @@ Never present the Raw HPR as the portfolio's performance. If you reference any r
 it must be the IRR figure above.`
 
   const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
+
+${REPORT_TONE_INSTRUCTION}
 
 Generate a rigorous, insightful ${reportType.toUpperCase()} portfolio intelligence report for the period: ${period}
 Generated: ${today}
