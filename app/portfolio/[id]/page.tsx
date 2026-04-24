@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import * as XLSX from 'xlsx'
 import {
-  RefreshCw, FileText, Download, AlertTriangle, Info, FileSpreadsheet,
+  RefreshCw, FileText, Download, AlertTriangle, Info, FileSpreadsheet, Sparkles,
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 import { supabase } from '@/lib/supabase'
@@ -27,6 +27,9 @@ import {
 //   and size of all cash flows. The Performance panel below has always been
 //   correct (it uses computePeriodMetrics with proper cash flows). The KPI
 //   strip sub-labels were the only place still showing raw HPR.
+// v21y: "Run scenario" button in the header action row opens a modal for
+//   ephemeral scenario analysis. Results can be copied or saved to the
+//   reports table (report_type = 'scenario' added via companion SQL).
 //
 // Pitfall #7: the "Download report" button MUST remain in the header
 // and MUST call /api/export?portfolioId=... The apply-update.sh greps
@@ -34,6 +37,7 @@ import {
 
 const AllocationDonut = dynamic(() => import('@/components/portfolio/AllocationDonut'), { ssr: false })
 const SectorDonut     = dynamic(() => import('@/components/portfolio/SectorDonut'),     { ssr: false })
+const ScenarioModal   = dynamic(() => import('@/components/portfolio/ScenarioModal'),   { ssr: false })
 
 const SLEEVE_FILL: Record<string, string> = {
   liq: 'var(--sidebar-bg)',
@@ -104,6 +108,9 @@ export default function PortfolioOverviewPage() {
   const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('ITD')
   const [analytics, setAnalytics]             = useState<any>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
+
+  // v21y: Scenario modal state
+  const [scenarioOpen, setScenarioOpen] = useState(false)
 
   const load = useCallback(async () => {
     const [portRes, holdRes, sleeveRes] = await Promise.all([
@@ -396,6 +403,10 @@ export default function PortfolioOverviewPage() {
           </button>
           <button className="btn-h" onClick={downloadExcel}>
             <FileSpreadsheet size={12} /> Export Excel
+          </button>
+          {/* v21y: Run scenario */}
+          <button className="btn-h" onClick={() => setScenarioOpen(true)}>
+            <Sparkles size={12} /> Run scenario
           </button>
           {/* PITFALL #7 — DO NOT REMOVE: Download report */}
           <button
@@ -822,6 +833,16 @@ export default function PortfolioOverviewPage() {
           )}
         </div>
       ) : null}
+
+      {/* v21y: Scenario analysis modal */}
+      {scenarioOpen && (
+        <ScenarioModal
+          portfolioId={portfolioId}
+          portfolioName={portfolio.name}
+          clientName={(portfolio as any).client?.name ?? ''}
+          onClose={() => setScenarioOpen(false)}
+        />
+      )}
     </main>
   )
 }
