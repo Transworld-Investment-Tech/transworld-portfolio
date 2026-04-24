@@ -1,13 +1,14 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 
-// v21s-hotfix-1: CIO Brief prompt redesign.
-//   1. Pure flowing narrative throughout — NO markdown tables in body sections
-//   2. ONE summary table at the very top (Portfolio at a Glance)
-//   3. New "Corporate Intelligence" section — earnings, dividends, corporate
-//      actions, volumes, director dealings: things an investment professional
-//      catches that a casual observer misses
-//   4. Tone instruction from v21s remains
+// v21s-hotfix-2: Final CIO brief prompt structure.
+// Format defined by user review of three versions:
+//   - Metrics: 5 compact blockquote lines (intermediate style) — nothing else at top
+//   - Body: pure flowing narrative throughout (original style, latest tone)
+//   - NO portfolio table, NO bullet points, NO tables in body sections
+//   - "How Our Portfolios Are Performing" narrative kept (latest version quality)
+//   - Corporate Intelligence section kept
+//   - Text extraction fix: join all blocks, strip preamble
 
 export interface CIOBriefPortfolio {
   id: string; name: string; label: string
@@ -53,7 +54,7 @@ function buildCombinedPositions(portfolios: CIOBriefPortfolio[]): string {
       '  ' + ticker + ' (' + d.name + '): ' + fmtM(d.totalValue) +
       ' | price \u20a6' + d.price.toFixed(2) +
       ' | cost \u20a6' + d.avgCost.toFixed(2) +
-      ' | ' + d.mandates.join(', '))
+      ' | held by: ' + d.mandates.join(', '))
     .join('\n')
 }
 
@@ -81,42 +82,32 @@ function buildPrompt(input: CIOBriefInput): string {
 
   return `You are the Chief Investment Officer at Transworld Investment and Securities, Lagos, Nigeria.
 You are preparing the weekly CIO Intelligence Brief for the week ending ${weekEnd},
-for distribution to all clients, investors, and the weekly CIO conference call.
+for distribution to all clients and investors and to anchor the weekly CIO conference call.
 
 ${REPORT_TONE_INSTRUCTION}
 
-CRITICAL FORMATTING RULES (follow precisely):
-- Start your response IMMEDIATELY with "## Market Snapshot" — no preamble, no research commentary.
-- The brief must be PURE FLOWING NARRATIVE throughout. No markdown tables in any section
-  EXCEPT the single "Portfolio at a Glance" table described under ## Market Snapshot.
-- Do NOT create tables for holdings, stock analysis, or macro data. Write these as prose.
-- Use blockquotes (lines starting with "> ") ONLY for the 5 market metrics under Market Snapshot.
-- Use ### for sub-section headers within sections where helpful.
-- Write every section as connected paragraphs — like a well-crafted weekly letter.
-
 ══════════════════════════════════════
-STEP 1 — SEARCH SILENTLY. Do not write anything until Step 3.
+ABSOLUTE FORMATTING RULES — NO EXCEPTIONS
 ══════════════════════════════════════
 
-Search for the following topics now. Write nothing yet.
+1. Start IMMEDIATELY with "## Market Snapshot" — no preamble of any kind.
+2. NO bullet points anywhere in the brief. None. Every idea must be in a sentence.
+3. NO markdown tables anywhere in the brief. None at all.
+4. NO numbered lists. No dashes used as list markers.
+5. Every section after Market Snapshot is PURE FLOWING PROSE — connected sentences
+   and paragraphs that read like a well-written magazine article or letter.
+6. Use ## for section headers and ### for sub-sections within a section only.
+7. The five blockquote lines in Market Snapshot are the ONLY special formatting
+   allowed. Everything else is narrative paragraphs.
 
-MARKET DATA: NGX All-Share Index ${weekEnd} performance level, CBN MPR current rate ${yr},
-Nigeria inflation CPI latest ${yr}, USD NGN exchange rate today, Brent crude price today
+══════════════════════════════════════
+STEP 1 — SEARCH SILENTLY. Write nothing until Step 3.
+══════════════════════════════════════
 
-COMPANY INTELLIGENCE for each held stock (${allTickers.join(', ')}):
-- Recent earnings results or profit announcements
-- Dividend declarations, increases, cuts, or suspensions
-- Corporate actions: rights issues, mergers, acquisitions, delistings, new listings
-- Unusual trading volumes or price movements
-- Director and insider dealings: board member share purchases or sales
-- Any regulatory actions from CBN, SEC, or NGX affecting the company
-- Any analyst upgrades, downgrades, or target price changes
-- Any major management changes, contract wins, or operational news
-
-BROADER MARKET INTELLIGENCE:
-- Any significant corporate actions on the NGX this week beyond our holdings
-- Any Nigerian macro news: FX policy, inflation data, CBN decisions, NBS releases
-- Any global events affecting Nigerian equities (commodity prices, emerging market flows)
+Search for: NGX All-Share Index performance ${weekEnd}, CBN policy rate ${yr},
+Nigeria CPI inflation ${yr}, USD NGN rate today, Brent crude price today,
+and for each holding (${allTickers.join(', ')}): recent earnings, dividends,
+corporate actions, unusual volumes, director dealings, regulatory news.
 
 ══════════════════════════════════════
 STEP 2 — PORTFOLIO CONTEXT
@@ -126,133 +117,115 @@ Week ending ${weekEnd} | Generated: ${dateStr}
 FX: ${fxRate ? '\u20a6' + Math.round(fxRate).toLocaleString() + '/USD' : 'check search'}
 
 COMBINED BOOK:
-  Active mandates:   ${portfolios.length}
-  Combined NAV:      ${fmtM(totalNAV)}
-  Starting capital:  ${fmtM(totalStarting)}
-  Combined P&L:      ${fmtM(totalPnL)} since inception
+  Mandates: ${portfolios.length} | Combined NAV: ${fmtM(totalNAV)}
+  Starting capital: ${fmtM(totalStarting)} | Combined P&L: ${fmtM(totalPnL)}
 
-PER-MANDATE DATA:
+PER-MANDATE:
 ${portfolios.map(p => {
   const pnl    = p.current_nav - p.starting_nav
   const pnlPct = p.starting_nav > 0 ? (pnl / p.starting_nav * 100).toFixed(1) + '%' : 'N/A'
-  const topHoldings = p.holdings.filter(h => h.type === 'Stock').slice(0, 5)
+  const top5   = p.holdings.filter(h => h.type === 'Stock').slice(0, 5)
     .map(h => h.instrument_id + ' (' + (h.weight * 100).toFixed(0) + '%)').join(', ')
-  return '  [' + p.clientCode + '] ' + p.clientName + ' | ' + p.name + '\n' +
-    '  NAV: ' + fmtM(p.current_nav) + ' | starting: ' + fmtM(p.starting_nav) + ' | return: ' + pnlPct + '\n' +
-    '  income target: ' + (p.income_target * 100).toFixed(0) + '% p.a. | top holdings: ' + (topHoldings || 'none')
-}).join('\n\n')}
+  return '  [' + p.clientCode + '] ' + p.clientName + ' \u2014 ' + p.name + ': NAV ' +
+    fmtM(p.current_nav) + ' | starting ' + fmtM(p.starting_nav) + ' | return ' + pnlPct +
+    ' | top holdings: ' + (top5 || 'none')
+}).join('\n')}
 
-COMBINED EQUITY BOOK:
-${combinedPositions || '  No equity positions found.'}
+COMBINED EQUITY BOOK (for your reference when writing):
+${combinedPositions || '  No equity positions.'}
 
 WATCHLIST CONTEXT:
-  Held names on watchlist: ${heldOnList.slice(0, 10).map(w => w.ticker + ' (#' + w.rank + ')').join(', ') || 'none'}
-  Top unowned watchlist names: ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' — ' + w.name).join(' | ') || 'none'}
-  Fixed income watchlist: ${watchFI.slice(0, 5).map(w => (w.ticker || w.name) + ' [' + (w.sub_type ?? '') + ']').join(', ')}
-  Eagle-eye pipeline items: ${watchEagle.map(w => w.name).join(', ') || 'none'}
+  Held + on watchlist: ${heldOnList.slice(0,10).map(w => w.ticker + ' (#' + w.rank + ')').join(', ') || 'none'}
+  Top unowned: ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' — ' + w.name).join(' | ') || 'none'}
+  FI watchlist (top 5): ${watchFI.slice(0,5).map(w => (w.ticker||w.name) + ' [' + (w.sub_type??'') + ']').join(', ')}
+  Eagle-eye: ${watchEagle.map(w => w.name).join(', ') || 'none'}
 
 ══════════════════════════════════════
-STEP 3 — WRITE THE BRIEF. Start immediately with ## Market Snapshot.
+STEP 3 — WRITE. Begin with ## Market Snapshot.
 ══════════════════════════════════════
-
-Write the following seven sections in sequence. Each section is flowing narrative prose
-— connected paragraphs, no bullet points, no tables (except the single one below).
-The whole brief should read like one coherent, intelligent letter to an investor.
 
 ## Market Snapshot
-Write five blockquote lines with the week's key market metrics:
-  > **NGX All-Share Index:** [level] | [weekly change] | YTD: [change]
-  > **CBN Policy Rate (MPR):** [rate] — [one-line plain-English context]
-  > **USD/NGN Exchange Rate:** [₦ per dollar] | [weekly trend]
-  > **Brent Crude Oil:** [$price per barrel] | [weekly change]
-  > **Nigeria Inflation (CPI):** [latest %] | [trend direction]
 
-Then write ONE markdown table — the Portfolio at a Glance. This is the ONLY table in
-the entire brief. No other tables anywhere.
-| Portfolio | Client | Current Value | Gain Since We Started | This Week |
-|---|---|---|---|---|
-[Fill in from the portfolio data above. "Current Value" in ₦M. "Gain Since We Started"
-as ₦M and %. "This Week" as brief qualitative: "Strong / Steady / Watching".]
+Write exactly five blockquote lines with this week's key market numbers.
+These five lines are the ONLY special formatting in the entire brief. Format:
+> **NGX All-Share Index:** [level] | [weekly change and %] | YTD: [%]
+> **CBN Policy Rate (MPR):** [rate] — [one plain-English sentence on what this means]
+> **USD/NGN Exchange Rate:** [₦ per dollar] | [one-line trend note]
+> **Brent Crude Oil:** [$price per barrel] | [weekly change and key driver]
+> **Nigeria Inflation (CPI):** [latest %] | [one-line trend note]
 
-## Market Overview
-Three to four narrative paragraphs on the week's dominant market theme. What drove the
-NGX this week? What was the mood — cautious, euphoric, selective? Use the specific
-index level and movement you found. Bring in CBN stance, FX stability, and the global
-backdrop. Make the reader feel the texture of the market, not just the statistics.
-Use analogies and plain language as instructed in the tone rules.
+After the five blockquotes, write this section as three to four flowing paragraphs
+telling the story of the week's market. What was the dominant theme? What drove the
+NGX this week? Use a vivid analogy to open — make the reader feel the market's mood
+immediately. Then explain the macro context: CBN, FX, oil, global backdrop. Be specific
+with numbers but wrap them in plain language. End with a sentence that connects the
+macro picture to what it means for Nigerian investors.
 
 ## How Our Portfolios Are Performing
-Three to four paragraphs discussing the combined book in plain terms. Do not mention
-"NAV" without explaining it. Which mandates had a strong week and why? Which positions
-moved most? What worked, and what are we watching? Name specific companies and explain
-what they do in one line. Write as if explaining at a family dinner, not a board meeting.
+
+Write three to four paragraphs discussing the combined book as if you are a proud but
+clear-eyed manager reporting back to the people who trusted you with their savings.
+Open by putting the combined figures in plain, human terms — not "NAV" jargon but
+"here is what your investments are worth and here is what we built together." Then
+discuss which mandates had the strongest week and why. Name specific companies and
+explain in one sentence what each company does. Discuss what worked well and be honest
+about anything you are watching carefully. This section should feel warm, direct, and
+like a personal update from someone who genuinely cares about the outcomes.
+Do NOT include any table, any list, or any structured data format. Pure prose only.
 
 ## What's Happening With Our Key Investments
-One solid paragraph per major holding (${allTickers.slice(0, 8).join(', ')}). For each
-company: what do they do (briefly), how did the stock move this week, what does the
-business momentum look like, and what are we thinking about the position. Use the tone
-of a well-informed friend who owns shares in that company and wants to explain its story.
+
+Write one generous paragraph per major holding (${allTickers.slice(0, 8).join(', ')}).
+For each company: what does it do in plain terms, how did the stock perform this week,
+what is the business story behind the price move, and what is our thinking on the
+position. Write as if explaining to a smart friend who doesn't follow the stock market
+daily but wants to understand why we own what we own.
+No bullet points. No tables. No sub-lists. One paragraph flows into the next.
 
 ## Corporate Intelligence: Under the Radar This Week
-This is the section where our investment team brings you the corporate developments that
-could easily slip past a busy investor but matter enormously to how stocks move.
-An investment professional reads between the lines — this section is that reading.
 
-Write a flowing narrative — NOT a list — covering the following from your research.
-Group related items naturally as the narrative develops. Explain to the reader WHY each
-item matters, not just what happened.
+This section is where our investment professionals surface the corporate developments
+that matter but can easily get lost in the daily noise. Write it as one continuous
+narrative — not a categorised list. Let the intelligence flow naturally from one
+company or theme to the next, as a thoughtful analyst would explain it in conversation.
 
-WHAT TO COVER (include everything you found that is relevant):
+Draw on your research to surface any of the following that are relevant this week,
+woven into the narrative wherever they appear:
 
-Earnings and Results: Were any quarterly or annual results published for our holdings
-or significant NGX names this week? What were the headline numbers, and more importantly,
-what did they reveal about the business that the headline might obscure? A company can
-post "record profit" while its margins are quietly shrinking — that's the kind of
-nuance to surface here.
+Recent earnings results and what they reveal beyond the headline numbers. Dividend
+announcements and what they signal about management confidence. Corporate actions such
+as rights issues, mergers, acquisitions, or new listings. Unusual trading volumes and
+what institutional behaviour they might suggest. Director and insider share dealings and
+what they imply. Regulatory actions or compliance developments from CBN, SEC, or NGX.
+Analyst rating changes or institutional shareholding shifts. Anything else an experienced
+investment professional would flag that a casual observer would miss.
 
-Dividend Signals: Any dividend declarations, increases, cuts, or suspensions? A dividend
-cut is management telling you they expect hard times ahead. A special dividend is
-management saying they have more cash than they know what to do with. Explain the signal.
-
-Corporate Actions: Rights issues (where a company asks existing shareholders for more
-money), mergers, acquisitions, name changes, delistings, new listings, or regulatory
-approvals. These often move stocks significantly but receive minimal mainstream coverage.
-
-Volume Intelligence: Were there any unusual trading volumes in our holdings or watchlist
-names this week? When a stock trades three times its normal daily volume for no obvious
-reason, something is usually happening behind the scenes. Flag it.
-
-Director and Insider Dealings: Did any company directors, board members, or major
-shareholders buy or sell significant amounts of their own company's shares this week?
-Insider buying is one of the strongest signals in investing — explain why.
-
-Regulatory and Compliance Developments: Any CBN, SEC, or NGX regulatory actions
-affecting our holdings or sectors? Any disclosures that companies were required to make?
-Were there any investigations, sanctions, or compliance notices worth noting?
-
-Analyst and Institutional Movements: Any significant analyst rating changes, price target
-revisions, or large institutional shareholding disclosures?
-
-If any of these categories had nothing notable this week, skip it naturally and move on.
-The goal is an honest, professional intelligence briefing — not padding.
+Explain to the reader not just what happened, but why it matters and what it might mean
+for the stock or for our position. Bring your professional eye to what others overlook.
+Skip any category that had nothing notable this week — do not pad.
 
 ## What the Watchlist Is Telling Us
-Two to three paragraphs on the most compelling signals from the Transworld watchlist this
-week. Are any top-ranked companies we do not yet own showing catalysts — price moves,
-positive results, or sector tailwinds — that make them more actionable? Are any eagle-eye
-pipeline items approaching a trigger? Write this as a narrative, not a list of names.
+
+Write two to three paragraphs as flowing narrative on the signals coming from the
+Transworld watchlist this week. Which unowned names are showing catalysts that make
+them more compelling? Which eagle-eye pipeline items are approaching a trigger point?
+What does the combined watchlist intelligence tell us about where the next opportunities
+are? Write with the forward-looking energy of someone who is excited about what they
+are seeing, grounded in the specific names and rationale.
 
 ## Our Outlook and What We Are Doing About It
-Three to four closing paragraphs. Be honest about the principal risk to the combined
-book over the next two to four weeks. Be specific and direct about the opportunity
-you see. Signal any portfolio actions under consideration. Close with one or two
-sentences that give clients genuine confidence in our direction — or an honest
-acknowledgment of the key uncertainties we are navigating. Do not be vague.
+
+Write three to four honest, direct paragraphs closing the brief. Name the principal risk
+to our combined book plainly and specifically. Name the opportunity you see with equal
+clarity. Signal any portfolio actions under active consideration. End with a paragraph
+that gives clients genuine confidence in the direction of the combined mandate — or
+acknowledges honestly the key uncertainties we are navigating together. Do not be vague.
+This closing should feel like a CIO who respects their clients enough to be straight
+with them.
 
 ---
 *CIO Weekly Intelligence Brief — week ending ${weekEnd} | Transworld Investment and Securities*
-*Discretionary Account Management. For distribution to clients and investors.*
-*All investment decisions remain at the discretion of the portfolio manager.*`
+*Discretionary Account Management. For distribution to clients and investors.*`
 }
 
 export async function generateCIOBrief(input: CIOBriefInput): Promise<string> {
@@ -263,13 +236,13 @@ export async function generateCIOBrief(input: CIOBriefInput): Promise<string> {
     tools:      [{ type: 'web_search_20250305', name: 'web_search' }],
     messages:   [{ role: 'user', content: buildPrompt(input) }],
   })
-  // Join all text blocks, strip self-talk before first ## header
+  // Join all text blocks (model may split across searches), strip self-talk preamble
   const blocks = (response.content as any[])
     .filter((b: any) => b.type === 'text')
     .map((b: any) => (b.text as string).trim())
     .filter(t => t.length > 0)
-  const all       = blocks.join('\n\n').trim()
-  const startsH2  = all.startsWith('## ')
-  const firstH2   = all.indexOf('\n## ')
+  const all      = blocks.join('\n\n').trim()
+  const startsH2 = all.startsWith('## ')
+  const firstH2  = all.indexOf('\n## ')
   return startsH2 ? all : firstH2 >= 0 ? all.slice(firstH2 + 1) : all
 }
