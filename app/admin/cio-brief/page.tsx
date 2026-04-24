@@ -2,10 +2,15 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Clock, Sparkles, FileText, Printer, Copy, Check, Radio, Trash2 } from 'lucide-react'
 
-// v21s-hotfix-3: Delete button added to CIO brief history panel.
-// Trash icon (faint) on each item → click → inline confirm → DELETE API call.
-// loadHistory accepts keepSelectedId so deleting a non-selected brief
-// doesn't jump the user to the top of the list.
+// v21t: Blockquote metric grouping.
+// Consecutive `> ` lines are now collapsed into a single {t:'bq_group'} block
+// and rendered as ONE gold-bordered panel with stacked compact rows — instead
+// of each line producing its own full-width card. Matches the "intermediate"
+// PDF look the user preferred at the top of the CIO brief (5-line metric
+// strip: NGX, CBN, USD/NGN, Brent, CPI). Print HTML mirrors this with a
+// .callout-group / .callout-row structure; old .callout class removed.
+//
+// Prior note (v21s-hotfix-3): Delete button in history panel. Confirmed working.
 
 function formatInline(text: string): React.ReactNode[] {
   if (!text) return []
@@ -47,7 +52,7 @@ function normalizeParagraphs(text: string): string {
 type Block =
   | { t: 'h2'; text: string } | { t: 'h3'; text: string } | { t: 'h4'; text: string }
   | { t: 'hr' } | { t: 'blank' } | { t: 'p'; text: string }
-  | { t: 'li'; text: string } | { t: 'bq'; text: string }
+  | { t: 'li'; text: string } | { t: 'bq_group'; texts: string[] }
   | { t: 'table'; headers: string[]; rows: string[][] }
 
 function parseBlocks(raw: string): Block[] {
@@ -64,7 +69,15 @@ function parseBlocks(raw: string): Block[] {
     else if (line.startsWith('- ') || line.startsWith('\u2022 ')) {
       blocks.push({ t: 'li', text: line.replace(/^[-\u2022]\s+/, '') }); i++
     }
-    else if (line.startsWith('> '))         { blocks.push({ t: 'bq', text: line.slice(2) });  i++ }
+    else if (line.startsWith('> ')) {
+      // v21t: collapse consecutive `> ` lines into one grouped block.
+      const texts: string[] = []
+      while (i < lines.length && lines[i].startsWith('> ')) {
+        texts.push(lines[i].slice(2))
+        i++
+      }
+      blocks.push({ t: 'bq_group', texts })
+    }
     else if (line.startsWith('| ')) {
       const tbl: string[] = []
       while (i < lines.length && lines[i].startsWith('| ')) { tbl.push(lines[i]); i++ }
@@ -88,7 +101,30 @@ function renderMarkdown(raw: string): React.ReactNode[] {
       case 'blank': return [<div key={i} style={{ height: 8 }} />]
       case 'p':     return [<p key={i} style={{ fontSize: 13.5, lineHeight: 1.9, color: 'var(--text)', margin: '8px 0', textAlign: 'justify' as const }}>{formatInline(block.text)}</p>]
       case 'li':    return [<div key={i} style={{ display: 'flex', gap: 10, margin: '5px 0 5px 10px' }}><span style={{ color: 'var(--gold)', flexShrink: 0, fontWeight: 700, marginTop: 2 }}>\u00b7</span><p style={{ fontSize: 13.5, lineHeight: 1.85, color: 'var(--text)', margin: 0, textAlign: 'justify' as const }}>{formatInline(block.text)}</p></div>]
-      case 'bq':    return [<div key={i} style={{ borderLeft: '3px solid var(--gold)', background: 'linear-gradient(90deg,rgba(176,139,62,0.08) 0%,rgba(176,139,62,0.03) 100%)', padding: '10px 16px', margin: '5px 0', borderRadius: '0 4px 4px 0' }}><p style={{ fontSize: 13, color: 'var(--text)', margin: 0, fontWeight: 500 }}>{formatInline(block.text)}</p></div>]
+      case 'bq_group': return [
+        <div key={i} style={{
+          borderLeft: '3px solid var(--gold)',
+          background: 'linear-gradient(90deg,rgba(176,139,62,0.09) 0%,rgba(176,139,62,0.03) 100%)',
+          padding: '14px 20px',
+          margin: '20px 0',
+          borderRadius: '0 4px 4px 0',
+        }}>
+          {block.texts.map((t, j) => (
+            <div key={j} style={{
+              fontSize: 13,
+              lineHeight: 1.65,
+              color: 'var(--text)',
+              fontWeight: 500,
+              padding: j === 0
+                ? '0 0 6px 0'
+                : j === block.texts.length - 1
+                  ? '7px 0 0 0'
+                  : '7px 0 6px 0',
+              borderTop: j === 0 ? 'none' : '1px solid rgba(176,139,62,0.14)',
+            }}>{formatInline(t)}</div>
+          ))}
+        </div>
+      ]
       case 'table': return [<div key={i} style={{ overflowX: 'auto', margin: '20px 0', borderRadius: 4, border: '1px solid var(--border)', boxShadow: '0 1px 4px rgba(15,41,71,0.06)' }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>{block.headers.length > 0 && <thead><tr style={{ background: 'var(--sidebar-bg)' }}>{block.headers.map((h, j) => <th key={j} style={{ padding: '10px 14px', textAlign: 'left' as const, color: 'var(--gold-bright)', fontWeight: 600, fontSize: 10, textTransform: 'uppercase' as const, letterSpacing: '0.14em', whiteSpace: 'nowrap' as const }}>{h}</th>)}</tr></thead>}<tbody>{block.rows.map((row, ri) => <tr key={ri} style={{ background: ri % 2 === 0 ? 'var(--bg-soft)' : 'var(--card)' }}>{row.map((cell, ci) => <td key={ci} style={{ padding: '9px 14px', borderBottom: ri < block.rows.length-1 ? '1px solid var(--border-soft)' : 'none', color: ci===0?'var(--text)':'var(--text-2)', fontWeight: ci===0?500:400 }}>{formatInline(cell)}</td>)}</tr>)}</tbody></table></div>]
       default: return []
     }
@@ -108,7 +144,19 @@ function buildPrintHTML(briefDate: string, content: string): string {
     else if (ln.startsWith('#### '))     html.push('<h4>' + applyInline(ln.slice(5)) + '</h4>')
     else if (ln.startsWith('---'))       html.push('<hr>')
     else if (ln.trim() === '')           html.push('<div class="gap"></div>')
-    else if (ln.startsWith('> '))        html.push('<div class="callout">' + applyInline(ln.slice(2)) + '</div>')
+    else if (ln.startsWith('> ')) {
+      // v21t: group consecutive `> ` lines into a single metrics strip
+      const group: string[] = []
+      while (i < lines.length && lines[i].startsWith('> ')) {
+        group.push(lines[i].slice(2))
+        i++
+      }
+      i--
+      let g = '<div class="callout-group">'
+      group.forEach(line => { g += '<div class="callout-row">' + applyInline(line) + '</div>' })
+      g += '</div>'
+      html.push(g)
+    }
     else if (ln.startsWith('| ')) {
       const tbl: string[] = []
       while (i < lines.length && lines[i].startsWith('| ')) { tbl.push(lines[i]); i++ }
@@ -143,12 +191,14 @@ function buildPrintHTML(briefDate: string, content: string): string {
     + 'p{margin:7px 0;color:#0f2947;font-size:11pt;line-height:1.85;text-align:justify}'
     + 'strong{font-weight:700;color:#0f2947}em{color:#5c6573}'
     + 'hr{border:none;border-top:1px solid rgba(15,41,71,0.12);margin:24px 0}.gap{height:8px}'
-    + '.callout{border-left:3px solid #b08b3e;background:rgba(176,139,62,0.07);padding:9px 14px;margin:5px 0;border-radius:0 3px 3px 0;font-weight:500;font-size:10.5pt}'
+    + '.callout-group{border-left:3px solid #b08b3e;background:rgba(176,139,62,0.07);padding:12px 18px;margin:18px 0;border-radius:0 3px 3px 0;page-break-inside:avoid}'
+    + '.callout-row{font-size:10.5pt;font-weight:500;line-height:1.65;color:#0f2947;padding:4px 0}'
+    + '.callout-row + .callout-row{border-top:1px solid rgba(176,139,62,0.14);margin-top:2px;padding-top:7px}'
     + 'table{width:100%;border-collapse:collapse;margin:16px 0;font-size:9.5pt;page-break-inside:avoid}'
     + 'thead tr{background:#0a1f3a}th{padding:9px 12px;text-align:left;color:#c9a556;font-weight:600;font-size:8pt;text-transform:uppercase;letter-spacing:0.12em}'
     + 'td{padding:8px 12px;border-bottom:1px solid rgba(15,41,71,0.07)}tr.even td{background:#faf5ea}tr.odd td{background:#fffbf2}td.first{font-weight:600}'
     + '.pbtn{position:fixed;top:16px;right:16px;background:#0a1f3a;color:#c9a556;border:none;border-radius:3px;padding:10px 18px;font-size:12px;cursor:pointer;font-family:"DM Sans",sans-serif;font-weight:600}'
-    + '@media print{@page{size:A4;margin:15mm}.pbtn{display:none!important}body{background:white}.ph{background:none!important;border-bottom:2px solid #b08b3e;padding:0 0 18px;margin-bottom:24px}.title{color:#0f2947!important}.firm{color:#b08b3e!important}.meta{color:#5c6573!important}.content{padding:0}thead tr{background:#0a1f3a!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}}'
+    + '@media print{@page{size:A4;margin:15mm}.pbtn{display:none!important}body{background:white}.ph{background:none!important;border-bottom:2px solid #b08b3e;padding:0 0 18px;margin-bottom:24px}.title{color:#0f2947!important}.firm{color:#b08b3e!important}.meta{color:#5c6573!important}.content{padding:0}thead tr{background:#0a1f3a!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}.callout-group{background:rgba(176,139,62,0.07)!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}}'
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>' + css + '</style></head><body>'
     + '<button class="pbtn" onclick="window.print()">Print / Save PDF</button>'
     + '<div class="ph"><div class="firm">Transworld Investment and Securities \u00b7 CIO Intelligence Brief</div>'
