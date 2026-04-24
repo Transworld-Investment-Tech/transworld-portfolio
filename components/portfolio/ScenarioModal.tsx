@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect, useCallback, type ReactElement } from 'react'
 import { Sparkles, X, Copy, Save, RefreshCw, Check } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 
@@ -157,9 +157,9 @@ function parseBlocks(md: string): Block[] {
   return out
 }
 
-function renderInline(s: string): (string | JSX.Element)[] {
+function renderInline(s: string): (string | ReactElement)[] {
   // Handle **bold**, *italic*, `code` in a simple pass.
-  const parts: (string | JSX.Element)[] = []
+  const parts: (string | ReactElement)[] = []
   const re = /(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g
   let lastIdx = 0
   let m: RegExpExecArray | null
