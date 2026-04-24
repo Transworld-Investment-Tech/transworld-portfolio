@@ -1,14 +1,15 @@
 import Anthropic from '@anthropic-ai/sdk'
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 
-// v21s-hotfix-2: Final CIO brief prompt structure.
-// Format defined by user review of three versions:
-//   - Metrics: 5 compact blockquote lines (intermediate style) — nothing else at top
-//   - Body: pure flowing narrative throughout (original style, latest tone)
-//   - NO portfolio table, NO bullet points, NO tables in body sections
-//   - "How Our Portfolios Are Performing" narrative kept (latest version quality)
-//   - Corporate Intelligence section kept
-//   - Text extraction fix: join all blocks, strip preamble
+// v21u: Market Snapshot converted from 5 blockquote metric lines to pure prose.
+// The five key numbers (NGX, CBN MPR, USD/NGN, Brent, CPI) are now woven into
+// the opening narrative paragraphs, not listed. User feedback after 7 attempts
+// at the metric-strip layout: prose sidesteps the rendering question entirely.
+//
+// Prior (v21s-hotfix-2 through v21t): intermediate metric-strip experiments.
+// The bq_group renderer shipped in v21t is left in place as a defensive
+// fallback for any future brief that emits a stray `>` line, but is no longer
+// exercised by the standard brief output.
 
 export interface CIOBriefPortfolio {
   id: string; name: string; label: string
@@ -91,14 +92,18 @@ ABSOLUTE FORMATTING RULES — NO EXCEPTIONS
 ══════════════════════════════════════
 
 1. Start IMMEDIATELY with "## Market Snapshot" — no preamble of any kind.
-2. NO bullet points anywhere in the brief. None. Every idea must be in a sentence.
-3. NO markdown tables anywhere in the brief. None at all.
-4. NO numbered lists. No dashes used as list markers.
-5. Every section after Market Snapshot is PURE FLOWING PROSE — connected sentences
-   and paragraphs that read like a well-written magazine article or letter.
-6. Use ## for section headers and ### for sub-sections within a section only.
-7. The five blockquote lines in Market Snapshot are the ONLY special formatting
-   allowed. Everything else is narrative paragraphs.
+2. NO bullet points anywhere. Every idea must be in a sentence.
+3. NO markdown tables anywhere.
+4. NO numbered lists. No dashes or asterisks used as list markers.
+5. NO blockquotes (> lines) anywhere. None — not even for metrics at the top.
+6. NO "**Label:** value" patterns. A bold phrase followed by a colon and a
+   number reads as a metric line even when it sits inside a paragraph. Numbers
+   appear INSIDE sentences as ordinary nouns with verbs and context around
+   them — never as data points with captions.
+7. Use ## for section headers and ### for sub-section headers only.
+8. The entire brief is PURE FLOWING PROSE from the first sentence of Market
+   Snapshot to the final sentence of the outlook. Read like a well-written
+   magazine article or a letter from a thoughtful investment manager.
 
 ══════════════════════════════════════
 STEP 1 — SEARCH SILENTLY. Write nothing until Step 3.
@@ -136,7 +141,7 @@ ${combinedPositions || '  No equity positions.'}
 
 WATCHLIST CONTEXT:
   Held + on watchlist: ${heldOnList.slice(0,10).map(w => w.ticker + ' (#' + w.rank + ')').join(', ') || 'none'}
-  Top unowned: ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' — ' + w.name).join(' | ') || 'none'}
+  Top unowned: ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' \u2014 ' + w.name).join(' | ') || 'none'}
   FI watchlist (top 5): ${watchFI.slice(0,5).map(w => (w.ticker||w.name) + ' [' + (w.sub_type??'') + ']').join(', ')}
   Eagle-eye: ${watchEagle.map(w => w.name).join(', ') || 'none'}
 
@@ -146,20 +151,21 @@ STEP 3 — WRITE. Begin with ## Market Snapshot.
 
 ## Market Snapshot
 
-Write exactly five blockquote lines with this week's key market numbers.
-These five lines are the ONLY special formatting in the entire brief. Format:
-> **NGX All-Share Index:** [level] | [weekly change and %] | YTD: [%]
-> **CBN Policy Rate (MPR):** [rate] — [one plain-English sentence on what this means]
-> **USD/NGN Exchange Rate:** [₦ per dollar] | [one-line trend note]
-> **Brent Crude Oil:** [$price per barrel] | [weekly change and key driver]
-> **Nigeria Inflation (CPI):** [latest %] | [one-line trend note]
+Open the brief with three to four flowing paragraphs that tell the story of the
+week's Nigerian market. This is the first thing a client reads — it is not a
+data dump. Five facts must appear in the prose, woven into sentences with
+context around them, never listed or stacked or prefixed with bold labels:
+the NGX All-Share Index's closing level together with its weekly change in
+points and percent and year-to-date performance; the CBN's current Monetary
+Policy Rate and what it signals about the central bank's stance; where USD/NGN
+is trading and the recent trend; where Brent crude is trading and what is
+driving it; and the latest Nigeria CPI inflation print with its trend.
 
-After the five blockquotes, write this section as three to four flowing paragraphs
-telling the story of the week's market. What was the dominant theme? What drove the
-NGX this week? Use a vivid analogy to open — make the reader feel the market's mood
-immediately. Then explain the macro context: CBN, FX, oil, global backdrop. Be specific
-with numbers but wrap them in plain language. End with a sentence that connects the
-macro picture to what it means for Nigerian investors.
+Open with a vivid analogy or image that gives the reader the market's mood
+immediately. Then weave the macro picture — CBN policy, FX, oil, global
+backdrop — through connected prose, using specific numbers but always wrapped
+in plain English. End the section with a sentence that bridges to what this
+macro backdrop means for Nigerian investors going into the week ahead.
 
 ## How Our Portfolios Are Performing
 
