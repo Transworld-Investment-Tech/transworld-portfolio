@@ -108,7 +108,7 @@ export async function generateConsolidatedReport(input: ConsolidatedReportInput)
   const tickers  = equities.map(h => h.instrument_id).join(', ')
   const watchCtx = buildConsolidatedWatchlistContext(combinedHoldings, watchlist)
 
-  const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Asset Management, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
+  const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
 Generate a rigorous, insightful CONSOLIDATED ${reportType.toUpperCase()} portfolio intelligence report for: ${period}
 Generated: ${today}
@@ -230,7 +230,7 @@ Where to trim, where to add — with ₦ sizes and which portfolio executes.
 Key data events and watchlist triggers to monitor.
 
 ---
-*Consolidated report generated ${today} | Transworld Asset Management Portfolio Intelligence*
+*Consolidated report generated ${today} | Transworld Investment and Securities — Discretionary Account Management*
 *Covers: ${portfolios.map(p => `Portfolio ${p.label} (${p.name})`).join(', ')}*
 *Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). Valuations are analytical estimates.*
 *All investment decisions remain at the discretion of the portfolio manager.*`

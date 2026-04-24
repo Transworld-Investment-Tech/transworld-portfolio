@@ -52,8 +52,8 @@ export default function LoginPageInner() {
               <circle cx="14" cy="6" r="2" fill="#a78bfa"/>
             </svg>
           </div>
-          <div className="text-[11px] font-bold tracking-[0.15em] text-[#a78bfa] uppercase mb-1">Transworld AM</div>
-          <h1 className="text-xl font-semibold text-[#e8eaf0]">Portfolio Intelligence</h1>
+          <div className="text-[11px] font-bold tracking-[0.15em] text-[#a78bfa] uppercase mb-1">Transworld I&S</div>
+          <h1 className="text-xl font-semibold text-[#e8eaf0]">Portfolio Intel</h1>
           <p className="text-xs text-[#555d72] mt-1.5">Sign in to your account</p>
         </div>
         <div className="bg-[#13161d] border border-white/[0.07] rounded-2xl p-7">

@@ -241,7 +241,7 @@ export default function WatchlistPage() {
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
           <div>
             <div className="eyebrow" style={{ marginBottom: 6 }}>
-              Transworld Asset Management
+              Transworld Investment and Securities
             </div>
             <h1 className="hybrid-serif" style={{ fontSize: 28, fontWeight: 500, letterSpacing: '-0.005em', color: 'var(--text)', lineHeight: 1 }}>
               NGX Master Watchlist

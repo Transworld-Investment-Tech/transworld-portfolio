@@ -270,7 +270,7 @@ function buildPrintHTML(portfolioName: string, reportType: string, reportDate: s
     ".content{padding:0;border:none}p{orphans:3;widows:3}}"
   return '<!DOCTYPE html><html><head><meta charset="UTF-8"><style>' + css + '</style></head><body>' +
     '<button class="pbtn" onclick="window.print()">Print / Save PDF</button>' +
-    '<div class="ph"><div class="firm">Transworld Asset Management · Portfolio Intelligence</div>' +
+    '<div class="ph"><div class="firm">Transworld Investment and Securities · Discretionary Account Management</div>' +
     '<div class="pname">' + portfolioName + '</div>' +
     '<div class="pmeta">' + reportType.toUpperCase() + ' · ' + reportDate + ' · ' + date + '</div></div>' +
     '<div class="content">' + body + '</div>' +
@@ -662,7 +662,7 @@ export default function PortfolioReportsPage() {
                       marginBottom: 6,
                     }}
                   >
-                    Transworld Asset Management — Portfolio Intelligence
+                    Transworld Investment and Securities — Discretionary Account Management
                   </div>
                   <div
                     className="hybrid-serif"

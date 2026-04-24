@@ -78,7 +78,7 @@ export async function POST(req: NextRequest) {
     // modulo whitespace. "Acknowledge if data is from training
     // knowledge" reminder dropped — web_search gives us current
     // information.
-    const prompt = `You are a Nigerian capital markets analyst at Transworld Asset Management, Lagos.
+    const prompt = `You are a Nigerian capital markets analyst at Transworld Investment and Securities, Lagos.
 Provide a brief, current market intelligence note for this security:
 
 Name: ${name}

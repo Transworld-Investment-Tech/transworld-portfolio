@@ -2,8 +2,8 @@ import type { Metadata } from 'next'
 import './globals.css'
 
 export const metadata: Metadata = {
-  title: 'Transworld Portfolio Intelligence',
-  description: 'Multi-portfolio management platform — Transworld Asset Management',
+  title: 'Transworld Investment and Securities — Portfolio Intel',
+  description: 'Multi-portfolio management platform — Transworld Investment and Securities',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {

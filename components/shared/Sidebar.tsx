@@ -138,7 +138,7 @@ export default function Sidebar({
                 marginBottom: 3,
               }}
             >
-              Transworld AM
+              Transworld I&S
             </div>
             <div
               style={{

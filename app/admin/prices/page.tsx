@@ -302,7 +302,7 @@ td.num{text-align:right}
 </div>
 <div class="header">
   <div>
-    <div class="eyebrow">Transworld Asset Management</div>
+    <div class="eyebrow">Transworld Investment and Securities</div>
     <h1>Market Prices</h1>
   </div>
   <div class="meta">
@@ -328,7 +328,7 @@ td.num{text-align:right}
 <tbody>${tableRows}</tbody>
 </table>
 <div class="footer">
-  Transworld Asset Management &nbsp;·&nbsp; Market Prices &nbsp;·&nbsp; ${today}<br>
+  Transworld Investment and Securities &nbsp;·&nbsp; Market Prices &nbsp;·&nbsp; ${today}<br>
   Prices sourced from the Nigerian Exchange Group (NGX). For investment decision-making use only.
 </div>
 </body>

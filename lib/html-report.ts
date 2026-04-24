@@ -769,7 +769,7 @@ export function generateHTMLReport(data: ReportData): string {
   <div class="header">
     <div class="header-top">
       <div>
-        <div class="firm">Transworld Asset Management · Portfolio Intelligence</div>
+        <div class="firm">Transworld Investment and Securities · Discretionary Account Management</div>
         <div class="port-name">${data.portfolioName}</div>
         <div class="client-name">${data.clientName}</div>
       </div>
@@ -925,7 +925,7 @@ export function generateHTMLReport(data: ReportData): string {
   </div>
 
   <div class="footer">
-    <strong>Transworld Asset Management</strong> — Portfolio Intelligence Report<br>
+    <strong>Transworld Investment and Securities</strong> — Discretionary Account Management Report<br>
     This report was generated on ${data.generatedAt} for ${data.clientName}. It is prepared for the exclusive use of the named client and contains confidential information.
     AI-assisted analytical suggestions and investment signals are indicative in nature and do not constitute investment advice.
     The portfolio manager retains full discretion over all investment decisions.

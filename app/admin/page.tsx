@@ -58,7 +58,7 @@ export default function AdminPage() {
       <div className="page-head">
         <div>
           <div className="eyebrow" style={{ marginBottom: 10 }}>
-            Transworld Asset Management
+            Transworld Investment and Securities
           </div>
           <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
             Admin panel

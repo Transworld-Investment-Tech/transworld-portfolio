@@ -259,7 +259,7 @@ INSTRUCTION TO AI: When writing this report, always cite the ITD IRR as the port
 Never present the Raw HPR as the portfolio's performance. If you reference any return percentage,
 it must be the IRR figure above.`
 
-  const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Asset Management, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
+  const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
 Generate a rigorous, insightful ${reportType.toUpperCase()} portfolio intelligence report for the period: ${period}
 Generated: ${today}
@@ -382,7 +382,7 @@ Prioritise by urgency. Cross-reference watchlist for the buys.
 Include any eagle-eye watchlist items approaching a trigger point.
 
 ---
-*Report generated ${today} | Transworld Asset Management Portfolio Intelligence*
+*Report generated ${today} | Transworld Investment and Securities — Discretionary Account Management*
 *Performance: ITD IRR ${perf.itdIRR !== null ? (perf.itdIRR * 100).toFixed(2) + '% p.a.' : 'N/A'} (Money-Weighted Return, Newton-Raphson). Valuations are analytical estimates.*
 *Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities).*
 *All investment decisions remain at the discretion of the portfolio manager.*`

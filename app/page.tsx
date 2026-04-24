@@ -172,7 +172,7 @@ export default function HomePage() {
           {/* Page header */}
           <div className="page-head">
             <div>
-              <div className="eyebrow" style={{ marginBottom: 10 }}>Transworld Asset Management</div>
+              <div className="eyebrow" style={{ marginBottom: 10 }}>Transworld Investment and Securities</div>
               <h1
                 className="hybrid-serif"
                 style={{
