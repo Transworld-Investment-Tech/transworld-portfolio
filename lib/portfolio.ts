@@ -21,11 +21,19 @@ export interface Instrument {
   asset_class: string
   currency?: string            // 'NGN' (always, in practice)
   coupon_pct: number
+  coupon_freq?: number | null
+  maturity_date?: string | null
   approved?: boolean
   ngx_symbol?: string
   // v20h additions — per-security classification from NGX
   sector?: string | null
   ngx_market?: string | null
+  // v21z additions — fixed income yield tracking
+  yield_pct?: number | null
+  yield_source?: string | null
+  yield_as_of?: string | null
+  yield_last_refreshed_at?: string | null
+  yield_notes?: string | null
   // Computed / joined at query time:
   latest_price?: number
   day_change?: number

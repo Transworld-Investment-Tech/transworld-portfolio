@@ -6,6 +6,7 @@ import { supabase } from '@/lib/supabase'
 
 // v20: Hybrid sidebar — navy #0a1f3a × muted gold text × Cormorant logo mark.
 // v21b-3b: Added "Broker files" entry to the admin section (/admin/broker).
+// v21z: Added "Fixed income" entry between Market prices and Broker files.
 //
 // Footer shows a live staleness dot based on the most recent market_prices
 // row. "Fresh" if any price within 3 days, "Stale" otherwise.
@@ -65,6 +66,7 @@ export default function Sidebar({
     { href: '/', label: 'All portfolios', icon: '▦', exact: true },
     { href: '/admin', label: 'Admin panel', icon: '◉', exact: true },
     { href: '/admin/prices', label: 'Market prices', icon: '⟡' },
+    { href: '/admin/fixed-income', label: 'Fixed income', icon: '§' },
     { href: '/admin/broker', label: 'Broker files', icon: '▣' },
     { href: '/watchlist',      label: 'NGX Watchlist',   icon: '❈' },
   { href: '/admin/aliases',        label: 'Ticker aliases',  icon: '⇄' },
