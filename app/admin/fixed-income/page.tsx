@@ -4,16 +4,17 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import {
   ArrowLeft, Edit2, Search, X, Save, Info, Sparkles,
-  AlertCircle, CheckCircle2,
+  AlertCircle, CheckCircle2, ExternalLink, Clipboard,
 } from 'lucide-react'
 
 // v21z: Fixed Income admin page.
-// Manages yield_pct / yield_as_of / yield_source / yield_notes on the
-// 72 sleeve_id='fi' instruments (2 legacy buckets + 70 watchlist-seeded).
-// Two entry paths: per-row manual Edit, or batch AI refresh that proposes
-// yields via web_search and lets the user review before saving.
+// v21z-hotfix-1: Replaced the `web_search` AI refresh (3/72 hit rate — data
+// not on open web) with a paste-from-FMDQ flow. User opens FMDQ's Market Data
+// page, copies their Daily Quotations table, pastes here, Claude parses and
+// maps to our instrument IDs. Review modal unchanged.
 
 const YIELD_STALE_DAYS = 14
+const FMDQ_URL = 'https://fmdqgroup.com/exchange/market-data/'
 
 interface FiRow {
   instrument_id: string
@@ -32,7 +33,7 @@ interface FiRow {
   yield_notes: string | null
 }
 
-interface AiProposal {
+interface ParsedProposal {
   instrument_id: string
   yield_pct: number
   source: string
@@ -41,7 +42,7 @@ interface AiProposal {
   notes?: string
 }
 
-interface ReviewRow extends AiProposal {
+interface ReviewRow extends ParsedProposal {
   name: string
   current_yield: number | null
   accepted: boolean
@@ -103,12 +104,16 @@ export default function FixedIncomePage() {
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState('')
 
-  // AI refresh modal
-  const [aiLoading, setAiLoading] = useState(false)
-  const [aiError, setAiError] = useState('')
-  const [aiProposals, setAiProposals] = useState<ReviewRow[] | null>(null)
-  const [aiSaving, setAiSaving] = useState(false)
-  const [aiSaveMsg, setAiSaveMsg] = useState('')
+  // Paste-from-FMDQ modal
+  const [pasteOpen, setPasteOpen] = useState(false)
+  const [pasteText, setPasteText] = useState('')
+  const [pasteLoading, setPasteLoading] = useState(false)
+  const [pasteError, setPasteError] = useState('')
+
+  // Review modal (shared between any proposal source)
+  const [proposals, setProposals] = useState<ReviewRow[] | null>(null)
+  const [batchSaving, setBatchSaving] = useState(false)
+  const [batchSaveMsg, setBatchSaveMsg] = useState('')
 
   useEffect(() => { load() }, [])
 
@@ -196,7 +201,7 @@ export default function FixedIncomePage() {
         ? {
             yield_pct: y,
             yield_as_of: editAsOf,
-            yield_source: editing.yield_source === 'ai-refresh' ? 'manual' : (editing.yield_source ?? 'manual'),
+            yield_source: 'manual',
             yield_notes: editNotes || null,
             yield_last_refreshed_at: new Date().toISOString(),
           }
@@ -207,8 +212,6 @@ export default function FixedIncomePage() {
             yield_notes: null,
             yield_last_refreshed_at: null,
           }
-      // Always set source='manual' for hand-edits even if there was a prior AI value
-      if (hasYield) update.yield_source = 'manual'
 
       const { error } = await (supabase.from('instruments') as any)
         .update(update)
@@ -227,23 +230,36 @@ export default function FixedIncomePage() {
     }
   }
 
-  // ─── AI refresh flow ───
+  // ─── Paste-from-FMDQ flow ───
 
-  async function runAiRefresh() {
-    setAiLoading(true)
-    setAiError('')
-    setAiProposals(null)
-    setAiSaveMsg('')
+  function openPaste() {
+    setPasteOpen(true)
+    setPasteText('')
+    setPasteError('')
+  }
+
+  async function submitPaste() {
+    const trimmed = pasteText.trim()
+    if (trimmed.length < 30) {
+      setPasteError('Paste looks too short. Copy the full quotations table from FMDQ and try again.')
+      return
+    }
+    setPasteLoading(true)
+    setPasteError('')
     try {
-      const res = await fetch('/api/fixed-income/refresh-yields', { method: 'POST' })
+      const res = await fetch('/api/fixed-income/parse-fmdq', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ paste: trimmed }),
+      })
       const body = await res.json()
       if (!res.ok) {
-        setAiError(body?.error || `HTTP ${res.status}`)
+        setPasteError(body?.error || `HTTP ${res.status}`)
         return
       }
-      const proposals: AiProposal[] = body.results ?? []
+      const parsed: ParsedProposal[] = body.results ?? []
       const byId = new Map(rows.map(r => [r.instrument_id, r]))
-      const review: ReviewRow[] = proposals
+      const review: ReviewRow[] = parsed
         .filter(p => byId.has(p.instrument_id))
         .map(p => {
           const r = byId.get(p.instrument_id)!
@@ -255,19 +271,26 @@ export default function FixedIncomePage() {
           }
         })
       if (review.length === 0) {
-        setAiError('AI could not find reliable yields. Try again later or enter yields manually.')
+        setPasteError(
+          `No matches found. The AI couldn't map any row in the paste to our instrument list ` +
+          `(${body.total_instruments ?? 0} instruments available). Check that the paste contains ticker, ` +
+          `coupon, or instrument name info — or close and use per-row Edit.`
+        )
       } else {
-        setAiProposals(review)
+        setProposals(review)
+        setPasteOpen(false)
       }
     } catch (e) {
-      setAiError((e as Error).message)
+      setPasteError((e as Error).message)
     } finally {
-      setAiLoading(false)
+      setPasteLoading(false)
     }
   }
 
+  // ─── Review + batch save flow ───
+
   function toggleAccept(idx: number) {
-    setAiProposals(prev => {
+    setProposals(prev => {
       if (!prev) return prev
       const next = [...prev]
       next[idx] = { ...next[idx], accepted: !next[idx].accepted }
@@ -276,15 +299,15 @@ export default function FixedIncomePage() {
   }
 
   function toggleAll(accept: boolean) {
-    setAiProposals(prev => prev ? prev.map(p => ({ ...p, accepted: accept })) : prev)
+    setProposals(prev => prev ? prev.map(p => ({ ...p, accepted: accept })) : prev)
   }
 
-  async function saveAiBatch() {
-    if (!aiProposals) return
-    const accepted = aiProposals.filter(p => p.accepted)
+  async function saveBatch() {
+    if (!proposals) return
+    const accepted = proposals.filter(p => p.accepted)
     if (accepted.length === 0) return
-    setAiSaving(true)
-    setAiSaveMsg('')
+    setBatchSaving(true)
+    setBatchSaveMsg('')
     try {
       const nowIso = new Date().toISOString()
       const results = await Promise.all(accepted.map(p =>
@@ -292,25 +315,25 @@ export default function FixedIncomePage() {
           .update({
             yield_pct: p.yield_pct,
             yield_as_of: p.as_of,
-            yield_source: 'ai-refresh',
-            yield_notes: p.notes ?? p.source,
+            yield_source: 'fmdq-paste',
+            yield_notes: p.notes ? `${p.source} — ${p.notes}` : p.source,
             yield_last_refreshed_at: nowIso,
           })
           .eq('instrument_id', p.instrument_id)
       ))
       const errors = results.filter((r: any) => r?.error)
       if (errors.length > 0) {
-        setAiSaveMsg(`✗ ${errors.length} save${errors.length === 1 ? '' : 's'} failed`)
+        setBatchSaveMsg(`✗ ${errors.length} save${errors.length === 1 ? '' : 's'} failed`)
       } else {
-        setAiSaveMsg(`✓ Saved ${accepted.length} yield${accepted.length === 1 ? '' : 's'}`)
-        setAiProposals(null)
+        setBatchSaveMsg(`✓ Saved ${accepted.length} yield${accepted.length === 1 ? '' : 's'}`)
+        setProposals(null)
         await load()
       }
     } catch (e) {
-      setAiSaveMsg(`✗ ${(e as Error).message}`)
+      setBatchSaveMsg(`✗ ${(e as Error).message}`)
     } finally {
-      setAiSaving(false)
-      setTimeout(() => setAiSaveMsg(''), 8000)
+      setBatchSaving(false)
+      setTimeout(() => setBatchSaveMsg(''), 8000)
     }
   }
 
@@ -330,18 +353,17 @@ export default function FixedIncomePage() {
           </h1>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-          {aiSaveMsg && (
-            <span style={{ fontSize: 11, color: aiSaveMsg.startsWith('✓') ? 'var(--pos)' : 'var(--neg)' }}>
-              {aiSaveMsg}
+          {batchSaveMsg && (
+            <span style={{ fontSize: 11, color: batchSaveMsg.startsWith('✓') ? 'var(--pos)' : 'var(--neg)' }}>
+              {batchSaveMsg}
             </span>
           )}
           <button
             className="btn-h btn-h-primary"
-            onClick={runAiRefresh}
-            disabled={aiLoading}
+            onClick={openPaste}
           >
-            <Sparkles size={12} style={aiLoading ? { animation: 'spin 0.7s linear infinite' } : undefined} />
-            {aiLoading ? 'Searching FMDQ / DMO…' : 'AI refresh yields'}
+            <Clipboard size={12} />
+            Paste from FMDQ
           </button>
         </div>
       </div>
@@ -358,16 +380,8 @@ export default function FixedIncomePage() {
         ) : (
           <span style={{ color: 'var(--pos)' }}>All yields fresh</span>
         )}
-        . AI refresh proposes yields from FMDQ / DMO — review before saving.
+        . Paste FMDQ quotations to batch-update yields — the AI maps pasted rows to our instruments and you review before anything saves.
       </div>
-
-      {aiError && (
-        <div className="alert-h alert-h-critical" style={{ fontSize: 12, marginBottom: 16, maxWidth: 900, display: 'flex', alignItems: 'flex-start', gap: 8 }}>
-          <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-          <span>{aiError}</span>
-          <button onClick={() => setAiError('')} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: 'inherit', cursor: 'pointer' }}><X size={12} /></button>
-        </div>
-      )}
 
       <div style={{ maxWidth: 1400 }}>
         {/* Filters */}
@@ -484,9 +498,9 @@ export default function FixedIncomePage() {
         <div style={{ marginTop: 16, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6, maxWidth: 860 }}>
           <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
-            Yields feed into AI report generation and scenario analysis, so the AI can recommend specific fixed income instruments with current yield context.
-            AI refresh proposes yields via web search across FMDQ daily quotations, DMO auction results, and trusted Nigerian market sources — you review before anything is saved.
-            Manual edits always take precedence over AI refreshes.
+            Yields feed AI report generation and scenario analysis. The paste flow uses Claude to match pasted FMDQ rows
+            to our instrument IDs — nothing saves until you review the proposals.
+            Manual Edit takes precedence over any paste.
           </span>
         </div>
       </div>
@@ -583,33 +597,117 @@ export default function FixedIncomePage() {
         </div>
       )}
 
-      {/* ─── AI proposals review modal ─── */}
-      {aiProposals && (
+      {/* ─── Paste-from-FMDQ modal ─── */}
+      {pasteOpen && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
-          onClick={() => !aiSaving && setAiProposals(null)}
+          onClick={() => !pasteLoading && setPasteOpen(false)}
+        >
+          <div className="panel" style={{ maxWidth: 760, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Paste yield data</div>
+                <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
+                  Paste from FMDQ quotations
+                </div>
+              </div>
+              <button onClick={() => !pasteLoading && setPasteOpen(false)} disabled={pasteLoading} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: pasteLoading ? 'not-allowed' : 'pointer', padding: 4 }}>
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+
+              {/* Instructions + FMDQ link */}
+              <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6, background: 'var(--bg-soft)', padding: '12px 14px', borderRadius: 3, border: '1px solid var(--border-soft)' }}>
+                <div style={{ marginBottom: 10 }}>
+                  <strong style={{ color: 'var(--text)' }}>How this works:</strong> open FMDQ, copy their Daily Quotations table
+                  (or any research-note table with Nigerian FI yields), paste below. Claude will map each pasted row to
+                  our instrument list and surface matches for you to review before saving.
+                </div>
+                <a
+                  href={FMDQ_URL}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="btn-h"
+                  style={{ fontSize: 12, padding: '6px 12px', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                >
+                  <ExternalLink size={12} /> Open FMDQ Market Data
+                </a>
+              </div>
+
+              {/* Textarea */}
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Pasted data
+                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— any format; table, CSV, raw text</span>
+                </label>
+                <textarea
+                  value={pasteText}
+                  onChange={e => setPasteText(e.target.value)}
+                  placeholder="Paste FMDQ daily quotations table or similar yield data here..."
+                  rows={12}
+                  className="input-h"
+                  style={{ width: '100%', fontFamily: 'var(--font-mono)', fontSize: 11, resize: 'vertical' }}
+                  autoFocus
+                  disabled={pasteLoading}
+                />
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                  {pasteText.length.toLocaleString()} chars pasted
+                </div>
+              </div>
+
+              {pasteError && (
+                <div className="alert-h alert-h-critical" style={{ fontSize: 11, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                  <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>{pasteError}</span>
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
+                <button
+                  onClick={submitPaste}
+                  disabled={pasteLoading || pasteText.trim().length < 30}
+                  className="btn-h btn-h-primary"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
+                  <Sparkles size={12} style={pasteLoading ? { animation: 'spin 0.7s linear infinite' } : undefined} />
+                  {pasteLoading ? 'Parsing…' : 'Parse & propose yields'}
+                </button>
+                <button onClick={() => setPasteOpen(false)} disabled={pasteLoading} className="btn-h">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── Proposals review modal ─── */}
+      {proposals && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
+          onClick={() => !batchSaving && setProposals(null)}
         >
           <div className="panel" style={{ maxWidth: 920, width: '100%', margin: 0, maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
               <div>
-                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Review AI-proposed yields</div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Review proposed yields</div>
                 <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
-                  {aiProposals.length} yield{aiProposals.length === 1 ? '' : 's'} proposed
+                  {proposals.length} yield{proposals.length === 1 ? '' : 's'} matched
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
                   Uncheck any rows that look wrong. Only accepted rows will be saved.
                 </div>
               </div>
-              <button onClick={() => !aiSaving && setAiProposals(null)} disabled={aiSaving} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: aiSaving ? 'not-allowed' : 'pointer', padding: 4 }}>
+              <button onClick={() => !batchSaving && setProposals(null)} disabled={batchSaving} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: batchSaving ? 'not-allowed' : 'pointer', padding: 4 }}>
                 <X size={16} />
               </button>
             </div>
 
             <div style={{ display: 'flex', gap: 8, marginBottom: 10, fontSize: 11 }}>
-              <button onClick={() => toggleAll(true)} disabled={aiSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Select all</button>
-              <button onClick={() => toggleAll(false)} disabled={aiSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Deselect all</button>
+              <button onClick={() => toggleAll(true)} disabled={batchSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Select all</button>
+              <button onClick={() => toggleAll(false)} disabled={batchSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Deselect all</button>
               <div style={{ marginLeft: 'auto', alignSelf: 'center', color: 'var(--text-3)' }}>
-                {aiProposals.filter(p => p.accepted).length} of {aiProposals.length} selected
+                {proposals.filter(p => p.accepted).length} of {proposals.length} selected
               </div>
             </div>
 
@@ -627,13 +725,13 @@ export default function FixedIncomePage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {aiProposals.map((p, i) => {
-                    const conf = p.confidence ?? 'medium'
+                  {proposals.map((p, i) => {
+                    const conf = p.confidence ?? 'high'
                     const confColor = conf === 'high' ? 'var(--pos)' : conf === 'low' ? 'var(--warn)' : 'var(--text-2)'
                     return (
                       <tr key={p.instrument_id} style={p.accepted ? {} : { opacity: 0.45 }}>
                         <td>
-                          <input type="checkbox" checked={p.accepted} onChange={() => toggleAccept(i)} disabled={aiSaving} style={{ accentColor: 'var(--gold)' }} />
+                          <input type="checkbox" checked={p.accepted} onChange={() => toggleAccept(i)} disabled={batchSaving} style={{ accentColor: 'var(--gold)' }} />
                         </td>
                         <td>
                           <div style={{ fontSize: 12, fontWeight: 500 }}>{p.name}</div>
@@ -661,15 +759,15 @@ export default function FixedIncomePage() {
 
             <div style={{ display: 'flex', gap: 8, paddingTop: 14, borderTop: '1px solid var(--border-soft)', marginTop: 12 }}>
               <button
-                onClick={saveAiBatch}
-                disabled={aiSaving || aiProposals.filter(p => p.accepted).length === 0}
+                onClick={saveBatch}
+                disabled={batchSaving || proposals.filter(p => p.accepted).length === 0}
                 className="btn-h btn-h-primary"
                 style={{ flex: 1, justifyContent: 'center' }}
               >
                 <CheckCircle2 size={12} />
-                {aiSaving ? 'Saving…' : `Accept ${aiProposals.filter(p => p.accepted).length} yield${aiProposals.filter(p => p.accepted).length === 1 ? '' : 's'}`}
+                {batchSaving ? 'Saving…' : `Accept ${proposals.filter(p => p.accepted).length} yield${proposals.filter(p => p.accepted).length === 1 ? '' : 's'}`}
               </button>
-              <button onClick={() => setAiProposals(null)} disabled={aiSaving} className="btn-h">Cancel</button>
+              <button onClick={() => setProposals(null)} disabled={batchSaving} className="btn-h">Cancel</button>
             </div>
           </div>
         </div>
