@@ -1,5 +1,12 @@
 import Anthropic from '@anthropic-ai/sdk'
 
+// v21x: Fix for missing "Market Overview" heading. When the API splits the
+// first `## Heading` and the body into two adjacent text blocks, v21w's
+// shape-aware join glued them with a single space — the whole first
+// paragraph then parsed as one giant h2. Fix: if the current accumulated
+// content ends with a `## xxx` / `### xxx` / `#### xxx` line, force a
+// paragraph break before appending the next block.
+//
 // v21w: Fix for "disordered, scattered" brief formatting. Root cause was in
 // text-block joining, not in the prompt. When web_search is used, the
 // Anthropic API splits a single prose sentence into multiple adjacent text
@@ -225,7 +232,15 @@ export async function generateCIOBrief(input: CIOBriefInput): Promise<string> {
     const next      = blocks[i]
     const firstChar = next[0] || ''
 
+    // v21x: If `all` ends with a markdown heading line, force a paragraph
+    // break — otherwise body text gets appended to the heading with a space
+    // and the whole run parses as one giant h2.
+    const lastLine = all.split('\n').pop() || ''
+    const allEndsWithHeading = /^#{2,4}\s/.test(lastLine)
+
     if (/^(#{2,4}\s|---|\||-\s|\u2022\s|>\s)/.test(next)) {
+      all = all + '\n\n' + next
+    } else if (allEndsWithHeading) {
       all = all + '\n\n' + next
     } else if (/[.,;:!?)\]"'\u2019\u201d]/.test(firstChar)) {
       all = all + next

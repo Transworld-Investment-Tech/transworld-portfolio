@@ -2,6 +2,12 @@
 import { useEffect, useState, useCallback } from 'react'
 import { Clock, Sparkles, FileText, Printer, Copy, Check, Radio, Trash2 } from 'lucide-react'
 
+// v21x: Body font sizes bumped +1pt for readability.
+// Print:  p 11->12pt, callout-row 10.5->11pt, table 9.5->10.5pt
+// Screen: p 13.5->14.5, li 13.5->14.5, bq_group 13->14, table 12.5->13.5
+// Pairs with v21x cio-brief-engine.ts fix for the heading-glue bug that was
+// rendering the Market Overview opening paragraph as a giant h2.
+//
 // v21t: Blockquote metric grouping.
 // Consecutive `> ` lines are now collapsed into a single {t:'bq_group'} block
 // and rendered as ONE gold-bordered panel with stacked compact rows — instead
@@ -99,8 +105,8 @@ function renderMarkdown(raw: string): React.ReactNode[] {
       case 'h4': return [<h4 key={i} style={{ fontSize: 12, fontWeight: 700, color: 'var(--text)', textTransform: 'uppercase' as const, letterSpacing: '0.1em', marginTop: 22, marginBottom: 5, borderLeft: '3px solid var(--gold)', paddingLeft: 10 }}>{block.text}</h4>]
       case 'hr':    return [<hr key={i} style={{ border: 'none', borderTop: '1px solid var(--border-soft)', margin: '30px 0' }} />]
       case 'blank': return [<div key={i} style={{ height: 8 }} />]
-      case 'p':     return [<p key={i} style={{ fontSize: 13.5, lineHeight: 1.9, color: 'var(--text)', margin: '8px 0', textAlign: 'justify' as const }}>{formatInline(block.text)}</p>]
-      case 'li':    return [<div key={i} style={{ display: 'flex', gap: 10, margin: '5px 0 5px 10px' }}><span style={{ color: 'var(--gold)', flexShrink: 0, fontWeight: 700, marginTop: 2 }}>\u00b7</span><p style={{ fontSize: 13.5, lineHeight: 1.85, color: 'var(--text)', margin: 0, textAlign: 'justify' as const }}>{formatInline(block.text)}</p></div>]
+      case 'p':     return [<p key={i} style={{ fontSize: 14.5, lineHeight: 1.9, color: 'var(--text)', margin: '8px 0', textAlign: 'justify' as const }}>{formatInline(block.text)}</p>]
+      case 'li':    return [<div key={i} style={{ display: 'flex', gap: 10, margin: '5px 0 5px 10px' }}><span style={{ color: 'var(--gold)', flexShrink: 0, fontWeight: 700, marginTop: 2 }}>\u00b7</span><p style={{ fontSize: 14.5, lineHeight: 1.85, color: 'var(--text)', margin: 0, textAlign: 'justify' as const }}>{formatInline(block.text)}</p></div>]
       case 'bq_group': return [
         <div key={i} style={{
           borderLeft: '3px solid var(--gold)',
@@ -111,7 +117,7 @@ function renderMarkdown(raw: string): React.ReactNode[] {
         }}>
           {block.texts.map((t, j) => (
             <div key={j} style={{
-              fontSize: 13,
+              fontSize: 14,
               lineHeight: 1.65,
               color: 'var(--text)',
               fontWeight: 500,
@@ -125,7 +131,7 @@ function renderMarkdown(raw: string): React.ReactNode[] {
           ))}
         </div>
       ]
-      case 'table': return [<div key={i} style={{ overflowX: 'auto', margin: '20px 0', borderRadius: 4, border: '1px solid var(--border)', boxShadow: '0 1px 4px rgba(15,41,71,0.06)' }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12.5 }}>{block.headers.length > 0 && <thead><tr style={{ background: 'var(--sidebar-bg)' }}>{block.headers.map((h, j) => <th key={j} style={{ padding: '10px 14px', textAlign: 'left' as const, color: 'var(--gold-bright)', fontWeight: 600, fontSize: 10, textTransform: 'uppercase' as const, letterSpacing: '0.14em', whiteSpace: 'nowrap' as const }}>{h}</th>)}</tr></thead>}<tbody>{block.rows.map((row, ri) => <tr key={ri} style={{ background: ri % 2 === 0 ? 'var(--bg-soft)' : 'var(--card)' }}>{row.map((cell, ci) => <td key={ci} style={{ padding: '9px 14px', borderBottom: ri < block.rows.length-1 ? '1px solid var(--border-soft)' : 'none', color: ci===0?'var(--text)':'var(--text-2)', fontWeight: ci===0?500:400 }}>{formatInline(cell)}</td>)}</tr>)}</tbody></table></div>]
+      case 'table': return [<div key={i} style={{ overflowX: 'auto', margin: '20px 0', borderRadius: 4, border: '1px solid var(--border)', boxShadow: '0 1px 4px rgba(15,41,71,0.06)' }}><table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13.5 }}>{block.headers.length > 0 && <thead><tr style={{ background: 'var(--sidebar-bg)' }}>{block.headers.map((h, j) => <th key={j} style={{ padding: '10px 14px', textAlign: 'left' as const, color: 'var(--gold-bright)', fontWeight: 600, fontSize: 10, textTransform: 'uppercase' as const, letterSpacing: '0.14em', whiteSpace: 'nowrap' as const }}>{h}</th>)}</tr></thead>}<tbody>{block.rows.map((row, ri) => <tr key={ri} style={{ background: ri % 2 === 0 ? 'var(--bg-soft)' : 'var(--card)' }}>{row.map((cell, ci) => <td key={ci} style={{ padding: '9px 14px', borderBottom: ri < block.rows.length-1 ? '1px solid var(--border-soft)' : 'none', color: ci===0?'var(--text)':'var(--text-2)', fontWeight: ci===0?500:400 }}>{formatInline(cell)}</td>)}</tr>)}</tbody></table></div>]
       default: return []
     }
   })
@@ -188,13 +194,13 @@ function buildPrintHTML(briefDate: string, content: string): string {
     + 'h2{font-family:"Cormorant Garamond",Georgia,serif;font-size:17pt;font-weight:500;color:#0f2947;border-bottom:2px solid #b08b3e;padding-bottom:6px;margin:32px 0 12px}'
     + 'h3{font-family:"Cormorant Garamond",Georgia,serif;font-style:italic;font-size:13pt;font-weight:500;color:#b08b3e;margin:22px 0 7px}'
     + 'h4{font-size:9.5pt;font-weight:700;color:#0f2947;text-transform:uppercase;letter-spacing:0.1em;margin:18px 0 5px;border-left:3px solid #b08b3e;padding-left:8px}'
-    + 'p{margin:7px 0;color:#0f2947;font-size:11pt;line-height:1.85;text-align:justify}'
+    + 'p{margin:7px 0;color:#0f2947;font-size:12pt;line-height:1.85;text-align:justify}'
     + 'strong{font-weight:700;color:#0f2947}em{color:#5c6573}'
     + 'hr{border:none;border-top:1px solid rgba(15,41,71,0.12);margin:24px 0}.gap{height:8px}'
     + '.callout-group{border-left:3px solid #b08b3e;background:rgba(176,139,62,0.07);padding:12px 18px;margin:18px 0;border-radius:0 3px 3px 0;page-break-inside:avoid}'
-    + '.callout-row{font-size:10.5pt;font-weight:500;line-height:1.65;color:#0f2947;padding:4px 0}'
+    + '.callout-row{font-size:11pt;font-weight:500;line-height:1.65;color:#0f2947;padding:4px 0}'
     + '.callout-row + .callout-row{border-top:1px solid rgba(176,139,62,0.14);margin-top:2px;padding-top:7px}'
-    + 'table{width:100%;border-collapse:collapse;margin:16px 0;font-size:9.5pt;page-break-inside:avoid}'
+    + 'table{width:100%;border-collapse:collapse;margin:16px 0;font-size:10.5pt;page-break-inside:avoid}'
     + 'thead tr{background:#0a1f3a}th{padding:9px 12px;text-align:left;color:#c9a556;font-weight:600;font-size:8pt;text-transform:uppercase;letter-spacing:0.12em}'
     + 'td{padding:8px 12px;border-bottom:1px solid rgba(15,41,71,0.07)}tr.even td{background:#faf5ea}tr.odd td{background:#fffbf2}td.first{font-weight:600}'
     + '.pbtn{position:fixed;top:16px;right:16px;background:#0a1f3a;color:#c9a556;border:none;border-radius:3px;padding:10px 18px;font-size:12px;cursor:pointer;font-family:"DM Sans",sans-serif;font-weight:600}'
