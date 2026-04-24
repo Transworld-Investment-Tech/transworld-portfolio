@@ -1,11 +1,10 @@
 import Anthropic from '@anthropic-ai/sdk'
 
-// v21r-hotfix-1: Three fixes:
-//   1. Self-talk stripped — take LAST text block only; earlier blocks are
-//      the model's "I'll research..." preamble emitted before web searches.
-//   2. Prompt instructs model to start IMMEDIATELY with ## Market Overview.
-//   3. Prompt requests markdown tables + blockquote metric callouts so the
-//      renderer can produce proper tables and KPI cards.
+// v21r-hotfix-2: Fix text extraction.
+// Root cause: taking the last text block only captures the final chunk
+// when the model searches mid-response and emits the brief in pieces.
+// Fix: join all text blocks, then find the first ## header and strip
+// any self-talk preamble before it.
 
 export interface CIOBriefPortfolio {
   id: string; name: string; label: string
@@ -75,26 +74,25 @@ function buildPrompt(input: CIOBriefInput): string {
   const heldSet       = new Set(allTickers)
   const heldOnList    = watchEquities.filter(w => w.ticker && heldSet.has(w.ticker))
   const notHeldTop    = watchEquities.filter(w => w.ticker && !heldSet.has(w.ticker)).slice(0, 8)
-
   const combinedPositions = buildCombinedPositions(portfolios)
 
   return `You are the Chief Investment Officer at Transworld Investment and Securities, Lagos, Nigeria. You are preparing the weekly CIO Intelligence Brief for the week ending ${weekEnd}, for distribution to clients, investors, and the weekly CIO conference call.
 
-Write in flowing, authoritative prose — like a well-crafted weekly letter from a respected CIO. Your audience expects clear views, specific numbers, and actionable forward guidance. Use paragraphs, not bullets. Take clear positions.
+Write in flowing, authoritative prose. Your audience expects clear views, specific numbers, and actionable forward guidance. Use narrative paragraphs throughout. Take clear positions.
 
-CRITICAL INSTRUCTION: Begin your response IMMEDIATELY with the section header "## Market Overview" — do not include any text about your research process, no "I'll search", no "let me look up", no preamble of any kind. The very first characters of your response must be "## Market Overview".
-
-\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-STEP 1 — USE WEB SEARCH (do this silently, then write)
-\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-
-Search for: NGX ASI level and weekly performance ${weekEnd}, CBN MPR current rate, Nigeria CPI inflation ${yr}, USD/NGN exchange rate today, Brent crude price today, recent news for: ${allTickers.join(', ')}
+CRITICAL INSTRUCTION: Your response must begin IMMEDIATELY with "## Market Overview" as the very first text. Do not write any preamble, commentary about your research, or meta-text. Start directly with the section header.
 
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-STEP 2 — PORTFOLIO CONTEXT
+STEP 1 \u2014 SEARCH (do silently, write nothing until Step 3)
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
-COMBINED BOOK — WEEK ENDING ${weekEnd}
+Search for: NGX All-Share Index ${weekEnd} performance, CBN MPR current ${yr}, Nigeria CPI inflation latest ${yr}, USD NGN exchange rate today, Brent crude price today, recent news for ${allTickers.slice(0, 6).join(' ')}
+
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+STEP 2 \u2014 PORTFOLIO CONTEXT
+\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
+
+COMBINED BOOK \u2014 WEEK ENDING ${weekEnd}
 Generated: ${dateStr} | FX: ${fxRate ? '\u20a6' + Math.round(fxRate).toLocaleString() + '/USD' : 'see search'}
 
 Active mandates:   ${portfolios.length}
@@ -114,62 +112,52 @@ ${portfolios.map(p => {
     '    Holdings: ' + (top5 || 'none')
 }).join('\n\n')}
 
-COMBINED EQUITY BOOK:
+COMBINED EQUITY BOOK (ranked by combined value):
 ${combinedPositions || '  No equity positions.'}
 
 WATCHLIST:
-  Held + on watchlist: ${heldOnList.map(w => w.ticker + '(#' + w.rank + ')').join(', ') || 'none'}
-  Top unowned: ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' \u2014 ' + w.name).join(' | ') || 'none'}
+  Held + on watchlist: ${heldOnList.slice(0, 10).map(w => w.ticker + '(#' + w.rank + ')').join(', ') || 'none'}
+  Top unowned:         ${notHeldTop.map(w => '#' + w.rank + ' ' + w.ticker + ' \u2014 ' + w.name).join(' | ') || 'none'}
   FI watchlist (top 5): ${watchFI.slice(0, 5).map(w => (w.ticker || w.name) + ' [' + (w.sub_type ?? '') + ']').join(', ')}
-  Eagle-eye: ${watchEagle.map(w => w.name).join(', ') || 'none'}
+  Eagle-eye:           ${watchEagle.map(w => w.name).join(', ') || 'none'}
 
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
-STEP 3 — WRITE THE BRIEF (start with ## Market Overview)
+STEP 3 \u2014 WRITE (start with ## Market Overview, no preamble)
 \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550
 
-FORMATTING REQUIREMENTS — follow exactly:
-
-1. Start immediately with "## Market Overview" — no preamble whatsoever.
-
-2. Use blockquote lines (starting with "> ") for key metric callouts at the start of Market Overview:
+FORMATTING REQUIREMENTS:
+1. Start IMMEDIATELY with "## Market Overview" \u2014 no preamble whatsoever.
+2. After the ## Market Overview header, add 5 blockquote lines (> text) for key metrics:
    > **NGX All-Share Index:** [level] | [weekly change] | YTD: [change]
-   > **CBN Policy Rate:** [rate] | [last action]
-   > **USD/NGN:** [rate] | [trend]
-   > **Brent Crude:** [price] | [weekly change]
-   > **Nigeria CPI:** [latest print] | [trend]
+   > **CBN Policy Rate:** [rate] | [last action and date]
+   > **USD/NGN:** [\u20a6 rate] | [monthly trend]
+   > **Brent Crude:** [$price/bbl] | [weekly change]
+   > **Nigeria CPI:** [latest %] | [trend direction]
+3. Use markdown tables (| col | col |) in:
+   - Portfolio Performance: mandate performance table (Mandate | Client | NAV | Return)
+   - Key Holdings: holdings snapshot table (Ticker | Combined Value | Weight | Cost | Price | P&L%)
+4. Use ### for sub-section headers, #### for individual stock analysis headers
+5. Write all body text as flowing narrative paragraphs. No bullet point lists.
 
-3. Use markdown tables for structured data:
-   - In "## Portfolio Performance and Positioning": include a mandate performance table:
-     | Mandate | Client | Current NAV | P&L Since Inception | Return |
-     |---|---|---|---|---|
-   - In "## Key Holdings Intelligence": include a holdings snapshot table:
-     | Ticker | Name | Combined Value | Weight | Cost | Price | P&L % |
-     |---|---|---|---|---|---|---|
-   - In "## Macro and Sector Themes": include a macro snapshot table if helpful
-
-4. Use ### for sub-section headers (e.g., ### Banking Sector, ### Energy & Oil)
-5. Use #### for individual stock headers within Key Holdings (e.g., #### GTCO — Core Holding)
-6. Write all prose in flowing narrative paragraphs with full sentences. No bullet points.
-
-SECTION STRUCTURE:
+SECTIONS TO WRITE:
 
 ## Market Overview
-[Start with the 5 blockquote metric lines above, then 3-4 narrative paragraphs]
+[5 blockquote metric lines, then 3\u20134 narrative paragraphs on the week's market environment]
 
 ## Portfolio Performance and Positioning
-[Mandate performance table, then 3-4 narrative paragraphs on the combined book]
+[Mandate performance table, then narrative on combined book performance and key movers]
 
 ## Key Holdings Intelligence
-[Holdings snapshot table, then individual stock coverage using #### headers]
+[Holdings snapshot table, then individual stock analysis using #### TICKER \u2014 Name headers]
 
 ## Macro and Sector Themes
-[2-3 themed sub-sections using ### headers, each 2 paragraphs]
+[2\u20133 themed ### sub-sections covering the dominant macro themes for our holdings]
 
 ## Watchlist Signals
-[2-3 paragraphs on watchlist opportunities and eagle-eye items]
+[Narrative on most compelling watchlist opportunities and eagle-eye items this week]
 
 ## Outlook and Forward Positioning
-[3-4 paragraphs closing the brief — risk, opportunity, forward actions]
+[3\u20134 paragraphs on forward view, key risks, opportunities, and portfolio actions]
 
 ---
 *CIO Weekly Intelligence Brief \u2014 week ending ${weekEnd} | Transworld Investment and Securities*
@@ -186,17 +174,31 @@ export async function generateCIOBrief(input: CIOBriefInput): Promise<string> {
     messages:   [{ role: 'user', content: buildPrompt(input) }],
   })
 
-  // Fix for self-talk: take LAST non-empty text block only.
-  // The model emits intermediate text blocks ("I'll search...") before
-  // each web search call. The actual brief is always the final text block.
+  // --- TEXT EXTRACTION FIX (v21r-hotfix-2) ---
+  // Root cause of hotfix-1 regression: "take last text block" was wrong.
+  // The model may do additional searches mid-response, splitting the brief
+  // across multiple text blocks. Taking only the last block gives just the
+  // closing paragraph.
+  //
+  // Correct approach:
+  //   1. Join ALL text blocks (captures the full brief regardless of splits)
+  //   2. Strip any self-talk preamble before the first ## section header
+  //
   const textBlocks = (response.content as any[])
     .filter((b: any) => b.type === 'text')
     .map((b: any) => (b.text as string).trim())
     .filter(t => t.length > 0)
 
-  const text = textBlocks.length > 0
-    ? textBlocks[textBlocks.length - 1]
-    : 'Brief generation failed — no content returned.'
+  const allText = textBlocks.join('\n\n').trim()
 
-  return text
+  // Find the first ## header and strip everything before it
+  const startsWithH2  = allText.startsWith('## ')
+  const firstH2Index  = allText.indexOf('\n## ')
+  const text = startsWithH2
+    ? allText
+    : firstH2Index >= 0
+      ? allText.slice(firstH2Index + 1)
+      : allText
+
+  return text || 'Brief generation failed \u2014 no content returned.'
 }
