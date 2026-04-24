@@ -109,6 +109,31 @@ function formatDate(iso: string | null): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' })
 }
 
+// Bulletproof numeric formatter. Handles anything the DB or API might throw at
+// us — null, undefined, strings, NaN, numbers. Always returns a safe string
+// so no .toFixed() call can ever crash the render.
+function fmtPct(v: unknown, dp = 2, suffix = '%'): string {
+  if (v === null || v === undefined) return '—'
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  if (!isFinite(n)) return '—'
+  return `${n.toFixed(dp)}${suffix}`
+}
+
+// Same for naira amounts.
+function fmtNaira(v: unknown, dp = 2): string {
+  if (v === null || v === undefined) return '—'
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  if (!isFinite(n)) return '—'
+  return `₦${n.toFixed(dp)}`
+}
+
+// Truthiness-safe coercion for style toggles that want "is there a real number here".
+function hasNum(v: unknown): boolean {
+  if (v === null || v === undefined) return false
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  return isFinite(n)
+}
+
 export default function FixedIncomePage() {
   const [rows, setRows] = useState<FiRow[]>([])
   const [loading, setLoading] = useState(true)
@@ -153,6 +178,22 @@ export default function FixedIncomePage() {
       return
     }
 
+    const toNum = (v: any): number | null => {
+      if (v === null || v === undefined) return null
+      const n = typeof v === 'number' ? v : parseFloat(String(v))
+      return isFinite(n) ? n : null
+    }
+
+    // Diagnostic: surface any weird data that got past coercion (paste to console)
+    const weird = (data ?? []).filter((i: any) =>
+      (i.coupon_pct !== null && i.coupon_pct !== undefined && toNum(i.coupon_pct) === null) ||
+      (i.yield_pct !== null && i.yield_pct !== undefined && toNum(i.yield_pct) === null)
+    )
+    if (weird.length > 0) {
+      console.warn('[Fixed income] Rows with un-coerceable numeric fields:',
+        weird.map((w: any) => ({ id: w.instrument_id, coupon_pct: w.coupon_pct, yield_pct: w.yield_pct })))
+    }
+
     const mapped: FiRow[] = (data ?? []).map((i: any) => {
       const { subType, rationale } = parseNotes(i.notes)
       return {
@@ -161,11 +202,11 @@ export default function FixedIncomePage() {
         type: i.type,
         sub_type: subType,
         rationale,
-        coupon_pct: i.coupon_pct === null ? null : Number(i.coupon_pct),
-        coupon_freq: i.coupon_freq === null ? null : Number(i.coupon_freq),
+        coupon_pct: toNum(i.coupon_pct),
+        coupon_freq: toNum(i.coupon_freq),
         maturity_date: i.maturity_date ?? null,
         approved: !!i.approved,
-        yield_pct: i.yield_pct === null || i.yield_pct === undefined ? null : Number(i.yield_pct),
+        yield_pct: toNum(i.yield_pct),
         yield_source: i.yield_source ?? null,
         yield_as_of: i.yield_as_of ?? null,
         yield_last_refreshed_at: i.yield_last_refreshed_at ?? null,
@@ -291,11 +332,26 @@ export default function FixedIncomePage() {
         setUploadError('No matches. File parsed but no FI tickers matched. Check the file is the brokerage PrintDownload format.')
         return
       }
+      // Defensive: coerce numeric fields to actual numbers in case the API ever
+      // sends them through as strings (Supabase numerics arrive as strings by
+      // default, and we want the page to be resilient to that drift).
+      const numOrNull = (v: any): number | null => {
+        if (v === null || v === undefined) return null
+        const n = typeof v === 'number' ? v : parseFloat(String(v))
+        return isFinite(n) ? n : null
+      }
       // Default: auto-accept all rows that are flag-free and not NaN
-      const review: ReviewRow[] = imp.results.map(p => ({
-        ...p,
-        accepted: !p.flag && isFinite(p.ytm_pct),
-      }))
+      const review: ReviewRow[] = imp.results.map(p => {
+        const ytm = numOrNull(p.ytm_pct)
+        return {
+          ...p,
+          coupon_pct:   numOrNull(p.coupon_pct),
+          current_yield: numOrNull(p.current_yield),
+          clean_price:  numOrNull(p.clean_price) ?? 0,
+          ytm_pct:      ytm ?? NaN,
+          accepted: !p.flag && ytm !== null,
+        }
+      })
       setProposals(review)
       setImportMeta(imp)
       setUploadOpen(false)
@@ -329,17 +385,18 @@ export default function FixedIncomePage() {
     setBatchSaveMsg('')
     try {
       const nowIso = new Date().toISOString()
-      const results = await Promise.all(accepted.map(p =>
-        (supabase.from('instruments') as any)
+      const results = await Promise.all(accepted.map(p => {
+        const ytm = typeof p.ytm_pct === 'number' ? p.ytm_pct : parseFloat(String(p.ytm_pct))
+        return (supabase.from('instruments') as any)
           .update({
-            yield_pct: Number(p.ytm_pct.toFixed(4)),
+            yield_pct: Number(ytm.toFixed(4)),
             yield_as_of: p.as_of,
             yield_source: 'brokerage',
             yield_notes: p.notes,
             yield_last_refreshed_at: nowIso,
           })
           .eq('instrument_id', p.instrument_id)
-      ))
+      }))
       const errors = results.filter((r: any) => r?.error)
       if (errors.length > 0) {
         setBatchSaveMsg(`✗ ${errors.length} save${errors.length === 1 ? '' : 's'} failed`)
@@ -475,8 +532,8 @@ export default function FixedIncomePage() {
                           </span>
                         )}
                       </td>
-                      <td className="num" style={{ fontFamily: 'var(--font-mono)', color: r.coupon_pct ? 'var(--text-2)' : 'var(--text-4)' }}>
-                        {r.coupon_pct ? `${r.coupon_pct.toFixed(2)}%` : '—'}
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', color: hasNum(r.coupon_pct) ? 'var(--text-2)' : 'var(--text-4)' }}>
+                        {fmtPct(r.coupon_pct)}
                       </td>
                       <td style={{ fontSize: 12, color: r.maturity_date ? 'var(--text-2)' : 'var(--text-4)' }}>
                         {formatMaturity(r.maturity_date)}
@@ -485,8 +542,8 @@ export default function FixedIncomePage() {
                         {formatTenor(r.maturity_date)}
                       </td>
                       <td className="num" style={{ fontFamily: 'var(--font-mono)' }}>
-                        {r.yield_pct !== null
-                          ? <span style={{ fontWeight: 500, color: 'var(--text)' }}>{r.yield_pct.toFixed(2)}%</span>
+                        {hasNum(r.yield_pct)
+                          ? <span style={{ fontWeight: 500, color: 'var(--text)' }}>{fmtPct(r.yield_pct)}</span>
                           : <span style={{ color: 'var(--text-4)' }}>—</span>}
                       </td>
                       <td>
@@ -538,7 +595,7 @@ export default function FixedIncomePage() {
                 <div className="hybrid-serif" style={{ fontSize: 20, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>{editing.name}</div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', fontFamily: 'var(--font-mono)', marginTop: 2 }}>
                   {editing.instrument_id}
-                  {editing.coupon_pct ? ` · ${editing.coupon_pct.toFixed(2)}% coupon` : ''}
+                  {hasNum(editing.coupon_pct) ? ` · ${fmtPct(editing.coupon_pct)} coupon` : ''}
                   {editing.maturity_date ? ` · matures ${formatMaturity(editing.maturity_date)}` : ''}
                 </div>
               </div>
@@ -548,10 +605,10 @@ export default function FixedIncomePage() {
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
 
-              {editing.yield_pct !== null ? (
+              {hasNum(editing.yield_pct) ? (
                 <div style={{ fontSize: 11, color: 'var(--text-2)', background: 'var(--bg-soft)', borderRadius: 3, padding: '8px 12px', border: '1px solid var(--border-soft)' }}>
                   <div style={{ fontSize: 10, color: 'var(--text-3)', textTransform: 'uppercase' as const, letterSpacing: '0.1em', marginBottom: 3 }}>Current yield</div>
-                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{editing.yield_pct.toFixed(2)}%</span>{' · '}
+                  <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{fmtPct(editing.yield_pct)}</span>{' · '}
                   <span style={{ fontFamily: 'var(--font-mono)', textTransform: 'uppercase' as const, fontSize: 10 }}>{editing.yield_source}</span>{' · as of '}{formatDate(editing.yield_as_of)}
                 </div>
               ) : (
@@ -763,16 +820,16 @@ export default function FixedIncomePage() {
                           </div>
                         </td>
                         <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-2)' }}>
-                          {p.coupon_pct !== null ? `${p.coupon_pct.toFixed(2)}%` : '—'}
+                          {fmtPct(p.coupon_pct)}
                         </td>
                         <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-2)' }}>
-                          ₦{p.clean_price.toFixed(2)}
+                          {fmtNaira(p.clean_price)}
                         </td>
-                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: p.current_yield !== null ? 'var(--text-3)' : 'var(--text-4)' }}>
-                          {p.current_yield !== null ? `${p.current_yield.toFixed(2)}%` : '—'}
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: hasNum(p.current_yield) ? 'var(--text-3)' : 'var(--text-4)' }}>
+                          {fmtPct(p.current_yield)}
                         </td>
                         <td className="num" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500, color: p.flag ? 'var(--warn)' : 'var(--gold)' }}>
-                          {isFinite(p.ytm_pct) ? `${p.ytm_pct.toFixed(2)}%` : '—'}
+                          {fmtPct(p.ytm_pct)}
                         </td>
                         <td style={{ fontSize: 11 }}>
                           {p.flag ? (

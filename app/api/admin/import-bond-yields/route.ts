@@ -190,25 +190,38 @@ export async function POST(req: NextRequest) {
   const proposals: ProposalRow[] = []
   const unmatched: string[] = []
 
+  // Helper: Supabase returns numeric columns as strings by default, so coerce
+  // explicitly. Returns null if input is null/undefined or non-numeric.
+  const numOrNull = (v: any): number | null => {
+    if (v === null || v === undefined) return null
+    const n = typeof v === 'number' ? v : parseFloat(String(v))
+    return isFinite(n) ? n : null
+  }
+
   for (const raw of instruments as any as BondInstrument[]) {
     const price = priceByTicker.get(raw.instrument_id)
     if (price === undefined) {
       unmatched.push(raw.instrument_id)
       continue
     }
+    // Coerce numeric DB values to actual numbers (or null)
+    const couponNum     = numOrNull(raw.coupon_pct)
+    const couponFreqNum = numOrNull(raw.coupon_freq)
+    const currentYield  = numOrNull(raw.yield_pct)
+
     if (!raw.maturity_date) {
       // Can't compute YTM without maturity. Still report so user sees gap.
       proposals.push({
         instrument_id: raw.instrument_id,
         name: raw.name,
-        coupon_pct: raw.coupon_pct,
+        coupon_pct: couponNum,
         maturity_date: null,
         clean_price: price,
         settlement_date: firstDate,
         ytm_pct: NaN,
         flag: 'solver-failed',
         flag_explanation: 'No maturity date recorded in DB — cannot compute YTM',
-        current_yield: raw.yield_pct,
+        current_yield: currentYield,
         source: `Brokerage file ${firstDate}`,
         as_of: firstDate,
         confidence: 'low',
@@ -217,24 +230,22 @@ export async function POST(req: NextRequest) {
       continue
     }
 
-    const couponPct = raw.coupon_pct !== null ? Number(raw.coupon_pct) : 0
-    const freq = raw.coupon_freq !== null && Number(raw.coupon_freq) > 0
-      ? Number(raw.coupon_freq)
-      : 2
+    const couponPct = couponNum ?? 0
+    const freq = couponFreqNum !== null && couponFreqNum > 0 ? couponFreqNum : 2
     const result = computeBondYTM(price, couponPct, raw.maturity_date, firstDate, freq)
 
     if (!result) {
       proposals.push({
         instrument_id: raw.instrument_id,
         name: raw.name,
-        coupon_pct: raw.coupon_pct,
+        coupon_pct: couponNum,
         maturity_date: raw.maturity_date,
         clean_price: price,
         settlement_date: firstDate,
         ytm_pct: NaN,
         flag: 'solver-failed',
         flag_explanation: 'Could not compute YTM from inputs',
-        current_yield: raw.yield_pct,
+        current_yield: currentYield,
         source: `Brokerage file ${firstDate}`,
         as_of: firstDate,
         confidence: 'low',
@@ -253,14 +264,14 @@ export async function POST(req: NextRequest) {
     proposals.push({
       instrument_id: raw.instrument_id,
       name: raw.name,
-      coupon_pct: raw.coupon_pct,
+      coupon_pct: couponNum,
       maturity_date: raw.maturity_date,
       clean_price: price,
       settlement_date: firstDate,
       ytm_pct: result.ytm_pct,
       flag: result.flag,
       flag_explanation: result.flag ? explainFlag(result.flag) : null,
-      current_yield: raw.yield_pct,
+      current_yield: currentYield,
       source: `Brokerage file ${firstDate}`,
       as_of: firstDate,
       confidence,
