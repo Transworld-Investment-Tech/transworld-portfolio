@@ -69,6 +69,7 @@ export default function Sidebar({
     { href: '/watchlist',      label: 'NGX Watchlist',   icon: '❈' },
   { href: '/admin/aliases',        label: 'Ticker aliases',  icon: '⇄' },
   { href: '/admin/import-prices', label: 'Import prices',  icon: '⇪' },
+  { href: '/admin/cio-brief',     label: 'CIO Brief',      icon: '◎' },
   ]
 
   const portfolioNav = portfolioId ? [
