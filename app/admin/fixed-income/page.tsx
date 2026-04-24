@@ -4,17 +4,20 @@ import Link from 'next/link'
 import { supabase } from '@/lib/supabase'
 import {
   ArrowLeft, Edit2, Search, X, Save, Info, Sparkles,
-  AlertCircle, CheckCircle2, ExternalLink, Clipboard,
+  AlertCircle, CheckCircle2, Upload, FileSpreadsheet, AlertTriangle,
 } from 'lucide-react'
 
 // v21z: Fixed Income admin page.
-// v21z-hotfix-1: Replaced the `web_search` AI refresh (3/72 hit rate — data
-// not on open web) with a paste-from-FMDQ flow. User opens FMDQ's Market Data
-// page, copies their Daily Quotations table, pastes here, Claude parses and
-// maps to our instrument IDs. Review modal unchanged.
+// v21z-hotfix-1: Replaced web_search (3/72 hit rate) with paste-from-FMDQ.
+// v21z-hotfix-2: Generalised paste sources after FMDQ Market Data turned out
+//                to be subscription-gated.
+// v22:           Paste flow replaced with xlsx upload of the brokerage
+//                PrintDownload Price List — the same file already used for
+//                equity NAV reconstruction. 70/70 FI tickers match. YTM is
+//                computed from clean price + coupon + maturity server-side,
+//                with extreme yields flagged for review.
 
 const YIELD_STALE_DAYS = 14
-const FMDQ_URL = 'https://fmdqgroup.com/exchange/market-data/'
 
 interface FiRow {
   instrument_id: string
@@ -33,19 +36,37 @@ interface FiRow {
   yield_notes: string | null
 }
 
-interface ParsedProposal {
+type YieldFlag = 'matured' | 'par-at-or-above' | 'extreme-high' | 'extreme-low' | 'solver-failed'
+
+interface ProposalRow {
   instrument_id: string
-  yield_pct: number
+  name: string
+  coupon_pct: number | null
+  maturity_date: string | null
+  clean_price: number
+  settlement_date: string
+  ytm_pct: number
+  flag: YieldFlag | null
+  flag_explanation: string | null
+  current_yield: number | null
   source: string
   as_of: string
-  confidence?: string
-  notes?: string
+  confidence: 'high' | 'medium' | 'low'
+  notes: string
 }
 
-interface ReviewRow extends ParsedProposal {
-  name: string
-  current_yield: number | null
+interface ReviewRow extends ProposalRow {
   accepted: boolean
+}
+
+interface ImportResponse {
+  settlement_date: string
+  rows_in_file: number
+  fi_instruments_in_db: number
+  matched: number
+  unmatched_count: number
+  unmatched_ids: string[]
+  results: ProposalRow[]
 }
 
 function parseNotes(notes: string | null): { subType: string | null; rationale: string | null } {
@@ -104,14 +125,15 @@ export default function FixedIncomePage() {
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState('')
 
-  // Paste-from-FMDQ modal
-  const [pasteOpen, setPasteOpen] = useState(false)
-  const [pasteText, setPasteText] = useState('')
-  const [pasteLoading, setPasteLoading] = useState(false)
-  const [pasteError, setPasteError] = useState('')
+  // Upload modal
+  const [uploadOpen, setUploadOpen] = useState(false)
+  const [uploadFile, setUploadFile] = useState<File | null>(null)
+  const [uploadLoading, setUploadLoading] = useState(false)
+  const [uploadError, setUploadError] = useState('')
 
-  // Review modal (shared between any proposal source)
+  // Review modal
   const [proposals, setProposals] = useState<ReviewRow[] | null>(null)
+  const [importMeta, setImportMeta] = useState<ImportResponse | null>(null)
   const [batchSaving, setBatchSaving] = useState(false)
   const [batchSaveMsg, setBatchSaveMsg] = useState('')
 
@@ -230,64 +252,61 @@ export default function FixedIncomePage() {
     }
   }
 
-  // ─── Paste-from-FMDQ flow ───
+  // ─── Upload flow ───
 
-  function openPaste() {
-    setPasteOpen(true)
-    setPasteText('')
-    setPasteError('')
+  function openUpload() {
+    setUploadOpen(true)
+    setUploadFile(null)
+    setUploadError('')
   }
 
-  async function submitPaste() {
-    const trimmed = pasteText.trim()
-    if (trimmed.length < 30) {
-      setPasteError('Paste looks too short. Copy the full quotations table from FMDQ and try again.')
+  function onFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0] ?? null
+    setUploadFile(f)
+    setUploadError('')
+  }
+
+  async function submitUpload() {
+    if (!uploadFile) {
+      setUploadError('Choose a file first')
       return
     }
-    setPasteLoading(true)
-    setPasteError('')
+    if (uploadFile.size > 20 * 1024 * 1024) {
+      setUploadError('File exceeds 20 MB')
+      return
+    }
+    setUploadLoading(true)
+    setUploadError('')
     try {
-      const res = await fetch('/api/fixed-income/parse-fmdq', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ paste: trimmed }),
-      })
+      const fd = new FormData()
+      fd.append('file', uploadFile)
+      const res = await fetch('/api/admin/import-bond-yields', { method: 'POST', body: fd })
       const body = await res.json()
       if (!res.ok) {
-        setPasteError(body?.error || `HTTP ${res.status}`)
+        setUploadError(body?.error || `HTTP ${res.status}`)
         return
       }
-      const parsed: ParsedProposal[] = body.results ?? []
-      const byId = new Map(rows.map(r => [r.instrument_id, r]))
-      const review: ReviewRow[] = parsed
-        .filter(p => byId.has(p.instrument_id))
-        .map(p => {
-          const r = byId.get(p.instrument_id)!
-          return {
-            ...p,
-            name: r.name,
-            current_yield: r.yield_pct,
-            accepted: true,
-          }
-        })
-      if (review.length === 0) {
-        setPasteError(
-          `No matches found. The AI couldn't map any row in the paste to our instrument list ` +
-          `(${body.total_instruments ?? 0} instruments available). Check that the paste contains ticker, ` +
-          `coupon, or instrument name info — or close and use per-row Edit.`
-        )
-      } else {
-        setProposals(review)
-        setPasteOpen(false)
+      const imp = body as ImportResponse
+      if (imp.results.length === 0) {
+        setUploadError('No matches. File parsed but no FI tickers matched. Check the file is the brokerage PrintDownload format.')
+        return
       }
+      // Default: auto-accept all rows that are flag-free and not NaN
+      const review: ReviewRow[] = imp.results.map(p => ({
+        ...p,
+        accepted: !p.flag && isFinite(p.ytm_pct),
+      }))
+      setProposals(review)
+      setImportMeta(imp)
+      setUploadOpen(false)
     } catch (e) {
-      setPasteError((e as Error).message)
+      setUploadError((e as Error).message)
     } finally {
-      setPasteLoading(false)
+      setUploadLoading(false)
     }
   }
 
-  // ─── Review + batch save flow ───
+  // ─── Review + batch save ───
 
   function toggleAccept(idx: number) {
     setProposals(prev => {
@@ -299,12 +318,12 @@ export default function FixedIncomePage() {
   }
 
   function toggleAll(accept: boolean) {
-    setProposals(prev => prev ? prev.map(p => ({ ...p, accepted: accept })) : prev)
+    setProposals(prev => prev ? prev.map(p => ({ ...p, accepted: accept && !p.flag && isFinite(p.ytm_pct) })) : prev)
   }
 
   async function saveBatch() {
     if (!proposals) return
-    const accepted = proposals.filter(p => p.accepted)
+    const accepted = proposals.filter(p => p.accepted && isFinite(p.ytm_pct))
     if (accepted.length === 0) return
     setBatchSaving(true)
     setBatchSaveMsg('')
@@ -313,10 +332,10 @@ export default function FixedIncomePage() {
       const results = await Promise.all(accepted.map(p =>
         (supabase.from('instruments') as any)
           .update({
-            yield_pct: p.yield_pct,
+            yield_pct: Number(p.ytm_pct.toFixed(4)),
             yield_as_of: p.as_of,
-            yield_source: 'fmdq-paste',
-            yield_notes: p.notes ? `${p.source} — ${p.notes}` : p.source,
+            yield_source: 'brokerage',
+            yield_notes: p.notes,
             yield_last_refreshed_at: nowIso,
           })
           .eq('instrument_id', p.instrument_id)
@@ -327,6 +346,7 @@ export default function FixedIncomePage() {
       } else {
         setBatchSaveMsg(`✓ Saved ${accepted.length} yield${accepted.length === 1 ? '' : 's'}`)
         setProposals(null)
+        setImportMeta(null)
         await load()
       }
     } catch (e) {
@@ -360,10 +380,10 @@ export default function FixedIncomePage() {
           )}
           <button
             className="btn-h btn-h-primary"
-            onClick={openPaste}
+            onClick={openUpload}
           >
-            <Clipboard size={12} />
-            Paste from FMDQ
+            <Upload size={12} />
+            Upload brokerage file
           </button>
         </div>
       </div>
@@ -380,7 +400,7 @@ export default function FixedIncomePage() {
         ) : (
           <span style={{ color: 'var(--pos)' }}>All yields fresh</span>
         )}
-        . Paste FMDQ quotations to batch-update yields — the AI maps pasted rows to our instruments and you review before anything saves.
+        . Upload a brokerage PrintDownload Price List — the same xlsx used for equity NAV reconstruction — to compute YTM across the FI universe in one step.
       </div>
 
       <div style={{ maxWidth: 1400 }}>
@@ -498,9 +518,9 @@ export default function FixedIncomePage() {
         <div style={{ marginTop: 16, fontSize: 11, color: 'var(--text-3)', display: 'flex', alignItems: 'flex-start', gap: 6, lineHeight: 1.6, maxWidth: 860 }}>
           <Info size={11} style={{ marginTop: 2, flexShrink: 0 }} />
           <span>
-            Yields feed AI report generation and scenario analysis. The paste flow uses Claude to match pasted FMDQ rows
-            to our instrument IDs — nothing saves until you review the proposals.
-            Manual Edit takes precedence over any paste.
+            Yields feed AI report generation and scenario analysis. YTM is computed from the brokerage clean price,
+            coupon, and maturity using a standard semi-annual bond formula. Outlier yields ({'>'} 50% or {'<'} 5%)
+            are flagged for review — usually a sign the clean price is stale. Manual Edit takes precedence.
           </span>
         </div>
       </div>
@@ -570,7 +590,7 @@ export default function FixedIncomePage() {
                   type="text"
                   value={editNotes}
                   onChange={e => setEditNotes(e.target.value)}
-                  placeholder="e.g. FMDQ 23 April daily quotations list"
+                  placeholder="e.g. Investing.com 23 April, or DMO auction 15 April"
                   className="input-h"
                 />
               </div>
@@ -597,84 +617,81 @@ export default function FixedIncomePage() {
         </div>
       )}
 
-      {/* ─── Paste-from-FMDQ modal ─── */}
-      {pasteOpen && (
+      {/* ─── Upload modal ─── */}
+      {uploadOpen && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
-          onClick={() => !pasteLoading && setPasteOpen(false)}
+          onClick={() => !uploadLoading && setUploadOpen(false)}
         >
-          <div className="panel" style={{ maxWidth: 760, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
+          <div className="panel" style={{ maxWidth: 600, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
               <div>
-                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Paste yield data</div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Refresh yields</div>
                 <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
-                  Paste from FMDQ quotations
+                  Upload brokerage file
                 </div>
               </div>
-              <button onClick={() => !pasteLoading && setPasteOpen(false)} disabled={pasteLoading} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: pasteLoading ? 'not-allowed' : 'pointer', padding: 4 }}>
+              <button onClick={() => !uploadLoading && setUploadOpen(false)} disabled={uploadLoading} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: uploadLoading ? 'not-allowed' : 'pointer', padding: 4 }}>
                 <X size={16} />
               </button>
             </div>
 
-            <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
 
-              {/* Instructions + FMDQ link */}
               <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6, background: 'var(--bg-soft)', padding: '12px 14px', borderRadius: 3, border: '1px solid var(--border-soft)' }}>
-                <div style={{ marginBottom: 10 }}>
-                  <strong style={{ color: 'var(--text)' }}>How this works:</strong> open FMDQ, copy their Daily Quotations table
-                  (or any research-note table with Nigerian FI yields), paste below. Claude will map each pasted row to
-                  our instrument list and surface matches for you to review before saving.
-                </div>
-                <a
-                  href={FMDQ_URL}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="btn-h"
-                  style={{ fontSize: 12, padding: '6px 12px', textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
-                >
-                  <ExternalLink size={12} /> Open FMDQ Market Data
-                </a>
+                <strong style={{ color: 'var(--text)' }}>How this works:</strong> choose a Brokerage PrintDownload Price List xlsx
+                — the same format you use for equity NAV reconstruction. We extract the clean prices for your fixed income
+                universe and compute YTM from coupon + maturity + clean price server-side. You review the proposals before
+                anything saves. Equity prices in the file are untouched by this route.
               </div>
 
-              {/* Textarea */}
               <div>
                 <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
-                  Pasted data
-                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— any format; table, CSV, raw text</span>
+                  File
+                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— .xlsx, up to 20 MB</span>
                 </label>
-                <textarea
-                  value={pasteText}
-                  onChange={e => setPasteText(e.target.value)}
-                  placeholder="Paste FMDQ daily quotations table or similar yield data here..."
-                  rows={12}
-                  className="input-h"
-                  style={{ width: '100%', fontFamily: 'var(--font-mono)', fontSize: 11, resize: 'vertical' }}
-                  autoFocus
-                  disabled={pasteLoading}
-                />
-                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-                  {pasteText.length.toLocaleString()} chars pasted
+                <div style={{
+                  border: '1px dashed var(--border-strong)',
+                  borderRadius: 4,
+                  padding: '18px 14px',
+                  background: 'var(--bg-soft)',
+                  textAlign: 'center' as const,
+                }}>
+                  <input
+                    type="file"
+                    accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    onChange={onFileChange}
+                    disabled={uploadLoading}
+                    style={{ display: 'block', margin: '0 auto', fontSize: 12 }}
+                  />
+                  {uploadFile && (
+                    <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-2)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <FileSpreadsheet size={12} />
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>{uploadFile.name}</span>
+                      <span style={{ color: 'var(--text-3)' }}>· {(uploadFile.size / 1024).toFixed(0)} KB</span>
+                    </div>
+                  )}
                 </div>
               </div>
 
-              {pasteError && (
+              {uploadError && (
                 <div className="alert-h alert-h-critical" style={{ fontSize: 11, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
                   <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
-                  <span>{pasteError}</span>
+                  <span>{uploadError}</span>
                 </div>
               )}
 
               <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
                 <button
-                  onClick={submitPaste}
-                  disabled={pasteLoading || pasteText.trim().length < 30}
+                  onClick={submitUpload}
+                  disabled={uploadLoading || !uploadFile}
                   className="btn-h btn-h-primary"
                   style={{ flex: 1, justifyContent: 'center' }}
                 >
-                  <Sparkles size={12} style={pasteLoading ? { animation: 'spin 0.7s linear infinite' } : undefined} />
-                  {pasteLoading ? 'Parsing…' : 'Parse & propose yields'}
+                  <Sparkles size={12} style={uploadLoading ? { animation: 'spin 0.7s linear infinite' } : undefined} />
+                  {uploadLoading ? 'Parsing & computing YTM…' : 'Parse & propose yields'}
                 </button>
-                <button onClick={() => setPasteOpen(false)} disabled={pasteLoading} className="btn-h">Cancel</button>
+                <button onClick={() => setUploadOpen(false)} disabled={uploadLoading} className="btn-h">Cancel</button>
               </div>
             </div>
           </div>
@@ -682,20 +699,20 @@ export default function FixedIncomePage() {
       )}
 
       {/* ─── Proposals review modal ─── */}
-      {proposals && (
+      {proposals && importMeta && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
           onClick={() => !batchSaving && setProposals(null)}
         >
-          <div className="panel" style={{ maxWidth: 920, width: '100%', margin: 0, maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+          <div className="panel" style={{ maxWidth: 1100, width: '100%', margin: 0, maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
             <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
               <div>
-                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Review proposed yields</div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Review computed yields</div>
                 <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
-                  {proposals.length} yield{proposals.length === 1 ? '' : 's'} matched
+                  {proposals.length} yield{proposals.length === 1 ? '' : 's'} computed · {formatDate(importMeta.settlement_date)}
                 </div>
                 <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
-                  Uncheck any rows that look wrong. Only accepted rows will be saved.
+                  File: {importMeta.rows_in_file.toLocaleString()} rows · Matched {importMeta.matched} of {importMeta.fi_instruments_in_db} FI instruments{importMeta.unmatched_count > 0 ? ` · ${importMeta.unmatched_count} unmatched` : ''}
                 </div>
               </div>
               <button onClick={() => !batchSaving && setProposals(null)} disabled={batchSaving} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: batchSaving ? 'not-allowed' : 'pointer', padding: 4 }}>
@@ -704,7 +721,7 @@ export default function FixedIncomePage() {
             </div>
 
             <div style={{ display: 'flex', gap: 8, marginBottom: 10, fontSize: 11 }}>
-              <button onClick={() => toggleAll(true)} disabled={batchSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Select all</button>
+              <button onClick={() => toggleAll(true)} disabled={batchSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Select all valid</button>
               <button onClick={() => toggleAll(false)} disabled={batchSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Deselect all</button>
               <div style={{ marginLeft: 'auto', alignSelf: 'center', color: 'var(--text-3)' }}>
                 {proposals.filter(p => p.accepted).length} of {proposals.length} selected
@@ -717,38 +734,56 @@ export default function FixedIncomePage() {
                   <tr>
                     <th style={{ width: 36 }}></th>
                     <th>Instrument</th>
-                    <th className="num">Current</th>
-                    <th className="num">Proposed</th>
-                    <th>Source</th>
-                    <th>As of</th>
-                    <th>Confidence</th>
+                    <th className="num">Coupon</th>
+                    <th className="num">Clean price</th>
+                    <th className="num">Current yield</th>
+                    <th className="num">Computed YTM</th>
+                    <th>Flag</th>
                   </tr>
                 </thead>
                 <tbody>
                   {proposals.map((p, i) => {
-                    const conf = p.confidence ?? 'high'
-                    const confColor = conf === 'high' ? 'var(--pos)' : conf === 'low' ? 'var(--warn)' : 'var(--text-2)'
+                    const flaggedOrBad = !!p.flag || !isFinite(p.ytm_pct)
                     return (
-                      <tr key={p.instrument_id} style={p.accepted ? {} : { opacity: 0.45 }}>
+                      <tr key={p.instrument_id} style={p.accepted ? {} : { opacity: flaggedOrBad ? 0.55 : 0.45 }}>
                         <td>
-                          <input type="checkbox" checked={p.accepted} onChange={() => toggleAccept(i)} disabled={batchSaving} style={{ accentColor: 'var(--gold)' }} />
+                          <input
+                            type="checkbox"
+                            checked={p.accepted}
+                            onChange={() => toggleAccept(i)}
+                            disabled={batchSaving || !isFinite(p.ytm_pct)}
+                            style={{ accentColor: 'var(--gold)' }}
+                            title={!isFinite(p.ytm_pct) ? 'Cannot save: no valid YTM' : undefined}
+                          />
                         </td>
                         <td>
                           <div style={{ fontSize: 12, fontWeight: 500 }}>{p.name}</div>
-                          <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>{p.instrument_id}</div>
+                          <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                            {p.instrument_id} · matures {formatMaturity(p.maturity_date)}
+                          </div>
                         </td>
-                        <td className="num" style={{ fontFamily: 'var(--font-mono)', color: p.current_yield !== null ? 'var(--text-2)' : 'var(--text-4)' }}>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-2)' }}>
+                          {p.coupon_pct !== null ? `${p.coupon_pct.toFixed(2)}%` : '—'}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 12, color: 'var(--text-2)' }}>
+                          ₦{p.clean_price.toFixed(2)}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: p.current_yield !== null ? 'var(--text-3)' : 'var(--text-4)' }}>
                           {p.current_yield !== null ? `${p.current_yield.toFixed(2)}%` : '—'}
                         </td>
-                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500, color: 'var(--gold)' }}>
-                          {p.yield_pct.toFixed(2)}%
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontWeight: 500, color: p.flag ? 'var(--warn)' : 'var(--gold)' }}>
+                          {isFinite(p.ytm_pct) ? `${p.ytm_pct.toFixed(2)}%` : '—'}
                         </td>
-                        <td style={{ fontSize: 11, color: 'var(--text-2)' }} title={p.notes}>
-                          {p.source}
-                        </td>
-                        <td style={{ fontSize: 11, color: 'var(--text-2)' }}>{formatDate(p.as_of)}</td>
-                        <td style={{ fontSize: 10, color: confColor, textTransform: 'uppercase' as const, letterSpacing: '0.06em', fontWeight: 600 }}>
-                          {conf}
+                        <td style={{ fontSize: 11 }}>
+                          {p.flag ? (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, color: 'var(--warn)' }} title={p.flag_explanation ?? ''}>
+                              <AlertTriangle size={11} /> {p.flag}
+                            </span>
+                          ) : (
+                            <span style={{ color: 'var(--pos)', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                              <CheckCircle2 size={11} /> OK
+                            </span>
+                          )}
                         </td>
                       </tr>
                     )
