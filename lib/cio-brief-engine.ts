@@ -1,5 +1,15 @@
 import Anthropic from '@anthropic-ai/sdk'
 
+// v21w: Fix for "disordered, scattered" brief formatting. Root cause was in
+// text-block joining, not in the prompt. When web_search is used, the
+// Anthropic API splits a single prose sentence into multiple adjacent text
+// blocks (typically [claim-with-citation, ".", continuation]). The prior
+// ".join('\\n\\n')" turned each split into a paragraph break, producing the
+// "floating period on its own line" artifact in the rendered PDF. Fix:
+// shape-aware join — glue punctuation closers directly, glue alphabetic
+// continuations with a space, only paragraph-break when the next block
+// starts with a markdown block marker. See generateCIOBrief below.
+//
 // v21v: Prompt revert. Strips accreted constraints back toward the v21r original
 // that produced the cleanest output. See 02_app_state.md for the full drift log.
 //
@@ -188,12 +198,44 @@ export async function generateCIOBrief(input: CIOBriefInput): Promise<string> {
     tools:      [{ type: 'web_search_20250305', name: 'web_search' }],
     messages:   [{ role: 'user', content: buildPrompt(input) }],
   })
-  // Join all text blocks (model may split across searches), strip self-talk preamble.
+
+  // v21w: Extract text blocks and join them SHAPE-AWARE, not with naive '\n\n'.
+  //
+  // Why: web_search causes the API to split a single prose sentence across
+  // multiple adjacent text blocks — typically [claim, ".", continuation].
+  // Prior '\n\n' joining turned every split into a paragraph break, producing
+  // floating periods and orphaned fragments in the rendered brief.
+  //
+  // Rules:
+  //   - Next block starts with a markdown block marker (## / --- / | / > / -)
+  //       → paragraph break '\n\n'
+  //   - Next block starts with punctuation (. , ; : ! ? ) ] " ')
+  //       → concatenate with NO separator (it is a citation closer)
+  //   - Otherwise → single space (mid-sentence or same-paragraph continuation)
+  //
+  // Within-block paragraph structure (explicit '\n\n' inside one block) is
+  // preserved untouched.
   const blocks = (response.content as any[])
     .filter((b: any) => b.type === 'text')
     .map((b: any) => (b.text as string).trim())
-    .filter(t => t.length > 0)
-  const all      = blocks.join('\n\n').trim()
+    .filter((t: string) => t.length > 0)
+
+  let all = blocks[0] ?? ''
+  for (let i = 1; i < blocks.length; i++) {
+    const next      = blocks[i]
+    const firstChar = next[0] || ''
+
+    if (/^(#{2,4}\s|---|\||-\s|\u2022\s|>\s)/.test(next)) {
+      all = all + '\n\n' + next
+    } else if (/[.,;:!?)\]"'\u2019\u201d]/.test(firstChar)) {
+      all = all + next
+    } else {
+      all = all + ' ' + next
+    }
+  }
+  all = all.trim()
+
+  // Strip self-talk preamble — find first '## ' header and drop anything before.
   const startsH2 = all.startsWith('## ')
   const firstH2  = all.indexOf('\n## ')
   return startsH2 ? all : firstH2 >= 0 ? all.slice(firstH2 + 1) : all
