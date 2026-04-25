@@ -418,7 +418,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         data: pts.map(p => ({
           x: p.tenor_years,
           y: p.yield_pct,
-          // @ts-expect-error custom payload for tooltip
           _payload: p,
           _kind: 'curve',
         })),
@@ -439,7 +438,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         data: holdings.map(h => ({
           x: h.tenor_years,
           y: h.yield_pct,
-          // @ts-expect-error custom payload for tooltip
           _payload: h,
           _kind: 'holding',
         })),
