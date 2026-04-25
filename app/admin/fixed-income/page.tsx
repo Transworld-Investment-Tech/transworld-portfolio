@@ -226,7 +226,7 @@ export default function FixedIncomePage() {
         weird.map((w: any) => ({ id: w.instrument_id, coupon_pct: w.coupon_pct, yield_pct: w.yield_pct })))
     }
 
-    const mapped: FiRow[] = (data ?? []).map((i: any) => {
+    const mapped = (data ?? []).map((i: any) => {
       const { subType, rationale } = parseNotes(i.notes)
       return {
         instrument_id: i.instrument_id,
