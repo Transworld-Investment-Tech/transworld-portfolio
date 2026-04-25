@@ -125,8 +125,8 @@ type SleeveRow = {
   name: string
   act: number
   status: string
-  min_pct?: number
-  max_pct?: number
+  min_pct: number
+  max_pct: number
 }
 
 // 1. Allocation in band — reuses computeSleeveData status mapping
