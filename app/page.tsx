@@ -10,19 +10,31 @@ import IdleCashPanel from '@/components/cockpit/IdleCashPanel'
 import StaleReportsPanel from '@/components/cockpit/StaleReportsPanel'
 import SectorExposureGrid from '@/components/cockpit/SectorExposureGrid'
 import TopMoversPanel from '@/components/cockpit/TopMoversPanel'
+import HouseViewsPanel from '@/components/cockpit/HouseViewsPanel'
+import WatchlistPulsePanel from '@/components/cockpit/WatchlistPulsePanel'
 import type { MandateHealth } from '@/lib/mandate-health'
 import type { FeeOutlook } from '@/lib/fee-outlook'
-import type { SectorExposureData, TopMoversData } from '@/lib/cockpit-aggregations'
+import type {
+  SectorExposureData,
+  TopMoversData,
+  HouseViewsData,
+  WatchlistPulseData,
+} from '@/lib/cockpit-aggregations'
 
 // v27 — FIRM COCKPIT
 // v27c — Added Sector Exposure Grid, Top Movers, FI book overlay on yield curve.
+// v27d — Added House Views (tickers held by ≥2 mandates) and Watchlist Pulse
+//        (unheld watchlist tickers moving today). The Mandate Health Grid's
+//        Watchlist Alignment column is now real (was 'na' placeholder until v27c).
 //
-// Five API calls, fired in parallel:
-//   1. /api/cockpit/summary         — KPIs + AUM trend + allocation + idle cash + stale reports
-//   2. /api/cockpit/health          — Mandate Health Grid
-//   3. /api/cockpit/fee-outlook     — Fee Outlook table
-//   4. /api/cockpit/sector-exposure — Sector heatmap (v27c)
-//   5. /api/cockpit/top-movers      — Daily NGN-impact movers (v27c)
+// Seven API calls, fired in parallel:
+//   1. /api/cockpit/summary          — KPIs + AUM trend + allocation + idle cash + stale reports
+//   2. /api/cockpit/health           — Mandate Health Grid (now with real WL alignment)
+//   3. /api/cockpit/fee-outlook      — Fee Outlook table
+//   4. /api/cockpit/sector-exposure  — Sector heatmap (v27c)
+//   5. /api/cockpit/top-movers       — Daily NGN-impact movers (v27c)
+//   6. /api/cockpit/house-views      — Firm-wide conviction tickers (v27d)
+//   7. /api/cockpit/watchlist-pulse  — Unheld watchlist movers (v27d)
 //
 // The pre-cockpit "All Portfolios" home is preserved at /portfolios.
 
@@ -62,19 +74,29 @@ export default function CockpitPage() {
   const [movers, setMovers]                 = useState<TopMoversData | null>(null)
   const [moversLoading, setMoversLoading]   = useState(true)
 
+  // v27d — house views + watchlist pulse state
+  const [houseViews, setHouseViews]         = useState<HouseViewsData | null>(null)
+  const [houseViewsLoading, setHouseViewsLoading] = useState(true)
+
+  const [pulse, setPulse]                   = useState<WatchlistPulseData | null>(null)
+  const [pulseLoading, setPulseLoading]     = useState(true)
+
   const [refreshing, setRefreshing]         = useState(false)
 
   const loadAll = useCallback(async () => {
     setRefreshing(true)
     setSummaryLoading(true); setHealthLoading(true); setFeeLoading(true)
     setSectorLoading(true); setMoversLoading(true)
+    setHouseViewsLoading(true); setPulseLoading(true)
 
-    const [sRes, hRes, fRes, secRes, movRes] = await Promise.allSettled([
+    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
       fetch('/api/cockpit/health').then(r => r.json()),
       fetch('/api/cockpit/fee-outlook').then(r => r.json()),
       fetch('/api/cockpit/sector-exposure').then(r => r.json()),
       fetch('/api/cockpit/top-movers').then(r => r.json()),
+      fetch('/api/cockpit/house-views').then(r => r.json()),
+      fetch('/api/cockpit/watchlist-pulse').then(r => r.json()),
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -91,6 +113,12 @@ export default function CockpitPage() {
 
     if (movRes.status === 'fulfilled' && !movRes.value.error) setMovers(movRes.value)
     setMoversLoading(false)
+
+    if (hvRes.status === 'fulfilled' && !hvRes.value.error) setHouseViews(hvRes.value)
+    setHouseViewsLoading(false)
+
+    if (plRes.status === 'fulfilled' && !plRes.value.error) setPulse(plRes.value)
+    setPulseLoading(false)
 
     setRefreshing(false)
   }, [])
@@ -237,6 +265,46 @@ export default function CockpitPage() {
               </div>
             </div>
             <TopMoversPanel loading={moversLoading} data={movers} />
+          </div>
+
+          {/* v27d — House Views */}
+          <div className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <div className="panel-title">House Views — held by ≥2 mandates</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                  Tickers expressed across multiple client portfolios · firm-wide conviction surface
+                </div>
+              </div>
+              <div className="panel-meta">
+                {houseViewsLoading
+                  ? 'Loading…'
+                  : houseViews
+                    ? `${houseViews.rows.length} ticker${houseViews.rows.length === 1 ? '' : 's'}`
+                    : '—'}
+              </div>
+            </div>
+            <HouseViewsPanel loading={houseViewsLoading} data={houseViews} />
+          </div>
+
+          {/* v27d — Watchlist Pulse */}
+          <div className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <div className="panel-title">Watchlist Pulse — unheld movers today</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                  Active equity-watchlist tickers no mandate currently holds, moving ±2% or more today
+                </div>
+              </div>
+              <div className="panel-meta">
+                {pulseLoading
+                  ? 'Loading…'
+                  : pulse
+                    ? `${pulse.rows.length} above threshold`
+                    : '—'}
+              </div>
+            </div>
+            <WatchlistPulsePanel loading={pulseLoading} data={pulse} />
           </div>
 
           {/* Idle Cash + Stale Reports */}

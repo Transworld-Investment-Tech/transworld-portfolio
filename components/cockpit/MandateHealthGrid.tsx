@@ -5,6 +5,8 @@ import type { ReactElement } from 'react'
 import type { MandateHealth, HealthLevel } from '@/lib/mandate-health'
 
 // v27 — Mandate Health Grid
+// v27d — Watchlist alignment column header now reads 'Watchlist alignment'
+//        without a version suffix (the check is real as of v27d).
 //
 // Rows = portfolios, columns = 11 best-practice checks. Cells colored
 // green/amber/red/grey. Click a portfolio name to drill into that
@@ -25,7 +27,7 @@ const CHECK_COLUMNS: { key: keyof MandateHealth; label: string; short: string }[
   { key: 'fi_duration_sane',          label: 'FI duration sane',            short: 'FI dur' },
   { key: 'recent_activity',           label: 'Recent activity (90d)',       short: 'Active' },
   { key: 'report_current',            label: 'Report current',              short: 'Report' },
-  { key: 'watchlist_alignment',       label: 'Watchlist alignment (v27b)',  short: 'WL' },
+  { key: 'watchlist_alignment',       label: 'Watchlist alignment',         short: 'WL' },
   { key: 'beating_benchmark',         label: 'Beating benchmark',           short: 'Bench' },
 ]
 
@@ -239,7 +241,7 @@ export default function MandateHealthGrid({ loading, data }: Props): ReactElemen
         <span><span style={{ color: '#2d6e4e' }}>●</span> Green — within tolerance</span>
         <span><span style={{ color: '#a67c2a' }}>●</span> Amber — needs attention</span>
         <span><span style={{ color: '#a63b3b' }}>●</span> Red — breach or overdue</span>
-        <span><span style={{ color: '#b8bcc5' }}>–</span> N/A or pending v27b</span>
+        <span><span style={{ color: '#b8bcc5' }}>–</span> N/A</span>
         <span style={{ marginLeft: 'auto' }}>Hover any cell for detail · click mandate to drill in</span>
       </div>
     </div>

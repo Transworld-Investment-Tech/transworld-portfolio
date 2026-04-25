@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// MANDATE HEALTH ENGINE (v27)
+// MANDATE HEALTH ENGINE (v27 → v27a → v27d)
 // ═══════════════════════════════════════════════════════════════
 //
 // Best-practice surveillance for a single mandate. Returns 11 structured
@@ -11,8 +11,13 @@
 // All checks read from data already on the table. No schema changes.
 // Numeric coercion at every Supabase boundary (pitfall #72).
 //
-// Thresholds are hardcoded in v27 with comments. They can be moved to
+// Thresholds are hardcoded with comments. They can be moved to
 // portfolio-level columns in a later release if needed.
+//
+// v27d — Watchlist alignment check live. checkWatchlistAlignment now
+// computes "% of equity NAV in watchlist-tagged equity tickers" against
+// the active firm watchlist (section = 'equity' AND active = true).
+// Threshold: ≥60% green, ≥30% amber, <30% red.
 // ═══════════════════════════════════════════════════════════════
 
 import { computeSleeveData, estimatedIncomePA } from './portfolio'
@@ -83,7 +88,7 @@ export interface MandateHealth {
   fi_duration_sane:          HealthCheckResult
   recent_activity:           HealthCheckResult
   report_current:            HealthCheckResult
-  watchlist_alignment:       HealthCheckResult   // 'na' in v27, real in v27b
+  watchlist_alignment:       HealthCheckResult   // v27d — real check
   beating_benchmark:         HealthCheckResult
 
   // Aggregate
@@ -329,19 +334,16 @@ function checkCashInBand(
   }
 }
 
-// 7. FI duration — display-only in v27, always green
+// 7. FI duration — display-only, always green
 //    Surfaces weighted MD as a number for the tooltip.
-//    Real threshold added in v27b once "too long" defined for NGN context.
 function checkFIDurationSane(holdings: MandateHealthHolding[]): HealthCheckResult {
   const fiHoldings = holdings.filter(h => h.instrument?.sleeve_id === 'fi')
   if (fiHoldings.length === 0) {
     return { level: 'na', message: 'No FI holdings' }
   }
-  // Compute weighted MD if any holdings carry yield/coupon — defer to v27b
-  // for the actual threshold logic. For v27, just surface count.
   return {
     level: 'green',
-    message: `${fiHoldings.length} FI position${fiHoldings.length === 1 ? '' : 's'} (duration check pending v27b)`,
+    message: `${fiHoldings.length} FI position${fiHoldings.length === 1 ? '' : 's'}`,
     detail: { fi_count: fiHoldings.length },
   }
 }
@@ -402,11 +404,73 @@ function checkReportCurrent(
   }
 }
 
-// 10. Watchlist alignment — deferred to v27b
-function checkWatchlistAlignment(): HealthCheckResult {
+// 10. Watchlist alignment — v27d — Watchlist alignment check live
+//
+//    Computes % of equity NAV held in watchlist-tagged equity tickers.
+//    The "watchlist universe" here is the firm's research universe:
+//    section = 'equity' AND active = true (60 rows in production).
+//    Tickers come pre-deduplicated from fetchWatchlistTickers.
+//
+//    Thresholds:
+//      ≥ 60% → green   (allocation aligned with firm research)
+//      ≥ 30% → amber   (mixed alignment)
+//      < 30% → red     (drift from research universe)
+//
+//    NA cases:
+//      - Empty watchlist universe (data quality issue)
+//      - Portfolio has no equity holdings (FI-only mandate)
+//      - totalNAV is zero
+function checkWatchlistAlignment(
+  holdings: MandateHealthHolding[],
+  totalNAV: number,
+  watchlistTickers: Set<string> | undefined
+): HealthCheckResult {
+  if (!watchlistTickers || watchlistTickers.size === 0) {
+    return { level: 'na', message: 'Watchlist universe empty' }
+  }
+  if (totalNAV <= 0) return { level: 'na', message: 'No NAV' }
+
+  const equityHoldings = holdings.filter(h =>
+    h.instrument?.type === 'Stock' || h.instrument?.sleeve_id === 'eq'
+  )
+  if (equityHoldings.length === 0) {
+    return { level: 'na', message: 'No equity holdings' }
+  }
+
+  const equityNav = equityHoldings.reduce((s, h) => {
+    const px = h.latest_price ?? h.avg_cost
+    return s + num(h.quantity) * num(px)
+  }, 0)
+  if (equityNav <= 0) return { level: 'na', message: 'No equity NAV' }
+
+  const alignedNav = equityHoldings
+    .filter(h => watchlistTickers.has(h.instrument_id))
+    .reduce((s, h) => {
+      const px = h.latest_price ?? h.avg_cost
+      return s + num(h.quantity) * num(px)
+    }, 0)
+
+  const alignment = alignedNav / equityNav
+  const alignedPctLabel = (alignment * 100).toFixed(1) + '%'
+
+  if (alignment >= 0.60) {
+    return {
+      level: 'green',
+      message: `${alignedPctLabel} of equity NAV on firm watchlist`,
+      detail: { alignment, aligned_ngn: alignedNav, equity_ngn: equityNav, threshold: 0.60 },
+    }
+  }
+  if (alignment >= 0.30) {
+    return {
+      level: 'amber',
+      message: `${alignedPctLabel} on watchlist (target ≥60%)`,
+      detail: { alignment, aligned_ngn: alignedNav, equity_ngn: equityNav, threshold: 0.30 },
+    }
+  }
   return {
-    level: 'na',
-    message: 'Watchlist alignment check coming in v27b',
+    level: 'red',
+    message: `${alignedPctLabel} on watchlist — drifted from firm research universe`,
+    detail: { alignment, aligned_ngn: alignedNav, equity_ngn: equityNav },
   }
 }
 
@@ -467,12 +531,13 @@ export interface MandateHealthInput {
   recentTxnCount90d: number
   daysSinceLastReport: number | null
   ytdReturn: number | null   // computed by caller via computePeriodMetrics or similar
+  watchlistTickers?: Set<string>   // v27d — equity-section watchlist (optional; check returns 'na' if absent)
 }
 
 export function computeMandateHealth(input: MandateHealthInput): MandateHealth {
   const {
     portfolio, holdings, sleeveDefs, totalNAV, navHistory,
-    recentTxnCount90d, daysSinceLastReport, ytdReturn,
+    recentTxnCount90d, daysSinceLastReport, ytdReturn, watchlistTickers,
   } = input
 
   // computeSleeveData expects (holdings, sleeveDefs, totalNAV) → array of sleeve rows
@@ -496,7 +561,7 @@ export function computeMandateHealth(input: MandateHealthInput): MandateHealth {
     fi_duration_sane:          checkFIDurationSane(holdings),
     recent_activity:           checkRecentActivity(recentTxnCount90d),
     report_current:            checkReportCurrent(daysSinceLastReport),
-    watchlist_alignment:       checkWatchlistAlignment(),
+    watchlist_alignment:       checkWatchlistAlignment(holdings, totalNAV, watchlistTickers),
     beating_benchmark:         checkBeatingBenchmark(isInternal, ytdReturn, daysElapsed, daysInYear),
   }
 
@@ -542,6 +607,10 @@ export function computeMandateHealth(input: MandateHealthInput): MandateHealth {
 // This adapter converts the structured health result into that shape so the
 // existing JSX continues to render without changes. Red → critical, Amber → warn,
 // Green/NA → suppressed.
+//
+// Watchlist alignment is intentionally OMITTED from the legacy adapter — it's
+// a portfolio-fit signal for the cockpit, not a compliance/breach alert for the
+// portfolio overview banner.
 
 export interface LegacyAlert {
   level: 'critical' | 'warn' | 'info'
@@ -556,7 +625,7 @@ export function healthToLegacyAlerts(h: MandateHealth): LegacyAlert[] {
     { name: 'sleeve_concentration',      check: h.sleeve_concentration },
     { name: 'drawdown_clean',            check: h.drawdown_clean },
     { name: 'income_on_track',           check: h.income_on_track },
-    { name: 'cash_in_band',              check: h.cash_in_band },
+    { name: 'cash_in_band',               check: h.cash_in_band },
     { name: 'recent_activity',           check: h.recent_activity },
     { name: 'report_current',            check: h.report_current },
     { name: 'beating_benchmark',         check: h.beating_benchmark },

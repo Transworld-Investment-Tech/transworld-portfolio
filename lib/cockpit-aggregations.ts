@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// COCKPIT AGGREGATIONS (v27 → v27c)
+// COCKPIT AGGREGATIONS (v27 → v27c → v27d)
 // ═══════════════════════════════════════════════════════════════
 //
 // Pure aggregation helpers for the cockpit. Cross-portfolio reading,
@@ -17,6 +17,15 @@
 //     weighted by aggregate NGN exposure
 //   - buildFirmFIHoldings: aggregated FI holdings across all active
 //     portfolios for the YieldCurvePanel firm overlay
+//
+// v27d — Cockpit Analytics Phase 2:
+//   - fetchWatchlistTickers: equity-section watchlist as a Set, used by
+//     mandate-health for the alignment check input
+//   - buildHouseViews: tickers held by ≥2 portfolios, ranked by mandate
+//     count then firm exposure (firm-wide conviction surface)
+//   - buildWatchlistPulse: equity-section watchlist tickers moving today
+//     (|day_change| ≥ threshold) but unheld by any active portfolio
+//     (missed-opportunity surface)
 // ═══════════════════════════════════════════════════════════════
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -125,6 +134,51 @@ export interface FirmFIHolding {
   total_quantity:   number       // sum of face values
   mandate_count:    number       // distinct portfolios holding
   portfolio_codes:  string[]     // for tooltip display
+}
+
+// v27d — House Views types
+export interface HouseViewMandatePosition {
+  portfolio_id:   string
+  portfolio_name: string
+  client_code:    string
+  is_internal:    boolean
+  ngn:            number
+}
+
+export interface HouseViewRow {
+  instrument_id:            string
+  name:                     string
+  sector:                   string | null
+  mandate_count:            number
+  firm_exposure_ngn:        number
+  share_of_firm_equity_pct: number     // decimal, e.g. 0.124 = 12.4%
+  mandates:                 HouseViewMandatePosition[]   // sorted ngn desc
+}
+
+export interface HouseViewsData {
+  rows:              HouseViewRow[]
+  firm_equity_total: number   // total NGN across firm equity book
+  total_unique:      number   // distinct equity tickers held firm-wide (incl. ≥1 mandate)
+}
+
+// v27d — Watchlist Pulse types
+export interface WatchlistPulseRow {
+  ticker:         string
+  name:           string
+  section:        string
+  sector:         string | null
+  day_change_pct: number     // signed
+  latest_price:   number
+  price_date:     string
+}
+
+export interface WatchlistPulseData {
+  rows:           WatchlistPulseRow[]
+  threshold_pct:  number       // |day_change| threshold used (e.g. 2.0)
+  as_of_date:     string | null
+  watchlist_size: number       // active equity watchlist universe size
+  unheld_count:   number       // unheld active equity watchlist size (denom for pulse)
+  below_threshold_count: number // unheld watchlist movers that didn't clear threshold
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -790,7 +844,6 @@ export async function buildSectorExposureGrid(
   }
 
   const portfolioIds = portfolios.map(p => p.id)
-  const portfolioMeta = new Map(portfolios.map(p => [p.id, p]))
 
   // Pull equity holdings only — instrument.sleeve_id = 'eq' OR holding.sleeve_id = 'eq'
   const { data: holds } = await db
@@ -1061,4 +1114,299 @@ export async function buildFirmFIHoldings(
   }
 
   return out.sort((a, b) => b.total_quantity - a.total_quantity)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 17. v27d — fetchWatchlistTickers
+//
+// Returns the active equity-section watchlist as a Set of tickers.
+// Used by mandate-health for the watchlist alignment check input,
+// and by buildWatchlistPulse as the pulse universe.
+//
+// Schema: watchlist.ticker (nullable text), watchlist.section,
+// watchlist.active. Section values: 'equity' | 'fixed_income' |
+// 'other' | 'watch'. The 'equity' section IS the firm's research
+// universe for active mandate-fit scoring.
+//
+// Called once per cockpit health request.
+// ═══════════════════════════════════════════════════════════════
+export async function fetchWatchlistTickers(
+  db: SupabaseClient,
+  sections: string[] = ['equity']
+): Promise<Set<string>> {
+  const out = new Set<string>()
+  const { data } = await db
+    .from('watchlist')
+    .select('ticker, section, active')
+    .in('section', sections)
+    .eq('active', true)
+    .limit(2000)
+
+  for (const r of (data ?? []) as any[]) {
+    const t = r.ticker ? String(r.ticker).trim() : ''
+    if (t.length > 0) out.add(t)
+  }
+  return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 18. v27d — buildHouseViews
+//
+// Tickers held by ≥2 active portfolios across the firm. Surfaces the
+// firm's "high-conviction" positions concentrated across mandates.
+//
+// Equity-only (FI bonds are usually mandate-specific, not house views).
+// Sort: mandate_count desc, then firm_exposure_ngn desc.
+// Per row: ticker, name, sector, mandate count, firm exposure NGN,
+// share of firm equity book %, and per-mandate breakdown.
+//
+// share_of_firm_equity_pct denominator = sum across firm of equity
+// holdings NGN. Match the same definition used by buildSectorExposureGrid
+// for the firm equity book.
+// ═══════════════════════════════════════════════════════════════
+export async function buildHouseViews(
+  db: SupabaseClient,
+  portfolios: PortfolioWithMeta[]
+): Promise<HouseViewsData> {
+  const empty: HouseViewsData = { rows: [], firm_equity_total: 0, total_unique: 0 }
+  if (portfolios.length === 0) return empty
+
+  const portfolioIds = portfolios.map(p => p.id)
+  const portfolioMeta = new Map(portfolios.map(p => [p.id, p]))
+
+  const { data: holds } = await db
+    .from('holdings')
+    .select('portfolio_id, instrument_id, quantity, avg_cost, instrument:instruments(name, type, sector, sleeve_id)')
+    .in('portfolio_id', portfolioIds)
+    .limit(50000)
+
+  // Latest price per instrument
+  const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
+  const priceMap = new Map<string, number>()
+  if (allInstr.length > 0) {
+    const { data: prices } = await db
+      .from('market_prices')
+      .select('instrument_id, price, price_date')
+      .in('instrument_id', allInstr)
+      .order('price_date', { ascending: false })
+      .limit(50000)
+    for (const p of (prices ?? []) as any[]) {
+      if (!priceMap.has(p.instrument_id)) {
+        const v = numOrNull(p.price)
+        if (v !== null) priceMap.set(p.instrument_id, v)
+      }
+    }
+  }
+
+  // Group: instrument → list of mandate positions
+  type Entry = {
+    name:      string
+    sector:    string | null
+    positions: HouseViewMandatePosition[]
+  }
+  const byInstr = new Map<string, Entry>()
+  let firmEquityTotal = 0
+
+  for (const h of (holds ?? []) as any[]) {
+    const sleeve = h.instrument?.sleeve_id
+    const itype  = h.instrument?.type
+    if (sleeve !== 'eq' && itype !== 'Stock') continue
+    const qty = num(h.quantity)
+    if (qty <= 0) continue
+    const px = priceMap.get(h.instrument_id) ?? num(h.avg_cost)
+    const ngn = qty * px
+    if (ngn <= 0) continue
+
+    const meta = portfolioMeta.get(h.portfolio_id)
+    if (!meta) continue
+
+    let entry = byInstr.get(h.instrument_id)
+    if (!entry) {
+      entry = {
+        name:      h.instrument?.name ?? h.instrument_id,
+        sector:    (h.instrument?.sector ?? '').trim() || null,
+        positions: [],
+      }
+      byInstr.set(h.instrument_id, entry)
+    }
+    entry.positions.push({
+      portfolio_id:   meta.id,
+      portfolio_name: meta.name,
+      client_code:    meta.client_code,
+      is_internal:    meta.is_internal,
+      ngn,
+    })
+    firmEquityTotal += ngn
+  }
+
+  const totalUnique = byInstr.size
+
+  const rows: HouseViewRow[] = []
+  for (const [id, entry] of byInstr) {
+    if (entry.positions.length < 2) continue   // ≥2 mandate threshold
+    const exposureNgn = entry.positions.reduce((s, p) => s + p.ngn, 0)
+    rows.push({
+      instrument_id:            id,
+      name:                     entry.name,
+      sector:                   entry.sector,
+      mandate_count:            entry.positions.length,
+      firm_exposure_ngn:        exposureNgn,
+      share_of_firm_equity_pct: firmEquityTotal > 0 ? exposureNgn / firmEquityTotal : 0,
+      mandates:                 entry.positions.slice().sort((a, b) => b.ngn - a.ngn),
+    })
+  }
+
+  rows.sort((a, b) => {
+    if (b.mandate_count !== a.mandate_count) return b.mandate_count - a.mandate_count
+    return b.firm_exposure_ngn - a.firm_exposure_ngn
+  })
+
+  return {
+    rows,
+    firm_equity_total: firmEquityTotal,
+    total_unique:      totalUnique,
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 19. v27d — buildWatchlistPulse
+//
+// Tickers in the active equity watchlist that:
+//   - are NOT held by any active portfolio
+//   - have |day_change_pct| ≥ thresholdPct today
+//
+// Surfaces "missed opportunities" — names the firm has researched
+// but isn't currently expressing in any client mandate, that moved
+// today.
+//
+// Sort: |day_change_pct| descending, capped at maxRows.
+// thresholdPct default 2.0% (NGX equity meaningful-move threshold).
+// as_of_date = max price_date observed across the unheld watchlist.
+//
+// Returns metadata fields (watchlist_size, unheld_count,
+// below_threshold_count) for the panel footer to give context on
+// what fraction of the universe is moving.
+// ═══════════════════════════════════════════════════════════════
+export async function buildWatchlistPulse(
+  db: SupabaseClient,
+  portfolios: PortfolioWithMeta[],
+  thresholdPct: number = 2.0,
+  maxRows: number = 10
+): Promise<WatchlistPulseData> {
+  const empty: WatchlistPulseData = {
+    rows:                  [],
+    threshold_pct:         thresholdPct,
+    as_of_date:            null,
+    watchlist_size:        0,
+    unheld_count:          0,
+    below_threshold_count: 0,
+  }
+
+  // Pull active equity-section watchlist
+  const { data: watchData } = await db
+    .from('watchlist')
+    .select('ticker, name, section, active')
+    .eq('section', 'equity')
+    .eq('active', true)
+    .limit(2000)
+
+  const watchTickers = (watchData ?? [])
+    .filter((w: any) => w.ticker && String(w.ticker).trim().length > 0)
+    .map((w: any) => ({
+      ticker:  String(w.ticker).trim(),
+      name:    String(w.name ?? ''),
+      section: String(w.section ?? 'equity'),
+    }))
+
+  const watchlistSize = watchTickers.length
+  if (watchlistSize === 0) return empty
+
+  // Build set of held instrument_ids across all active portfolios
+  const portfolioIds = portfolios.map(p => p.id)
+  const heldSet = new Set<string>()
+  if (portfolioIds.length > 0) {
+    const { data: holds } = await db
+      .from('holdings')
+      .select('instrument_id, quantity')
+      .in('portfolio_id', portfolioIds)
+      .limit(50000)
+    for (const h of (holds ?? []) as any[]) {
+      if (num(h.quantity) > 0) heldSet.add(h.instrument_id)
+    }
+  }
+
+  const unheldTickers = watchTickers.filter(w => !heldSet.has(w.ticker))
+  const unheldCount = unheldTickers.length
+  if (unheldCount === 0) {
+    return { ...empty, watchlist_size: watchlistSize, unheld_count: 0 }
+  }
+
+  const tickerIds = unheldTickers.map(w => w.ticker)
+
+  // Latest price per ticker (with day_change)
+  const { data: prices } = await db
+    .from('market_prices')
+    .select('instrument_id, price, price_date, day_change')
+    .in('instrument_id', tickerIds)
+    .order('price_date', { ascending: false })
+    .limit(50000)
+
+  const latestByInstr = new Map<string, { price: number; day_change: number; price_date: string }>()
+  let maxPriceDate: string | null = null
+  for (const p of (prices ?? []) as any[]) {
+    if (latestByInstr.has(p.instrument_id)) continue
+    const px  = numOrNull(p.price)
+    const chg = numOrNull(p.day_change)
+    if (px === null || chg === null) continue
+    latestByInstr.set(p.instrument_id, {
+      price: px,
+      day_change: chg,
+      price_date: p.price_date,
+    })
+    if (!maxPriceDate || p.price_date > maxPriceDate) maxPriceDate = p.price_date
+  }
+
+  // Sector lookup from instruments
+  const { data: instrs } = await db
+    .from('instruments')
+    .select('instrument_id, sector')
+    .in('instrument_id', tickerIds)
+    .limit(2000)
+  const sectorMap = new Map<string, string | null>()
+  for (const i of (instrs ?? []) as any[]) {
+    sectorMap.set(i.instrument_id, (i.sector ?? '').trim() || null)
+  }
+
+  // Walk unheld tickers, classify above / below threshold
+  const aboveThreshold: WatchlistPulseRow[] = []
+  let belowThresholdCount = 0
+  for (const w of unheldTickers) {
+    const latest = latestByInstr.get(w.ticker)
+    if (!latest) continue   // no price data — neither above nor below; just skip
+    const absChange = Math.abs(latest.day_change)
+    if (absChange < thresholdPct) {
+      if (absChange > 0) belowThresholdCount++
+      continue
+    }
+    aboveThreshold.push({
+      ticker:         w.ticker,
+      name:           w.name,
+      section:        w.section,
+      sector:         sectorMap.get(w.ticker) ?? null,
+      day_change_pct: latest.day_change,
+      latest_price:   latest.price,
+      price_date:     latest.price_date,
+    })
+  }
+
+  aboveThreshold.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct))
+
+  return {
+    rows:                  aboveThreshold.slice(0, maxRows),
+    threshold_pct:         thresholdPct,
+    as_of_date:            maxPriceDate,
+    watchlist_size:        watchlistSize,
+    unheld_count:          unheldCount,
+    below_threshold_count: belowThresholdCount,
+  }
 }

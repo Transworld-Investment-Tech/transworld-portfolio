@@ -9,15 +9,19 @@ import {
   fetchYTDReturns,
   fetchRecentTxnCounts,
   fetchDaysSinceLastReport,
+  fetchWatchlistTickers,
 } from '@/lib/cockpit-aggregations'
 import { computeMandateHealth } from '@/lib/mandate-health'
 
 export const maxDuration = 60
 
 // v27 — Cockpit Mandate Health Grid endpoint
+// v27d — Now also fetches the active equity watchlist universe and passes it
+//        to computeMandateHealth so the Watchlist Alignment check produces a
+//        real green/amber/red instead of 'na'.
 //
 // Returns one MandateHealth result per active portfolio. Drives the
-// MandateHealthGrid panel on /cockpit (rows = portfolios, cols = 11 checks).
+// MandateHealthGrid panel on / (rows = portfolios, cols = 11 checks).
 
 export async function GET(_req: NextRequest) {
   try {
@@ -30,13 +34,22 @@ export async function GET(_req: NextRequest) {
       return NextResponse.json({ portfolios: [] })
     }
 
-    const [navMap, holdingsMap, sleeveTargetsMap, navHistoryMap, recentTxnMap, daysSinceMap] = await Promise.all([
+    const [
+      navMap,
+      holdingsMap,
+      sleeveTargetsMap,
+      navHistoryMap,
+      recentTxnMap,
+      daysSinceMap,
+      watchlistTickers,   // v27d
+    ] = await Promise.all([
       computeAllPortfolioNAVs(db, portfolioIds),
       fetchHoldingsForPortfolios(db, portfolioIds),
       fetchSleeveTargetsForPortfolios(db, portfolioIds),
       fetchNavHistoryForPortfolios(db, portfolioIds),
       fetchRecentTxnCounts(db, portfolioIds, 90),
       fetchDaysSinceLastReport(db, portfolioIds),
+      fetchWatchlistTickers(db, ['equity']),
     ])
 
     // YTD return needs navMap from above
@@ -70,6 +83,7 @@ export async function GET(_req: NextRequest) {
         recentTxnCount90d: recentTxnMap.get(p.id) ?? 0,
         daysSinceLastReport: daysSinceMap.get(p.id) ?? null,
         ytdReturn: ytdMap.get(p.id) ?? null,
+        watchlistTickers,   // v27d
       })
     })
 
