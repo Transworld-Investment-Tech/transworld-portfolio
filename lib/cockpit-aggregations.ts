@@ -7,6 +7,16 @@
 //
 // All numeric coercion at every Supabase boundary (pitfall #72).
 // All large queries cap at 50000 rows (pitfall #59).
+//
+// v27b — fetchYTDReturns denominator fix.
+//   Previously fell back to p.starting_nav (cost basis from years ago)
+//   when no Jan 1 nav_log entry existed for portfolios that started before
+//   the current year. This produced absurdly inflated YTD numbers
+//   (ADE +1743%, CMFB +157%) on the Mandate Health Grid. The numerator
+//   stayed correct so the beating_benchmark check happened to function,
+//   but the displayed YTD column was misleading. Fixed: return null when
+//   the proper Jan 1 NAV basis is unavailable. Engine and grid both already
+//   handle null cleanly ('na' on benchmark check, '—' in grid YTD column).
 // ═══════════════════════════════════════════════════════════════
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -427,6 +437,14 @@ export async function buildStaleReports(
 // ═══════════════════════════════════════════════════════════════
 // 7. fetchYTDReturns — simple YTD return per portfolio
 //    Used by mandate-health benchmark check.
+//
+//    v27b — denominator fix.
+//    For portfolios that started this year, denominator = portfolio.starting_nav (correct).
+//    For portfolios that started before this year, denominator = nav_log entry on/before
+//    Jan 1 of this year. If no such nav_log entry exists, return null — do NOT fall back
+//    to starting_nav (cost basis from years ago, produces grossly inflated YTD numbers).
+//    The mandate-health beating_benchmark check returns 'na' when ytdReturn is null.
+//    The Mandate Health Grid YTD column already renders '—' for null.
 // ═══════════════════════════════════════════════════════════════
 export async function fetchYTDReturns(
   db: SupabaseClient,
@@ -479,14 +497,24 @@ export async function fetchYTDReturns(
 
   for (const p of portfolios) {
     const startedThisYear = p.start_date ? new Date(p.start_date) >= yStart : false
-    const nav0 = startedThisYear ? p.starting_nav : (navAtYearStartMap.get(p.id) ?? p.starting_nav)
-    const navN = navMap.get(p.id) ?? 0
 
-    if (nav0 <= 0) {
+    // v27b — strict denominator selection.
+    // If started this year: starting_nav is correct (the deployed capital).
+    // Otherwise: must have Jan 1 nav_log entry — if absent, YTD is not computable.
+    let nav0: number | null
+    if (startedThisYear) {
+      nav0 = p.starting_nav > 0 ? p.starting_nav : null
+    } else {
+      const janNav = navAtYearStartMap.get(p.id)
+      nav0 = (janNav !== undefined && janNav > 0) ? janNav : null
+    }
+
+    if (nav0 === null) {
       out.set(p.id, null)
       continue
     }
 
+    const navN = navMap.get(p.id) ?? 0
     const flows = flowsByPortfolio.get(p.id) ?? { inflow: 0, outflow: 0 }
     // Simple YTD return = (endNAV - startNAV - inflows + outflows) / startNAV
     const ytdReturn = (navN - nav0 - flows.inflow + flows.outflow) / nav0
