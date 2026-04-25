@@ -7,8 +7,9 @@ import { supabase } from '@/lib/supabase'
 // v20: Hybrid sidebar — navy #0a1f3a × muted gold text × Cormorant logo mark.
 // v21b-3b: Added "Broker files" entry to the admin section (/admin/broker).
 // v21z: Added "Fixed income" entry between Market prices and Broker files.
-// v27: Added "Firm Cockpit" as the new top-of-stack item pointing to /.
-//      "All portfolios" relocated from / to /portfolios.
+//
+// Footer shows a live staleness dot based on the most recent market_prices
+// row. "Fresh" if any price within 3 days, "Stale" otherwise.
 
 interface SidebarProps {
   portfolioName?: string
@@ -32,6 +33,7 @@ export default function Sidebar({
   const isActive = (href: string, exact = false) =>
     exact ? pathname === href : pathname.startsWith(href)
 
+  // Freshness footer — query the newest market_prices.price_date and compare
   useEffect(() => {
     supabase
       .from('market_prices')
@@ -60,19 +62,16 @@ export default function Sidebar({
     router.push('/login')
   }
 
-  // v27: Cockpit at the top of the stack. "All portfolios" now points
-  // to /portfolios (the relocated former home page).
   const mainNav = [
-    { href: '/',                    label: 'Firm Cockpit',     icon: '◈', exact: true },
-    { href: '/portfolios',          label: 'All portfolios',   icon: '▦' },
-    { href: '/admin',               label: 'Admin panel',      icon: '◉', exact: true },
-    { href: '/admin/prices',        label: 'Market prices',    icon: '⟡' },
-    { href: '/admin/fixed-income',  label: 'Fixed income',     icon: '§' },
-    { href: '/admin/broker',        label: 'Broker files',     icon: '▣' },
-    { href: '/watchlist',           label: 'NGX Watchlist',    icon: '❈' },
-    { href: '/admin/aliases',       label: 'Ticker aliases',   icon: '⇄' },
-    { href: '/admin/import-prices', label: 'Import prices',    icon: '⇪' },
-    { href: '/admin/cio-brief',     label: 'CIO Brief',        icon: '◎' },
+    { href: '/', label: 'All portfolios', icon: '▦', exact: true },
+    { href: '/admin', label: 'Admin panel', icon: '◉', exact: true },
+    { href: '/admin/prices', label: 'Market prices', icon: '⟡' },
+    { href: '/admin/fixed-income', label: 'Fixed income', icon: '§' },
+    { href: '/admin/broker', label: 'Broker files', icon: '▣' },
+    { href: '/watchlist',      label: 'NGX Watchlist',   icon: '❈' },
+  { href: '/admin/aliases',        label: 'Ticker aliases',  icon: '⇄' },
+  { href: '/admin/import-prices', label: 'Import prices',  icon: '⇪' },
+  { href: '/admin/cio-brief',     label: 'CIO Brief',      icon: '◎' },
   ]
 
   const portfolioNav = portfolioId ? [
@@ -101,6 +100,7 @@ export default function Sidebar({
         fontFamily: 'var(--font-sans)',
       }}
     >
+      {/* Logo */}
       <Link href="/" style={{ textDecoration: 'none', color: 'inherit' }}>
         <div
           style={{
@@ -158,6 +158,7 @@ export default function Sidebar({
         </div>
       </Link>
 
+      {/* Main nav */}
       <ul style={{ listStyle: 'none', padding: '12px 12px 4px', margin: 0 }}>
         {mainNav.map(item => (
           <li key={item.href} style={{ margin: 0 }}>
@@ -172,6 +173,7 @@ export default function Sidebar({
         ))}
       </ul>
 
+      {/* Current portfolio section */}
       {portfolioId && (
         <>
           <div
@@ -242,6 +244,7 @@ export default function Sidebar({
         </>
       )}
 
+      {/* Footer — freshness + sign out */}
       <div
         style={{
           marginTop: 'auto',
