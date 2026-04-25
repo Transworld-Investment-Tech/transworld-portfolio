@@ -42,6 +42,34 @@ function buildFeeRows(txns: any[]): any[] {
   return rows
 }
 
+// v27e: per-row fee decomposition. The two new buckets capture residuals
+// that previously sat silently inside t.fees with no column attribution
+// (e.g. NGX 0.30% regulatory charge on BUY rows, demat / verification fees
+// on standalone FEE rows). By construction:
+//   namedSum + otherRegulatory + otherStandalone === totalFees.
+// FEE rows: residual → otherStandalone. Non-FEE rows: residual → otherRegulatory.
+function decomposeFees(t: any) {
+  const commission = Number(t.fee_commission ?? 0)
+  const vat        = Number(t.fee_vat ?? 0)
+  const stamp      = Number(t.fee_contract_stamp ?? 0)
+  const exchange   = Number(t.fee_exchange ?? 0)
+  const clearing   = Number(t.fee_clearing ?? 0)
+  const sms        = Number(t.fee_sms ?? 0)
+  const management = Number(t.fee_management ?? 0)
+  const totalFees  = Number(t.fees ?? 0)
+  const namedSum   = commission + vat + stamp + exchange + clearing + sms + management
+  const residual   = totalFees - namedSum
+  const isFee      = t.action === 'FEE'
+  return {
+    commission, vat, stamp, exchange, clearing, sms, management,
+    otherRegulatory: isFee ? 0 : residual,
+    otherStandalone: isFee ? residual : 0,
+    totalFees,
+    namedSum,
+    residual,
+  }
+}
+
 const FEE_TYPES = [
   'Management Fee', 'Brokerage Commission', 'Stamp Duty',
   'VAT', 'Exchange Levy', 'Clearing Fee', 'SMS Charge',
@@ -128,22 +156,42 @@ export default function TransactionsPage() {
     })
   })()
 
-  const feeTotals = {
-    commission: txns.reduce((s, t) => s + (t.fee_commission     ?? 0), 0),
-    vat:        txns.reduce((s, t) => s + (t.fee_vat            ?? 0), 0),
-    stamp:      txns.reduce((s, t) => s + (t.fee_contract_stamp ?? 0), 0),
-    exchange:   txns.reduce((s, t) => s + (t.fee_exchange       ?? 0), 0),
-    clearing:   txns.reduce((s, t) => s + (t.fee_clearing       ?? 0), 0),
-    sms:        txns.reduce((s, t) => s + (t.fee_sms            ?? 0), 0),
-    management: txns.reduce((s, t) => s + (t.fee_management     ?? 0), 0),
-    total:      txns.reduce((s, t) => s + (t.fees               ?? 0), 0),
-  }
+  // v27e: feeTotals built from per-row decomposition so the two new buckets
+  // (otherRegulatory, otherStandalone) flow naturally. Headline `total` = sum
+  // of t.fees = sum of all named + buckets, by construction in decomposeFees.
+  const feeTotals = txns.reduce(
+    (acc: any, t: any) => {
+      const d = decomposeFees(t)
+      acc.commission      += d.commission
+      acc.vat             += d.vat
+      acc.stamp           += d.stamp
+      acc.exchange        += d.exchange
+      acc.clearing        += d.clearing
+      acc.sms             += d.sms
+      acc.management      += d.management
+      acc.otherRegulatory += d.otherRegulatory
+      acc.otherStandalone += d.otherStandalone
+      acc.total           += d.totalFees
+      return acc
+    },
+    {
+      commission: 0, vat: 0, stamp: 0, exchange: 0, clearing: 0,
+      sms: 0, management: 0, otherRegulatory: 0, otherStandalone: 0, total: 0,
+    }
+  )
 
   // v21j: Excel export — Sheet 1: Summary, Sheet 2: Full transactions
   function downloadExcel() {
     const wb = XLSX.utils.book_new()
 
     // Sheet 1: Summary
+    // v27e: TOTAL FEES headline is now an Excel formula referencing the
+    // component cells (B6:B14). Fallback v= the same number for readers
+    // that don't evaluate formulas. Summary fee section runs rows 6–15.
+    const totalFromComponents =
+      feeTotals.commission + feeTotals.vat + feeTotals.stamp +
+      feeTotals.exchange + feeTotals.clearing + feeTotals.sms +
+      feeTotals.otherRegulatory + feeTotals.management + feeTotals.otherStandalone
     const summaryData = [
       ['Portfolio', portfolio?.name ?? ''],
       ['Client', portfolio?.client?.name ?? ''],
@@ -156,8 +204,10 @@ export default function TransactionsPage() {
       ['NGX exchange levy (₦)', feeTotals.exchange],
       ['CSCS clearing fee (₦)', feeTotals.clearing],
       ['SMS charges (₦)', feeTotals.sms],
+      ['Other regulatory charges (₦)', feeTotals.otherRegulatory],
       ['Management fees (₦)', feeTotals.management],
-      ['TOTAL FEES (₦)', feeTotals.total],
+      ['Other standalone fees (₦)', feeTotals.otherStandalone],
+      ['TOTAL FEES (₦)', { t: 'n', f: 'SUM(B6:B14)', v: totalFromComponents }],
       [''],
       ['TRANSACTION COUNTS', ''],
       ['Total transactions', txns.length],
@@ -177,40 +227,87 @@ export default function TransactionsPage() {
     XLSX.utils.book_append_sheet(wb, summaryWs, 'Summary')
 
     // Sheet 2: Full transactions
+    // v27e: insert Other Regulatory Charges between SMS and Management Fee.
+    // Append Other Standalone Fees after Management Fee. Net +2 columns.
     const headers = [
       'Date', 'Settlement Date', 'Action', 'Instrument', 'CN Number',
       'Quantity', 'Price (₦)', 'Gross Value (₦)', 'Amount (₦)',
       'Total Fees (₦)', 'Commission (₦)', 'VAT (₦)', 'Stamp Duty (₦)',
-      'Exchange Levy (₦)', 'Clearing (₦)', 'SMS (₦)', 'Management Fee (₦)',
+      'Exchange Levy (₦)', 'Clearing (₦)', 'SMS (₦)',
+      'Other Regulatory Charges (₦)',
+      'Management Fee (₦)',
+      'Other Standalone Fees (₦)',
       'Broker', 'Notes',
     ]
-    const txnRows = txns.map(t => [
-      t.trade_date ?? '',
-      t.settlement_date ?? '',
-      t.action ?? '',
-      t.instrument_id ?? '',
-      t.cn_number ?? '',
-      t.quantity != null ? Number(t.quantity) : '',
-      t.price != null ? Number(t.price) : '',
-      t.gross_value != null ? Number(t.gross_value) : '',
-      t.amount != null ? Number(t.amount) : '',
-      Number(t.fees ?? 0),
-      Number(t.fee_commission ?? 0),
-      Number(t.fee_vat ?? 0),
-      Number(t.fee_contract_stamp ?? 0),
-      Number(t.fee_exchange ?? 0),
-      Number(t.fee_clearing ?? 0),
-      Number(t.fee_sms ?? 0),
-      Number(t.fee_management ?? 0),
-      t.broker ?? '',
-      t.notes ?? '',
-    ])
+    // v27e: pre-flight integrity check. Decompose every row, then assert:
+    //   (a) named columns do not overshoot Total Fees (residual >= -0.01)
+    //   (b) round-trip: namedSum + otherReg + otherStd === totalFees (within 0.01)
+    // If any row fails, abort with a diagnostic alert listing the first 5 offenders.
+    const decomposed = txns.map((t: any) => decomposeFees(t))
+    const integrityErrors: string[] = []
+    txns.forEach((t: any, i: number) => {
+      const d = decomposed[i]
+      const ref = `Row ${i + 1} ${t.trade_date} ${t.action} ${t.instrument_id ?? '—'}` +
+                  ` (gross ₦${(t.gross_value ?? 0).toLocaleString()})`
+      if (d.residual < -0.01) {
+        integrityErrors.push(
+          `${ref}: named fee columns sum to ₦${d.namedSum.toFixed(2)} ` +
+          `but Total Fees is only ₦${d.totalFees.toFixed(2)}`
+        )
+      }
+      const roundTrip = d.namedSum + d.otherRegulatory + d.otherStandalone
+      if (Math.abs(roundTrip - d.totalFees) > 0.01) {
+        integrityErrors.push(
+          `${ref}: decomposed sum ₦${roundTrip.toFixed(2)} ≠ Total Fees ₦${d.totalFees.toFixed(2)}`
+        )
+      }
+    })
+    if (integrityErrors.length > 0) {
+      const sample = integrityErrors.slice(0, 5).join('\n\n')
+      const more   = integrityErrors.length > 5 ? `\n\n…and ${integrityErrors.length - 5} more.` : ''
+      alert(
+        `Excel export aborted — fee reconciliation failed on ${integrityErrors.length} row${integrityErrors.length === 1 ? '' : 's'}:\n\n${sample}${more}`
+      )
+      return
+    }
+
+    const txnRows = txns.map((t: any, i: number) => {
+      const d = decomposed[i]
+      return [
+        t.trade_date ?? '',
+        t.settlement_date ?? '',
+        t.action ?? '',
+        t.instrument_id ?? '',
+        t.cn_number ?? '',
+        t.quantity != null ? Number(t.quantity) : '',
+        t.price != null ? Number(t.price) : '',
+        t.gross_value != null ? Number(t.gross_value) : '',
+        t.amount != null ? Number(t.amount) : '',
+        d.totalFees,
+        d.commission,
+        d.vat,
+        d.stamp,
+        d.exchange,
+        d.clearing,
+        d.sms,
+        d.otherRegulatory,
+        d.management,
+        d.otherStandalone,
+        t.broker ?? '',
+        t.notes ?? '',
+      ]
+    })
     const txnWs = XLSX.utils.aoa_to_sheet([headers, ...txnRows])
+    // v27e: 21 columns total. Other Regulatory Charges + Other Standalone Fees
+    // are wider (~26 chars label) than the existing fee columns.
     txnWs['!cols'] = [
       { wch: 12 }, { wch: 14 }, { wch: 12 }, { wch: 16 }, { wch: 14 },
       { wch: 12 }, { wch: 12 }, { wch: 16 }, { wch: 14 },
       { wch: 14 }, { wch: 14 }, { wch: 10 }, { wch: 14 },
-      { wch: 14 }, { wch: 12 }, { wch: 10 }, { wch: 16 },
+      { wch: 14 }, { wch: 12 }, { wch: 10 },
+      { wch: 26 },
+      { wch: 16 },
+      { wch: 24 },
       { wch: 16 }, { wch: 36 },
     ]
     XLSX.utils.book_append_sheet(wb, txnWs, 'Transactions')
@@ -232,14 +329,16 @@ export default function TransactionsPage() {
     lines.push(`Fee entries:    ${txns.filter(t=>t.action==='FEE').length}`)
     lines.push('')
     lines.push('── FEE SUMMARY ──────────────────────────────────────────')
-    lines.push(`Brokerage commission:  ₦${feeTotals.commission.toLocaleString()}`)
-    lines.push(`VAT on commission:     ₦${feeTotals.vat.toLocaleString()}`)
-    lines.push(`Contract stamp duty:   ₦${feeTotals.stamp.toLocaleString()}`)
-    lines.push(`NGX exchange levy:     ₦${feeTotals.exchange.toLocaleString()}`)
-    lines.push(`CSCS clearing fee:     ₦${feeTotals.clearing.toLocaleString()}`)
-    lines.push(`SMS charges:           ₦${feeTotals.sms.toLocaleString()}`)
-    lines.push(`Management fees:       ₦${feeTotals.management.toLocaleString()}`)
-    lines.push(`TOTAL FEES:            ₦${feeTotals.total.toLocaleString()}`)
+    lines.push(`Brokerage commission:     ₦${feeTotals.commission.toLocaleString()}`)
+    lines.push(`VAT on commission:        ₦${feeTotals.vat.toLocaleString()}`)
+    lines.push(`Contract stamp duty:      ₦${feeTotals.stamp.toLocaleString()}`)
+    lines.push(`NGX exchange levy:        ₦${feeTotals.exchange.toLocaleString()}`)
+    lines.push(`CSCS clearing fee:        ₦${feeTotals.clearing.toLocaleString()}`)
+    lines.push(`SMS charges:              ₦${feeTotals.sms.toLocaleString()}`)
+    lines.push(`Other regulatory charges: ₦${feeTotals.otherRegulatory.toLocaleString()}`)
+    lines.push(`Management fees:          ₦${feeTotals.management.toLocaleString()}`)
+    lines.push(`Other standalone fees:    ₦${feeTotals.otherStandalone.toLocaleString()}`)
+    lines.push(`TOTAL FEES:               ₦${feeTotals.total.toLocaleString()}`)
     lines.push('')
     lines.push('── TRANSACTION DETAIL ───────────────────────────────────')
     lines.push('Date       | Action | Instrument      | Qty           | Price     | Gross Value | Commission | Stamp    | Exch Fee | VAT     | Total Fees')
