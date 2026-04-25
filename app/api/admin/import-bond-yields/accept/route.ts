@@ -1,17 +1,19 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
 
-// v24: POST /api/admin/import-bond-yields/accept
+// v24:  POST /api/admin/import-bond-yields/accept
+// v24b: Within-batch dedupe before UPSERT.
 //
-// Accepts a flat list of yield proposals (from either the single-file or
-// bulk historical upload flow) and writes them to:
+// The Postgres ON CONFLICT clause can only resolve ONE conflict per row in
+// a single INSERT statement. If the proposals array contains two rows with
+// the same (instrument_id, yield_as_of), Postgres rejects the whole INSERT
+// with: "ON CONFLICT DO UPDATE command cannot affect row a second time".
 //
-//   1. yield_history (always — UPSERT on (instrument_id, yield_as_of))
-//   2. instruments.yield_* (conditionally — only if the proposal's yield_as_of
-//      is newer than the current value, so upload order doesn't matter)
-//
-// Service-role write means we bypass RLS for the bulk batch — fewer round
-// trips than the previous per-row anon-client pattern.
+// In practice this happens whenever two uploaded brokerage files share a
+// Market Day (e.g. a re-pulled file, a renamed copy, or two file numbers
+// coincidentally targeting the same EOM date). The server collapses the
+// proposals array by (instrument_id, yield_as_of) — last write wins —
+// and reports the dedupe count in the response.
 
 export const maxDuration = 60
 
@@ -23,13 +25,13 @@ interface AcceptedProposal {
   maturity_date:  string | null
   clean_price:    number | null
   notes:          string
-  // source label is hard-coded server-side — always 'brokerage' for v24
 }
 
 interface AcceptResponse {
   history_inserted: number
   current_updated:  number
   unique_dates:     number
+  deduped:          number  // v24b: count of within-batch collisions collapsed
   errors:           Array<{ instrument_id: string; message: string }>
 }
 
@@ -59,7 +61,7 @@ export async function POST(req: NextRequest) {
   }
 
   // Validate + coerce each proposal at the boundary
-  const clean: AcceptedProposal[] = []
+  const valid: AcceptedProposal[] = []
   const errors: Array<{ instrument_id: string; message: string }> = []
 
   for (const p of proposals) {
@@ -76,7 +78,7 @@ export async function POST(req: NextRequest) {
       errors.push({ instrument_id: p.instrument_id, message: `invalid yield_as_of: ${p.yield_as_of}` })
       continue
     }
-    clean.push({
+    valid.push({
       instrument_id:  p.instrument_id,
       yield_pct:      y,
       yield_as_of:    p.yield_as_of,
@@ -87,15 +89,29 @@ export async function POST(req: NextRequest) {
     })
   }
 
-  if (clean.length === 0) {
+  if (valid.length === 0) {
     return NextResponse.json({ error: 'All proposals invalid', errors }, { status: 400 })
   }
 
+  // ── v24b: dedupe within-batch by (instrument_id, yield_as_of) ─────────
+  // When two files in the upload share a Market Day, the same instrument
+  // appears twice with the same yield_as_of. Postgres can't UPSERT both in
+  // one statement, so collapse to a single row per key — last-write-wins.
+  // Order in the array is preserved by the original parse (file iteration
+  // order); the LAST occurrence wins, which means the file the user picked
+  // most recently in their picker takes precedence. In practice the YTM
+  // values for the same (instrument, date) should be identical anyway.
+  const dedupeMap = new Map<string, AcceptedProposal>()
+  for (const p of valid) {
+    const key = `${p.instrument_id}|${p.yield_as_of}`
+    dedupeMap.set(key, p)
+  }
+  const clean = Array.from(dedupeMap.values())
+  const dedupedCount = valid.length - clean.length
+
   const db = createClient(supabaseUrl, supabaseKey)
 
-  // 1. Upsert into yield_history. ON CONFLICT (instrument_id, yield_as_of) UPDATE.
-  //    This makes re-uploads idempotent: same data → no change. Corrected
-  //    data → overwrite. Last write wins.
+  // 1. Upsert into yield_history.
   const historyRows = clean.map(p => ({
     instrument_id: p.instrument_id,
     yield_as_of:   p.yield_as_of,
@@ -112,7 +128,6 @@ export async function POST(req: NextRequest) {
     .upsert(historyRows, { onConflict: 'instrument_id,yield_as_of', count: 'exact' })
 
   if (histErr) {
-    // Most common cause: 001-create-yield-history.sql wasn't run yet
     const isMissing = /relation .* does not exist|table .* does not exist/i.test(histErr.message)
     return NextResponse.json({
       error: isMissing
@@ -124,7 +139,6 @@ export async function POST(req: NextRequest) {
   // 2. Conditional update of instruments.yield_* to the most-recent yield
   //    per instrument from this batch (only if newer than current value).
 
-  // Find the latest proposal per instrument from this batch
   const latestByInstrument = new Map<string, AcceptedProposal>()
   for (const p of clean) {
     const existing = latestByInstrument.get(p.instrument_id)
@@ -133,7 +147,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Fetch current state for affected instruments
   const ids = Array.from(latestByInstrument.keys())
   const { data: currentRows, error: cErr } = await db
     .from('instruments')
@@ -144,6 +157,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({
       error: `Failed to read current instruments state: ${cErr.message}`,
       history_inserted: histCount ?? 0,
+      deduped: dedupedCount,
     }, { status: 500 })
   }
 
@@ -152,7 +166,6 @@ export async function POST(req: NextRequest) {
     currentMap.set((r as any).instrument_id, (r as any).yield_as_of)
   }
 
-  // Decide which instruments need updating
   const nowIso = new Date().toISOString()
   const toUpdate: AcceptedProposal[] = []
   for (const [iid, p] of latestByInstrument) {
@@ -162,9 +175,6 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // Apply each update individually — could batch via .upsert but instruments
-  // has many other columns we mustn't disturb, so .update().eq() is safer
-  // (per principle #13). Few enough rows for series to be fine.
   let updatedCount = 0
   for (const p of toUpdate) {
     const { error: uErr } = await (db.from('instruments') as any)
@@ -189,6 +199,7 @@ export async function POST(req: NextRequest) {
     history_inserted: histCount ?? clean.length,
     current_updated:  updatedCount,
     unique_dates:     uniqueDates,
+    deduped:          dedupedCount,
     errors,
   }
 
