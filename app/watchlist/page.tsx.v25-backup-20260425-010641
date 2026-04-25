@@ -1,11 +1,10 @@
 'use client'
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { useEffect, useState, useCallback } from 'react'
 import {
   Search, Plus, Trash2, Edit3, Save, X, Eye, BookOpen,
   TrendingUp, Shield, BarChart3, RefreshCw,
   ChevronDown, ChevronUp, Sparkles,
 } from 'lucide-react'
-import { supabase } from '@/lib/supabase'
 
 // v20e: Hybrid rewrite of NGX Master Watchlist.
 // Preserves:
@@ -22,12 +21,6 @@ import { supabase } from '@/lib/supabase'
 // Anthropic does not send CORS headers permitting browser calls.
 // The new endpoint also enables web_search so insights include
 // current market context instead of only training-cutoff knowledge.
-//
-// v26: Quick-add-from-universe picker injected at the top of the
-// Add (not Edit) form panel. Search the instruments universe by
-// ticker or name; one click auto-fills ticker, name, section, and
-// sub-type. Manual entry remains as fallback for anything not yet
-// in the instruments table.
 
 type Section = 'all' | 'equity' | 'fixed_income' | 'other' | 'watch'
 
@@ -79,78 +72,10 @@ interface EditForm {
   rank: number
 }
 
-// v26: minimal shape from the instruments universe table needed
-// to drive the picker + auto-fill heuristics.
-interface InstrumentRow {
-  instrument_id: string
-  name: string
-  sleeve_id: string | null
-  sector: string | null
-  notes: string | null
-  type: string | null
-}
-
 const emptyForm = (): EditForm => ({
   ticker: '', name: '', section: 'equity', sub_type: '',
   rationale: '', notes: '', tags: '', rank: 999,
 })
-
-// v26 helpers ------------------------------------------------------------
-
-function sleeveToSection(sleeveId: string | null | undefined): 'equity' | 'fixed_income' | 'other' {
-  if (sleeveId === 'eq') return 'equity'
-  if (sleeveId === 'fi') return 'fixed_income'
-  return 'other'
-}
-
-function sleeveLabel(sleeveId: string | null | undefined): string {
-  if (sleeveId === 'eq') return 'Equity'
-  if (sleeveId === 'fi') return 'Fixed Income'
-  if (sleeveId === 'liq') return 'Liquidity'
-  return 'Other'
-}
-
-// FI sub-type lives at the front of `instruments.notes` as `[Federal]`,
-// `[Corporate Sukuk]`, etc. — we map those to the watchlist's allowed
-// fixed_income sub-types. Anything we can't classify returns ''.
-function inferFiSubType(notes: string | null | undefined): string {
-  if (!notes) return ''
-  const m = notes.match(/^\s*\[([^\]]+)\]/)
-  if (!m) return ''
-  const raw = m[1].trim().toLowerCase()
-  if (raw.includes('federal sukuk'))  return 'Federal Sukuk'
-  if (raw.includes('corporate sukuk')) return 'Corporate'
-  if (raw.includes('state sukuk'))    return 'State'
-  if (raw === 'federal' || raw === 'fgs' || raw === 'fgnsb' || raw === 'federal eurobond') return 'Federal'
-  if (raw === 'corporate')        return 'Corporate'
-  if (raw === 'commercial paper') return 'Commercial Paper'
-  if (raw === 'state')            return 'State'
-  if (raw === 'supranational')    return 'Supranational'
-  return ''
-}
-
-// Equity sub-type maps `instruments.sector` (free-form NGX sector text)
-// to the watchlist's allowed equity sub-types. Returns '' if no clean
-// match — user can pick manually.
-function inferEquitySubType(sector: string | null | undefined): string {
-  if (!sector) return ''
-  const s = sector.trim().toLowerCase()
-  if (s.includes('bank'))                                         return 'Banking'
-  if (s.includes('telecom') || s.includes('ict') || s.includes('communication')) return 'Telecom'
-  if (s.includes('oil') || s.includes('gas') || s.includes('petroleum'))         return 'Oil & Gas'
-  if (s.includes('consumer'))                                     return 'Consumer'
-  if (s.includes('industrial'))                                   return 'Industrial'
-  if (s.includes('health') || s.includes('pharma'))               return 'Healthcare'
-  return ''
-}
-
-function inferSubType(i: InstrumentRow, section: string): string {
-  if (section === 'fixed_income') return inferFiSubType(i.notes)
-  if (section === 'equity')       return inferEquitySubType(i.sector)
-  return ''
-}
-
-// ------------------------------------------------------------------------
 
 export default function WatchlistPage() {
   const [items,       setItems]       = useState<WatchItem[]>([])
@@ -169,10 +94,6 @@ export default function WatchlistPage() {
   const [sortBy,      setSortBy]      = useState<'rank' | 'name' | 'section'>('rank')
   const [sortDir,     setSortDir]     = useState<'asc' | 'desc'>('asc')
 
-  // v26: instruments universe + picker search state
-  const [instruments,   setInstruments]   = useState<InstrumentRow[]>([])
-  const [pickerSearch,  setPickerSearch]  = useState('')
-
   const load = useCallback(async () => {
     setLoading(true)
     const res = await fetch('/api/watchlist')
@@ -181,67 +102,9 @@ export default function WatchlistPage() {
     setLoading(false)
   }, [])
 
-  // v26: load the instruments universe once on mount. We filter
-  // client-side because the universe is small (~300 rows now,
-  // ~1k worst case) and we need fuzzy matching that Postgres
-  // ilike doesn't quite handle.
-  const loadInstruments = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('instruments')
-      .select('instrument_id, name, sleeve_id, sector, notes, type')
-      .eq('approved', true)
-      .order('name')
-      .limit(2000)
-    if (error) {
-      console.error('[watchlist] loadInstruments error:', error)
-      return
-    }
-    setInstruments((data ?? []) as InstrumentRow[])
-  }, [])
-
-  useEffect(() => { load(); loadInstruments() }, [load, loadInstruments])
+  useEffect(() => { load() }, [])
 
   function flash(m: string) { setMsg(m); setTimeout(() => setMsg(''), 3000) }
-
-  // v26: instruments not already on the watchlist (case-insensitive
-  // ticker compare). The picker shows only addable rows.
-  const availableInstruments = useMemo(() => {
-    const onWatchlist = new Set(
-      items.map(i => (i.ticker ?? '').trim().toLowerCase()).filter(Boolean)
-    )
-    return instruments.filter(i => !onWatchlist.has(i.instrument_id.toLowerCase()))
-  }, [instruments, items])
-
-  const pickerMatches = useMemo(() => {
-    const q = pickerSearch.trim().toLowerCase()
-    if (!q) return []
-    return availableInstruments
-      .filter(i =>
-        i.instrument_id.toLowerCase().includes(q) ||
-        (i.name ?? '').toLowerCase().includes(q),
-      )
-      .slice(0, 12)
-  }, [availableInstruments, pickerSearch])
-
-  function pickInstrument(i: InstrumentRow) {
-    const sec = sleeveToSection(i.sleeve_id)
-    setForm(f => ({
-      ...f,
-      ticker: i.instrument_id,
-      name: i.name,
-      section: sec,
-      sub_type: inferSubType(i, sec),
-    }))
-    setPickerSearch('')
-    flash(`Filled from universe: ${i.instrument_id}`)
-  }
-
-  function closeForm() {
-    setAdding(false)
-    setEditingId(null)
-    setForm(emptyForm())
-    setPickerSearch('')
-  }
 
   const filtered = items
     .filter(it => section === 'all' || it.section === section)
@@ -278,7 +141,7 @@ export default function WatchlistPage() {
         await fetch('/api/watchlist', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) })
         flash('Added ✓')
       }
-      closeForm(); load()
+      setEditingId(null); setAdding(false); setForm(emptyForm()); load()
     } catch { flash('Error saving') }
     setSaving(false)
   }
@@ -303,7 +166,6 @@ export default function WatchlistPage() {
     })
     setEditingId(item.id)
     setAdding(false)
-    setPickerSearch('')
   }
 
   // v21g-2: route through server-side /api/watchlist/insight endpoint
@@ -363,9 +225,6 @@ export default function WatchlistPage() {
 
   const formSubs = SUB_TYPES[form.section] ?? []
 
-  // v26: only show the picker when adding a new entry, not when editing.
-  const showPicker = adding && !editingId
-
   return (
     <div className="hybrid-page" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
       {/* Sticky top header */}
@@ -398,7 +257,7 @@ export default function WatchlistPage() {
             </button>
             <button
               className="btn-h btn-h-primary"
-              onClick={() => { setAdding(true); setEditingId(null); setForm(emptyForm()); setPickerSearch('') }}
+              onClick={() => { setAdding(true); setEditingId(null); setForm(emptyForm()) }}
             >
               <Plus size={12} /> Add security
             </button>
@@ -576,170 +435,12 @@ export default function WatchlistPage() {
                   {editingId ? 'Edit security' : 'Add new security'}
                 </div>
                 <button
-                  onClick={closeForm}
+                  onClick={() => { setAdding(false); setEditingId(null); setForm(emptyForm()) }}
                   style={{ background: 'none', border: 'none', cursor: 'pointer', color: 'var(--text-3)', padding: 4 }}
                 >
                   <X size={13} />
                 </button>
               </div>
-
-              {/* v26: Quick add from instruments universe */}
-              {showPicker && (
-                <div
-                  style={{
-                    marginBottom: 16,
-                    padding: 12,
-                    background: 'var(--gold-soft)',
-                    borderRadius: 3,
-                    border: '1px solid rgba(176, 139, 62, 0.25)',
-                  }}
-                >
-                  <label
-                    style={{
-                      display: 'block',
-                      fontSize: 10,
-                      color: 'var(--gold)',
-                      marginBottom: 6,
-                      textTransform: 'uppercase' as const,
-                      letterSpacing: '0.14em',
-                      fontWeight: 600,
-                    }}
-                  >
-                    Quick add from universe
-                    <span
-                      style={{
-                        marginLeft: 8,
-                        color: 'var(--text-3)',
-                        fontWeight: 400,
-                        textTransform: 'none' as const,
-                        letterSpacing: 0,
-                      }}
-                    >
-                      {availableInstruments.length} instruments addable
-                    </span>
-                  </label>
-                  <div style={{ position: 'relative' }}>
-                    <Search
-                      size={12}
-                      style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)', color: 'var(--text-3)' }}
-                    />
-                    <input
-                      value={pickerSearch}
-                      onChange={e => setPickerSearch(e.target.value)}
-                      placeholder="Type ticker or name (e.g. MTNN, FGSUK, Dangote)…"
-                      className="input-h input-h-sm"
-                      style={{ paddingLeft: 30 }}
-                      autoFocus
-                    />
-                    {pickerSearch.trim() && pickerMatches.length > 0 && (
-                      <div
-                        style={{
-                          position: 'absolute',
-                          top: '100%',
-                          left: 0,
-                          right: 0,
-                          marginTop: 4,
-                          background: 'var(--card)',
-                          border: '1px solid var(--border)',
-                          borderRadius: 3,
-                          boxShadow: '0 6px 18px rgba(15, 41, 71, 0.12)',
-                          maxHeight: 320,
-                          overflowY: 'auto',
-                          zIndex: 30,
-                        }}
-                      >
-                        {pickerMatches.map((i, idx) => (
-                          <button
-                            key={i.instrument_id}
-                            onClick={() => pickInstrument(i)}
-                            style={{
-                              width: '100%',
-                              textAlign: 'left' as const,
-                              padding: '8px 12px',
-                              border: 'none',
-                              background: 'transparent',
-                              cursor: 'pointer',
-                              fontFamily: 'var(--font-sans)',
-                              borderBottom: idx === pickerMatches.length - 1 ? 'none' : '1px solid var(--border-soft)',
-                              display: 'flex',
-                              alignItems: 'center',
-                              gap: 10,
-                            }}
-                            onMouseEnter={e => { e.currentTarget.style.background = 'var(--bg-soft)' }}
-                            onMouseLeave={e => { e.currentTarget.style.background = 'transparent' }}
-                          >
-                            <span
-                              style={{
-                                fontFamily: 'var(--font-mono)',
-                                fontSize: 11,
-                                fontWeight: 700,
-                                color: 'var(--gold)',
-                                width: 110,
-                                flexShrink: 0,
-                              }}
-                            >
-                              {i.instrument_id}
-                            </span>
-                            <span
-                              style={{
-                                fontSize: 12,
-                                color: 'var(--text)',
-                                flex: 1,
-                                minWidth: 0,
-                                overflow: 'hidden',
-                                textOverflow: 'ellipsis',
-                                whiteSpace: 'nowrap' as const,
-                              }}
-                            >
-                              {i.name}
-                            </span>
-                            <span
-                              style={{
-                                fontSize: 9,
-                                padding: '1px 6px',
-                                borderRadius: 2,
-                                background: 'var(--bg-soft)',
-                                color: 'var(--text-3)',
-                                textTransform: 'uppercase' as const,
-                                letterSpacing: '0.06em',
-                                flexShrink: 0,
-                              }}
-                            >
-                              {sleeveLabel(i.sleeve_id)}
-                            </span>
-                          </button>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                  {pickerSearch.trim() && pickerMatches.length === 0 && (
-                    <p
-                      style={{
-                        marginTop: 8,
-                        fontSize: 11,
-                        color: 'var(--text-3)',
-                        fontStyle: 'italic' as const,
-                      }}
-                    >
-                      No matching instrument in the universe — fill the form below to add manually,
-                      or seed it via <code style={{ fontFamily: 'var(--font-mono)' }}>/admin/fixed-income</code> /
-                      <code style={{ fontFamily: 'var(--font-mono)' }}>/admin/equities</code> first.
-                    </p>
-                  )}
-                  <p
-                    style={{
-                      marginTop: 8,
-                      fontSize: 10,
-                      color: 'var(--text-3)',
-                      lineHeight: 1.5,
-                    }}
-                  >
-                    Pick an instrument to auto-fill ticker, name, section, and sub-type.
-                    You&rsquo;ll still enter rank, rationale, notes, and tags below.
-                  </p>
-                </div>
-              )}
-
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 2fr 1fr', gap: 12, marginBottom: 12 }}>
                 <div>
                   <label style={{ display: 'block', fontSize: 10, color: 'var(--text-3)', marginBottom: 4, textTransform: 'uppercase' as const, letterSpacing: '0.12em' }}>
@@ -809,7 +510,7 @@ export default function WatchlistPage() {
               </div>
               <div style={{ marginBottom: 12 }}>
                 <label style={{ display: 'block', fontSize: 10, color: 'var(--text-3)', marginBottom: 4, textTransform: 'uppercase' as const, letterSpacing: '0.12em' }}>
-                  Why it&rsquo;s on the watchlist
+                  Why it's on the watchlist
                 </label>
                 <textarea
                   value={form.rationale}
@@ -854,7 +555,7 @@ export default function WatchlistPage() {
                 </button>
                 <button
                   className="btn-h"
-                  onClick={closeForm}
+                  onClick={() => { setAdding(false); setEditingId(null); setForm(emptyForm()) }}
                 >
                   Cancel
                 </button>
@@ -1242,9 +943,9 @@ export default function WatchlistPage() {
                 lineHeight: 1.6,
               }}
             >
-              <strong style={{ color: 'var(--text-2)' }}>Usage:</strong> This watchlist is Transworld&rsquo;s investment idea universe — 55 equities, 70 fixed income, 15 other securities and 8 eagle-eye watch items.
+              <strong style={{ color: 'var(--text-2)' }}>Usage:</strong> This watchlist is Transworld's investment idea universe — 55 equities, 70 fixed income, 15 other securities and 8 eagle-eye watch items.
               The AI report engine scans this list when generating portfolio intelligence.
-              Click any item to expand, then &ldquo;Get AI market intelligence&rdquo; for a live Claude-powered brief on that security.
+              Click any item to expand, then "Get AI market intelligence" for a live Claude-powered brief on that security.
               Source: NGX Daily Summary 12 March 2026 · NGX Daily Official List (Bonds) 13 March 2026.
             </div>
           )}
