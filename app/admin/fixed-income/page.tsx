@@ -7,6 +7,8 @@ import {
   AlertCircle, CheckCircle2, Upload, FileSpreadsheet, AlertTriangle,
   History,
 } from 'lucide-react'
+import YieldCurvePanel from '@/components/admin/YieldCurvePanel'
+import { computeDurationConvexity } from '@/lib/bond-yield'
 
 // v21z: Fixed Income admin page.
 // v21z-hotfix-1: Replaced web_search (3/72 hit rate) with paste-from-FMDQ.
@@ -39,6 +41,10 @@ interface FiRow {
   yield_as_of: string | null
   yield_last_refreshed_at: string | null
   yield_notes: string | null
+  // v25: computed at load time
+  mod_duration: number | null
+  convexity: number | null
+  vwc_tag: 'traded' | 'quoted' | 'stale'
 }
 
 type YieldFlag = 'matured' | 'par-at-or-above' | 'extreme-high' | 'extreme-low' | 'solver-failed'
@@ -239,7 +245,37 @@ export default function FixedIncomePage() {
         yield_notes: i.yield_notes ?? null,
       }
     })
-    setRows(mapped)
+    // v25: augment with mod duration, convexity, and VWC tag
+    const { data: histData } = await supabase
+      .from('yield_history')
+      .select('instrument_id, yield_as_of, volume')
+      .order('yield_as_of', { ascending: false })
+      .limit(2000)
+    const latestVolMap = new Map<string, number | null>()
+    for (const r of (histData ?? []) as any[]) {
+      if (!latestVolMap.has(r.instrument_id)) {
+        latestVolMap.set(r.instrument_id, numOrNull(r.volume))
+      }
+    }
+    const today = new Date().toISOString().slice(0, 10)
+    const augmented: FiRow[] = mapped.map(r => {
+      let modDur: number | null = null
+      let convex: number | null = null
+      if (r.yield_pct !== null && r.coupon_pct !== null && r.maturity_date) {
+        const dc = computeDurationConvexity(r.yield_pct, r.coupon_pct, r.maturity_date, today, 2)
+        if (dc) { modDur = dc.mod_duration; convex = dc.convexity }
+      }
+      let vwc: 'traded' | 'quoted' | 'stale' = 'quoted'
+      if (!r.yield_as_of) vwc = 'stale'
+      else {
+        const ageDays = (new Date(today).getTime() - new Date(r.yield_as_of).getTime()) / 86_400_000
+        if (ageDays > 14) vwc = 'stale'
+        else if ((latestVolMap.get(r.instrument_id) ?? 0) > 0) vwc = 'traded'
+        else vwc = 'quoted'
+      }
+      return { ...r, mod_duration: modDur, convexity: convex, vwc_tag: vwc }
+    })
+    setRows(augmented)
     setLoading(false)
   }
 
@@ -704,6 +740,9 @@ export default function FixedIncomePage() {
           </div>
         </div>
 
+        {/* v25: yield curve panel */}
+        <YieldCurvePanel />
+
         {/* Table */}
         <div className="panel" style={{ padding: 0, overflowX: 'auto' }}>
           {loading ? (
@@ -720,6 +759,9 @@ export default function FixedIncomePage() {
                   <th>Maturity</th>
                   <th className="num">Tenor</th>
                   <th className="num">Yield</th>
+                  <th className="num" title="Modified duration: % price change per 100bps yield change">Mod dur</th>
+                  <th className="num" title="Convexity">Convexity</th>
+                  <th title="Volume-Weighted Confidence: traded / quoted / stale">VWC</th>
                   <th>Source</th>
                   <th>As of</th>
                   <th></th>
@@ -758,6 +800,23 @@ export default function FixedIncomePage() {
                         {hasNum(r.yield_pct)
                           ? <span style={{ fontWeight: 500, color: 'var(--text)' }}>{fmtPct(r.yield_pct)}</span>
                           : <span style={{ color: 'var(--text-4)' }}>—</span>}
+                      </td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.mod_duration !== null ? 'var(--text-2)' : 'var(--text-4)' }}>
+                        {r.mod_duration !== null ? `${r.mod_duration.toFixed(2)}y` : '—'}
+                      </td>
+                      <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: r.convexity !== null ? 'var(--text-2)' : 'var(--text-4)' }}>
+                        {r.convexity !== null ? r.convexity.toFixed(1) : '—'}
+                      </td>
+                      <td>
+                        <span style={{
+                          fontSize: 9, padding: '2px 7px', borderRadius: 2,
+                          background: r.vwc_tag === 'traded' ? 'rgba(45, 110, 78, 0.12)' : r.vwc_tag === 'stale' ? 'rgba(166, 124, 42, 0.14)' : 'var(--bg-soft)',
+                          color: r.vwc_tag === 'traded' ? 'var(--pos)' : r.vwc_tag === 'stale' ? 'var(--warn)' : 'var(--text-3)',
+                          border: '1px solid var(--border-soft)',
+                          fontWeight: 600, letterSpacing: '0.06em', textTransform: 'uppercase' as const, whiteSpace: 'nowrap' as const,
+                        }}>
+                          {r.vwc_tag}
+                        </span>
                       </td>
                       <td>
                         {r.yield_source

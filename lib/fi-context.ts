@@ -1,34 +1,30 @@
 // v23: Fixed Income context module.
+// v25: Extended FIInstrument with mod_duration, convexity, vwc_tag.
+//      Prompt block now mentions duration as a risk-budget metric and
+//      VWC tag as a liquidity signal.
 //
-// Shared builder for the "Fixed Income Universe" block injected into
-// scenario, per-portfolio, and consolidated AI prompts. Single source of
-// truth for how FI yield data is fetched, grouped, formatted, and flagged.
-//
-// Design decisions:
-//   - Filter: sleeve_id='fi' AND approved=true AND yield_pct IS NOT NULL
-//             AND yield_pct > 0 AND maturity_date IS NOT NULL.
-//             Excludes legacy FGN_10/FGN_5_7 buckets and at-par bonds.
-//   - Groups: Federal / Federal Sukuk / FGS+FGNSB / Sub-Sovereign /
-//             Corporate+CP. Parsed from notes "[SubType]" tag with
-//             ticker-prefix fallback.
-//   - Flag: yield > 40% or yield < 8%. Nigeria is a high-rate environment
-//           so legitimately high yields are plausible, but > 40% is very
-//           likely matrix-priced on an illiquid series — the AI should
-//           treat such recommendations with a liquidity caveat.
-//   - Numeric coercion at fetch boundary (pitfall #72). Supabase returns
-//     numeric columns as strings; parseFloat at the seam.
+// Single source of truth for how FI yield data is fetched, grouped,
+// formatted, and flagged for AI prompt injection.
+
+import { computeDurationConvexity } from './bond-yield'
 
 export type FIGroup = 'federal' | 'federal_sukuk' | 'fgs_fgnsb' | 'sub_sovereign' | 'corporate'
+
+export type VWCTag = 'traded' | 'quoted' | 'stale'
 
 export interface FIInstrument {
   instrument_id: string
   name:          string
   coupon_pct:    number | null
-  maturity_date: string           // ISO date, never null (filtered upstream)
+  maturity_date: string
   yield_pct:     number
-  yield_as_of:   string | null    // ISO date
-  sub_type:      string           // parsed display label
+  yield_as_of:   string | null
+  sub_type:      string
   group:         FIGroup
+  // v25 additions
+  mod_duration:  number | null    // years; null if can't compute
+  convexity:     number | null    // years²
+  vwc_tag:       VWCTag           // traded / quoted / stale
 }
 
 // ── Numeric coercion at the DB-to-JS boundary (pitfall #72) ──────────────
@@ -39,14 +35,11 @@ function toNum(v: unknown): number | null {
 }
 
 // ── Sub-type extraction ──────────────────────────────────────────────────
-// Primary source: notes field starts with "[SubType] rationale".
-// Fallback: infer from ticker prefix or name.
 function parseSubType(notes: string | null, ticker: string, name: string): string {
   if (notes) {
     const m = notes.match(/^\[([^\]]+)\]/)
     if (m) return m[1].trim()
   }
-  // Fallback heuristics based on ticker and name patterns
   if (ticker.startsWith('CP'))                             return 'Commercial Paper'
   if (/FGNSB/i.test(name))                                 return 'FGNSB'
   if (/FHSUK|FGSUK/i.test(ticker) || /FHSUK/i.test(name))  return 'Federal Sukuk'
@@ -64,8 +57,26 @@ function groupOf(subType: string): FIGroup {
   if (s === 'fgs' || s === 'fgnsb')                return 'fgs_fgnsb'
   if (s.includes('state')    || s.includes('impact') ||
       s.includes('municipal'))                     return 'sub_sovereign'
-  // Corporate bucket includes Corporate, Commercial Paper, Guaranteed Corporate
   return 'corporate'
+}
+
+// v25: VWC tag — read from latest yield_history row's volume + age of yield_as_of.
+//   traded   → most recent yield_history row for this instrument has volume > 0
+//   quoted   → recent yield_history row exists but volume is 0 / null
+//   stale    → no yield_history row in last YIELD_STALE_DAYS
+const YIELD_STALE_DAYS = 14
+
+function vwcTagFor(
+  yieldAsOf: string | null,
+  latestVolume: number | null,
+): VWCTag {
+  if (!yieldAsOf) return 'stale'
+  const asOf = new Date(yieldAsOf + 'T00:00:00Z')
+  const now  = new Date()
+  const days = (now.getTime() - asOf.getTime()) / 86_400_000
+  if (days > YIELD_STALE_DAYS) return 'stale'
+  if (latestVolume !== null && latestVolume > 0) return 'traded'
+  return 'quoted'
 }
 
 // ── Public: fetch + shape ─────────────────────────────────────────────────
@@ -81,21 +92,51 @@ export async function fetchFIUniverse(db: any): Promise<FIInstrument[]> {
 
   if (error || !data) return []
 
+  // v25: also pull the latest volume per instrument from yield_history.
+  // We grab volume from the most recent yield_history row per instrument
+  // by ordering desc then taking the first occurrence client-side.
+  const { data: histData } = await db
+    .from('yield_history')
+    .select('instrument_id, yield_as_of, volume')
+    .order('yield_as_of', { ascending: false })
+    .limit(2000)
+
+  const latestVolumeBy = new Map<string, number | null>()
+  for (const r of (histData ?? []) as any[]) {
+    if (!latestVolumeBy.has(r.instrument_id)) {
+      latestVolumeBy.set(r.instrument_id, toNum(r.volume))
+    }
+  }
+
+  const today = new Date().toISOString().slice(0, 10)
   const rows: FIInstrument[] = []
   for (const r of data as any[]) {
     const y = toNum(r.yield_pct)
     if (y === null || y <= 0) continue
 
     const subType = parseSubType(r.notes, r.instrument_id, r.name)
+    const couponNum = toNum(r.coupon_pct)
+
+    // Compute duration/convexity from the known yield + today as settlement.
+    let modDur: number | null = null
+    let convex: number | null = null
+    if (couponNum !== null && r.maturity_date) {
+      const dc = computeDurationConvexity(y, couponNum, r.maturity_date, today, 2)
+      if (dc) { modDur = dc.mod_duration; convex = dc.convexity }
+    }
+
     rows.push({
       instrument_id: r.instrument_id,
       name:          r.name,
-      coupon_pct:    toNum(r.coupon_pct),
+      coupon_pct:    couponNum,
       maturity_date: r.maturity_date,
       yield_pct:     y,
       yield_as_of:   r.yield_as_of ?? null,
       sub_type:      subType,
       group:         groupOf(subType),
+      mod_duration:  modDur,
+      convexity:     convex,
+      vwc_tag:       vwcTagFor(r.yield_as_of ?? null, latestVolumeBy.get(r.instrument_id) ?? null),
     })
   }
   return rows
@@ -115,8 +156,6 @@ function fmtTenor(y: number): string {
 }
 
 function isFlagged(yieldPct: number): boolean {
-  // Nigeria is a high-rate environment. Wide band to allow legitimately
-  // high yields on illiquid short-dated issues. Only flag truly extreme.
   return yieldPct > 40 || yieldPct < 8
 }
 
@@ -144,12 +183,16 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
   }
   for (const it of items) grouped[it.group].push(it)
 
-  // Most-recent yield_as_of becomes the header date
   const asOfs = items.map(i => i.yield_as_of).filter((x): x is string => !!x).sort()
   const latestAsOf = asOfs[asOfs.length - 1] ?? null
   const asOfDisplay = latestAsOf
     ? new Date(latestAsOf).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
     : 'unknown'
+
+  // v25: VWC tally — gives the AI a sense of how much of the universe is real
+  const tradedCount = items.filter(i => i.vwc_tag === 'traded').length
+  const quotedCount = items.filter(i => i.vwc_tag === 'quoted').length
+  const staleCount  = items.filter(i => i.vwc_tag === 'stale').length
 
   const lines: string[] = [
     '',
@@ -157,9 +200,14 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
     `FIXED INCOME UNIVERSE — yields as of ${asOfDisplay}`,
     '═══════════════════════════════════════════════════════',
     `${items.length} instruments with current market yields. Tenor = years to maturity from today.`,
-    '⚠ = yield > 40% — likely matrix-priced on thinly traded series. Nigeria is a high-rate',
-    'environment so elevated yields can be legitimate, but ⚠ lines warrant a liquidity caveat',
-    'if recommended.',
+    `Liquidity signal: ${tradedCount} traded recently · ${quotedCount} quoted (no recent volume) · ${staleCount} stale.`,
+    '',
+    'Per-row notation:',
+    '  · TRADED  — bond had volume in latest brokerage snapshot (real signal)',
+    '  · QUOTED  — yield exists but no recent trades (matrix-priced reference)',
+    '  · STALE   — yield older than 14 days (do not anchor recommendations on this)',
+    '  · ⚠       — yield > 40% — likely matrix-priced on a thinly traded series',
+    '  · MD x.xy — modified duration: % price change per 100bps yield move',
     '',
   ]
 
@@ -171,8 +219,10 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
     for (const r of rows) {
       const tenor = tenorYears(r.maturity_date)
       const flag  = isFlagged(r.yield_pct) ? ' \u26a0' : ''
+      const tag   = r.vwc_tag.toUpperCase()
+      const md    = r.mod_duration !== null ? ` · MD ${r.mod_duration.toFixed(1)}y` : ''
       lines.push(
-        `  ${r.instrument_id} · ${r.name} · tenor ${fmtTenor(tenor)} · yield ${r.yield_pct.toFixed(2)}%${flag}`
+        `  ${r.instrument_id} · ${r.name} · tenor ${fmtTenor(tenor)} · yield ${r.yield_pct.toFixed(2)}%${md} · ${tag}${flag}`
       )
     }
     lines.push('')
@@ -181,15 +231,24 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
   lines.push('INSTRUCTIONS FOR AI: When recommending fixed income positions, cite specific')
   lines.push('instruments by ticker and current yield from the universe above. Match tenor to')
   lines.push("the scenario's / mandate's time horizon. Do not invent FI instruments that are")
-  lines.push('not in this universe. When a flagged (\u26a0) line is the best match, mention the')
-  lines.push('liquidity caveat explicitly.')
+  lines.push('not in this universe.')
+  lines.push('')
+  lines.push('LIQUIDITY GUIDANCE: Prefer TRADED instruments for any recommendation that')
+  lines.push('involves actually entering a position at scale. QUOTED instruments are valid')
+  lines.push('reference points but mention liquidity risk if recommending size. STALE')
+  lines.push('instruments should not be cited unless explicitly noted as approximate.')
+  lines.push('')
+  lines.push('DURATION GUIDANCE: For mandates with > 1 year horizon, longer-duration')
+  lines.push('positions earn more carry but carry more rate risk. For income-focused')
+  lines.push('mandates, weighted-average modified duration of the FI sleeve should align')
+  lines.push("with the mandate's drawdown tolerance. Mention duration explicitly when")
+  lines.push('recommending bonds with MD > 5 years.')
   lines.push('═══════════════════════════════════════════════════════')
 
   return lines.join('\n')
 }
 
-// ── Public: summarised curve snapshot (reserved for v24 CIO brief) ────────
-// Not used in v23. CIO brief stays untouched this release.
+// ── Public: summarised curve snapshot (reserved for CIO brief integration) ────
 export function buildFICurveSnapshot(items: FIInstrument[]): string {
   if (!items || items.length === 0) return ''
 

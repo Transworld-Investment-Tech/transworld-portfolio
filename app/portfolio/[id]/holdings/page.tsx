@@ -1,19 +1,23 @@
 'use client'
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import * as XLSX from 'xlsx'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
+import { computeDurationConvexity } from '@/lib/bond-yield'
+import YieldCurvePanel from '@/components/admin/YieldCurvePanel'
 import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle, FileSpreadsheet } from 'lucide-react'
 
 // v20d: Hybrid rewrite.
-// Sidebar is rendered by app/portfolio/[id]/layout.tsx — do NOT render one here.
-// v17: prices display an "As of" date with a stale indicator.
+// v17:  prices display an "As of" date with a stale indicator.
 // v21h: new Sector, NGX Board, Volume, Prev close, and Day change %
 //   columns surface v20h data.
-// v21j: Excel export via SheetJS. "Export Excel" button added to header.
-//   Exports all held positions with full column set to a single-sheet .xlsx.
+// v21j: Excel export via SheetJS.
+// v25:  When a holding is FI, show Mod Duration + Convexity columns.
+//   Portfolio-weighted MD displayed in summary. YieldCurvePanel embedded
+//   at bottom, locked to this portfolio so its bond holdings overlay
+//   automatically as gold diamonds on the live yield curve.
 
 const STALE_DAYS = 3
 
@@ -56,6 +60,12 @@ interface PriceRow {
   prev_close: number | null
   volume: number | null
   price_date: string
+}
+
+const numOrNull = (v: unknown): number | null => {
+  if (v === null || v === undefined) return null
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  return isFinite(n) ? n : null
 }
 
 export default function HoldingsPage() {
@@ -132,22 +142,6 @@ export default function HoldingsPage() {
     flashMsg('Position added — transaction recorded ✓')
     await load()
   }
-  async function _unused_addHolding_OLD() {
-    if (!newHolding.instrument_id || !newHolding.quantity) return
-    const instr = instruments.find(i => i.instrument_id === newHolding.instrument_id)
-    await supabase.from('holdings').upsert({
-      portfolio_id: portfolioId,
-      instrument_id: newHolding.instrument_id,
-      sleeve_id: instr?.sleeve_id,
-      quantity: Number(newHolding.quantity),
-      avg_cost: Number(newHolding.avg_cost) || priceData[newHolding.instrument_id]?.price || 1,
-      as_of_date: new Date().toISOString().slice(0, 10),
-    }, { onConflict: 'portfolio_id,instrument_id' })
-    setAdding(false)
-    setNewHolding({ instrument_id: '', quantity: '', avg_cost: '', trade_date: '' })
-    load()
-    flashMsg('Position added ✓')
-  }
 
   async function deleteHolding(instrumentId: string) {
     if (!confirm('Remove this position?')) return
@@ -161,7 +155,60 @@ export default function HoldingsPage() {
     setHoldings(h => h.map(hold => hold.instrument_id === instrId ? { ...hold, [key]: val } : hold))
   }
 
-  // v21j: Excel export — single sheet with all visible columns
+  // v25: precompute MD/Convexity per FI holding
+  const fiMetrics = useMemo(() => {
+    const today = new Date().toISOString().slice(0, 10)
+    const out = new Map<string, { mod_duration: number | null; convexity: number | null }>()
+    for (const h of holdings) {
+      if (h.sleeve_id !== 'fi') continue
+      const instr = h.instrument
+      if (!instr || !instr.maturity_date) continue
+      const yieldPct = numOrNull(instr.yield_pct)
+      const couponPct = numOrNull(instr.coupon_pct)
+      if (yieldPct === null || couponPct === null) {
+        out.set(h.instrument_id, { mod_duration: null, convexity: null })
+        continue
+      }
+      const dc = computeDurationConvexity(yieldPct, couponPct, String(instr.maturity_date).slice(0, 10), today, 2)
+      out.set(h.instrument_id, dc ? { mod_duration: dc.mod_duration, convexity: dc.convexity } : { mod_duration: null, convexity: null })
+    }
+    return out
+  }, [holdings])
+
+  // v25: portfolio-weighted MD across the FI sleeve only
+  const fiSleeveStats = useMemo(() => {
+    let totalFiValue = 0
+    let weightedMD = 0
+    let weightedYield = 0
+    let mdCovered = 0
+    let yldCovered = 0
+    for (const h of holdings) {
+      if (h.sleeve_id !== 'fi') continue
+      const instr = h.instrument
+      const qty = Number(h.quantity) || 0
+      // For FI, qty is face value at par 100. Use face value as a proxy for sizing.
+      const value = qty
+      totalFiValue += value
+      const m = fiMetrics.get(h.instrument_id)
+      if (m?.mod_duration !== null && m?.mod_duration !== undefined) {
+        weightedMD += m.mod_duration * value
+        mdCovered  += value
+      }
+      const y = instr ? numOrNull(instr.yield_pct) : null
+      if (y !== null) {
+        weightedYield += y * value
+        yldCovered    += value
+      }
+    }
+    return {
+      totalFiValue,
+      weightedMD:    mdCovered  > 0 ? weightedMD    / mdCovered  : null,
+      weightedYield: yldCovered > 0 ? weightedYield / yldCovered : null,
+      hasFI:         totalFiValue > 0,
+    }
+  }, [holdings, fiMetrics])
+
+  // v21j: Excel export
   function downloadExcel() {
     const totalNav = holdings.reduce((sum, h) => {
       const p = priceData[h.instrument_id]?.price ?? h.avg_cost ?? 1
@@ -173,6 +220,7 @@ export default function HoldingsPage() {
       'Quantity', 'Avg Cost (₦)', 'Prev Close (₦)', 'Current Price (₦)',
       'Day Chg %', 'Volume', 'Price Date',
       'Market Value (₦)', 'Unrealised P&L (₦)', 'Weight %',
+      'Yield (FI)', 'Mod Duration (FI)', 'Convexity (FI)',
     ]
 
     const rows = holdings.map(h => {
@@ -181,6 +229,8 @@ export default function HoldingsPage() {
       const v = Number(h.quantity) * p
       const pnl = Number(h.quantity) * (p - Number(h.avg_cost))
       const wt = totalNav > 0 ? v / totalNav * 100 : 0
+      const m  = fiMetrics.get(h.instrument_id)
+      const y  = h.instrument && h.sleeve_id === 'fi' ? numOrNull(h.instrument.yield_pct) : null
       return [
         h.instrument?.name ?? h.instrument_id,
         h.instrument_id,
@@ -198,6 +248,9 @@ export default function HoldingsPage() {
         v,
         pnl,
         Number(wt.toFixed(2)),
+        y !== null ? Number(y.toFixed(2)) : '',
+        m?.mod_duration  !== null && m?.mod_duration  !== undefined ? Number(m.mod_duration.toFixed(2)) : '',
+        m?.convexity     !== null && m?.convexity     !== undefined ? Number(m.convexity.toFixed(2))    : '',
       ]
     })
 
@@ -208,6 +261,7 @@ export default function HoldingsPage() {
       { wch: 14 }, { wch: 14 }, { wch: 14 }, { wch: 14 },
       { wch: 10 }, { wch: 12 }, { wch: 12 },
       { wch: 18 }, { wch: 18 }, { wch: 10 },
+      { wch: 12 }, { wch: 14 }, { wch: 12 },
     ]
     XLSX.utils.book_append_sheet(wb, ws, 'Holdings')
 
@@ -304,7 +358,6 @@ export default function HoldingsPage() {
           <button className="btn-h" onClick={copyText}>
             {copied ? <><Check size={12} /> Copied</> : <><Copy size={12} /> Copy</>}
           </button>
-          {/* v21j: Excel export */}
           <button className="btn-h" onClick={downloadExcel}>
             <FileSpreadsheet size={12} /> Export Excel
           </button>
@@ -313,6 +366,49 @@ export default function HoldingsPage() {
           </button>
         </div>
       </div>
+
+      {/* v25: FI sleeve summary pill — only shows when portfolio holds FI */}
+      {fiSleeveStats.hasFI && (
+        <div
+          style={{
+            background: 'var(--gold-soft)',
+            border: '1px solid rgba(176, 139, 62, 0.3)',
+            borderRadius: 4,
+            padding: '10px 16px',
+            marginBottom: 14,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 24,
+            flexWrap: 'wrap',
+            fontSize: 12,
+          }}
+        >
+          <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.16em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>
+            FI sleeve
+          </div>
+          <div>
+            <span style={{ color: 'var(--text-3)', marginRight: 6 }}>Face value</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)', fontWeight: 500 }}>
+              {fmt.ngnM(fiSleeveStats.totalFiValue)}
+            </span>
+          </div>
+          <div>
+            <span style={{ color: 'var(--text-3)', marginRight: 6 }}>Weighted yield</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)', fontWeight: 500 }}>
+              {fiSleeveStats.weightedYield !== null ? fiSleeveStats.weightedYield.toFixed(2) + '%' : '—'}
+            </span>
+          </div>
+          <div>
+            <span style={{ color: 'var(--text-3)', marginRight: 6 }}>Weighted mod duration</span>
+            <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)', fontWeight: 500 }}>
+              {fiSleeveStats.weightedMD !== null ? fiSleeveStats.weightedMD.toFixed(2) + 'y' : '—'}
+            </span>
+          </div>
+          <div style={{ fontSize: 10, color: 'var(--text-3)', marginLeft: 'auto' }}>
+            For every 100bps yield rise, FI value falls ~{fiSleeveStats.weightedMD !== null ? fiSleeveStats.weightedMD.toFixed(1) : '—'}%
+          </div>
+        </div>
+      )}
 
       {/* Add position form */}
       {adding && (
@@ -380,7 +476,9 @@ export default function HoldingsPage() {
       {/* Grouped holdings */}
       {Object.entries(grouped)
         .sort(([a], [b]) => (SLEEVE_ORDER[a] ?? 99) - (SLEEVE_ORDER[b] ?? 99))
-        .map(([sleeveId, items]) => (
+        .map(([sleeveId, items]) => {
+          const isFI = sleeveId === 'fi'
+          return (
           <div key={sleeveId} className="panel" style={{ marginBottom: 14 }}>
             <div className="panel-header">
               <div className="panel-title">{SLEEVE_NAMES[sleeveId] ?? sleeveId}</div>
@@ -389,7 +487,7 @@ export default function HoldingsPage() {
               </div>
             </div>
             <div style={{ overflowX: 'auto' }}>
-              <table className="h-table" style={{ minWidth: 1200 }}>
+              <table className="h-table" style={{ minWidth: isFI ? 1340 : 1200 }}>
                 <thead>
                   <tr>
                     <th>Instrument</th>
@@ -400,6 +498,8 @@ export default function HoldingsPage() {
                     <th className="num">Prev close</th>
                     <th className="num">Current price</th>
                     <th className="num">Day chg %</th>
+                    {isFI && <th className="num" title="Modified duration: % price change per 100bps yield change">Mod dur</th>}
+                    {isFI && <th className="num" title="Convexity: 2nd-order curvature">Convexity</th>}
                     <th className="num">Volume</th>
                     <th>As of</th>
                     <th className="num">Market value</th>
@@ -432,6 +532,7 @@ export default function HoldingsPage() {
                     const dayChgVal = pr?.day_change
                     const prevClose = pr?.prev_close
                     const volume = pr?.volume
+                    const fiM = fiMetrics.get(h.instrument_id)
 
                     return (
                       <tr key={h.instrument_id}>
@@ -504,6 +605,20 @@ export default function HoldingsPage() {
                             ? '—'
                             : <>{dayChgVal > 0 ? '+' : ''}{dayChgVal.toFixed(2)}%</>}
                         </td>
+                        {isFI && (
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: fiM?.mod_duration !== null && fiM?.mod_duration !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
+                            {fiM?.mod_duration !== null && fiM?.mod_duration !== undefined
+                              ? `${fiM.mod_duration.toFixed(2)}y`
+                              : '—'}
+                          </td>
+                        )}
+                        {isFI && (
+                          <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: fiM?.convexity !== null && fiM?.convexity !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}>
+                            {fiM?.convexity !== null && fiM?.convexity !== undefined
+                              ? fiM.convexity.toFixed(1)
+                              : '—'}
+                          </td>
+                        )}
                         <td
                           className="num"
                           style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: volume !== null && volume !== undefined ? 'var(--text-2)' : 'var(--text-4)' }}
@@ -551,7 +666,16 @@ export default function HoldingsPage() {
               </table>
             </div>
           </div>
-        ))}
+          )
+        })}
+
+      {/* v25: yield curve panel — only renders if portfolio holds FI */}
+      {fiSleeveStats.hasFI && (
+        <YieldCurvePanel
+          lockedPortfolioId={portfolioId}
+          lockedPortfolioName={`${portfolio?.client?.name ?? ''} ${portfolio?.name ?? ''}`.trim()}
+        />
+      )}
     </main>
   )
 }

@@ -3,35 +3,34 @@ import { createClient } from '@supabase/supabase-js'
 
 // v24:  POST /api/admin/import-bond-yields/accept
 // v24b: Within-batch dedupe before UPSERT.
+// v25:  Now persists volume / deals / value_ngn alongside the yield row.
+//       These three columns drive the VWC (Volume-Weighted Confidence) tag
+//       — `traded` if the most recent row has volume > 0, `quoted` otherwise.
 //
-// The Postgres ON CONFLICT clause can only resolve ONE conflict per row in
-// a single INSERT statement. If the proposals array contains two rows with
-// the same (instrument_id, yield_as_of), Postgres rejects the whole INSERT
-// with: "ON CONFLICT DO UPDATE command cannot affect row a second time".
-//
-// In practice this happens whenever two uploaded brokerage files share a
-// Market Day (e.g. a re-pulled file, a renamed copy, or two file numbers
-// coincidentally targeting the same EOM date). The server collapses the
-// proposals array by (instrument_id, yield_as_of) — last write wins —
-// and reports the dedupe count in the response.
+// Postgres ON CONFLICT cannot resolve within-statement key collisions, so we
+// dedupe by (instrument_id, yield_as_of) — last write wins — before submission.
 
 export const maxDuration = 60
 
 interface AcceptedProposal {
   instrument_id:  string
   yield_pct:      number
-  yield_as_of:    string   // ISO date 'YYYY-MM-DD'
+  yield_as_of:    string
   coupon_pct:     number | null
   maturity_date:  string | null
   clean_price:    number | null
   notes:          string
+  // v25: liquidity columns
+  volume:         number | null
+  deals:          number | null
+  value_ngn:      number | null
 }
 
 interface AcceptResponse {
   history_inserted: number
   current_updated:  number
   unique_dates:     number
-  deduped:          number  // v24b: count of within-batch collisions collapsed
+  deduped:          number
   errors:           Array<{ instrument_id: string; message: string }>
 }
 
@@ -39,6 +38,13 @@ const numOrNull = (v: any): number | null => {
   if (v === null || v === undefined) return null
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   return isFinite(n) ? n : null
+}
+
+// v25: deals can be integer or null; preserve 0 as a real signal (not null)
+const intOrNull = (v: any): number | null => {
+  const n = numOrNull(v)
+  if (n === null) return null
+  return Math.round(n)
 }
 
 export async function POST(req: NextRequest) {
@@ -60,7 +66,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'No proposals provided' }, { status: 400 })
   }
 
-  // Validate + coerce each proposal at the boundary
   const valid: AcceptedProposal[] = []
   const errors: Array<{ instrument_id: string; message: string }> = []
 
@@ -86,6 +91,9 @@ export async function POST(req: NextRequest) {
       maturity_date:  p.maturity_date ?? null,
       clean_price:    numOrNull(p.clean_price),
       notes:          p.notes ?? '',
+      volume:         numOrNull(p.volume),
+      deals:          intOrNull(p.deals),
+      value_ngn:      numOrNull(p.value_ngn),
     })
   }
 
@@ -94,13 +102,6 @@ export async function POST(req: NextRequest) {
   }
 
   // ── v24b: dedupe within-batch by (instrument_id, yield_as_of) ─────────
-  // When two files in the upload share a Market Day, the same instrument
-  // appears twice with the same yield_as_of. Postgres can't UPSERT both in
-  // one statement, so collapse to a single row per key — last-write-wins.
-  // Order in the array is preserved by the original parse (file iteration
-  // order); the LAST occurrence wins, which means the file the user picked
-  // most recently in their picker takes precedence. In practice the YTM
-  // values for the same (instrument, date) should be identical anyway.
   const dedupeMap = new Map<string, AcceptedProposal>()
   for (const p of valid) {
     const key = `${p.instrument_id}|${p.yield_as_of}`
@@ -111,7 +112,7 @@ export async function POST(req: NextRequest) {
 
   const db = createClient(supabaseUrl, supabaseKey)
 
-  // 1. Upsert into yield_history.
+  // 1. Upsert into yield_history with v25 columns.
   const historyRows = clean.map(p => ({
     instrument_id: p.instrument_id,
     yield_as_of:   p.yield_as_of,
@@ -121,6 +122,9 @@ export async function POST(req: NextRequest) {
     maturity_date: p.maturity_date,
     price_clean:   p.clean_price,
     notes:         p.notes,
+    volume:        p.volume,
+    deals:         p.deals,
+    value_ngn:     p.value_ngn,
   }))
 
   const { error: histErr, count: histCount } = await db
@@ -131,14 +135,12 @@ export async function POST(req: NextRequest) {
     const isMissing = /relation .* does not exist|table .* does not exist/i.test(histErr.message)
     return NextResponse.json({
       error: isMissing
-        ? 'yield_history table does not exist. Run 001-create-yield-history.sql in Supabase SQL editor first.'
+        ? 'yield_history table does not exist. Run schema migrations in Supabase SQL editor first.'
         : `yield_history upsert failed: ${histErr.message}`,
     }, { status: 500 })
   }
 
-  // 2. Conditional update of instruments.yield_* to the most-recent yield
-  //    per instrument from this batch (only if newer than current value).
-
+  // 2. Conditional update of instruments.yield_* to most-recent yield per instrument.
   const latestByInstrument = new Map<string, AcceptedProposal>()
   for (const p of clean) {
     const existing = latestByInstrument.get(p.instrument_id)

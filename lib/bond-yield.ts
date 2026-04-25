@@ -1,5 +1,9 @@
 // lib/bond-yield.ts
-// v22: Bond yield-to-maturity computation.
+// v22:  Bond yield-to-maturity computation.
+// v25:  Modified duration and convexity added to YieldResult; new
+//       computeDurationConvexity helper for instruments where the yield is
+//       already known (so we don't re-solve when displaying duration on
+//       the FI table or curve tooltip).
 //
 // Given a clean price, coupon rate, maturity date, and settlement date, solve
 // for the YTM that makes the present value of future cash flows equal to the
@@ -26,6 +30,8 @@ export interface YieldResult {
   flag: YieldFlag | null   // non-null if the result looks suspicious
   periods: number          // periods to maturity used in the calc
   days_to_maturity: number
+  mod_duration: number     // v25 — modified duration in years (sensitivity)
+  convexity: number        // v25 — convexity in years² (curvature)
 }
 
 export type YieldFlag =
@@ -36,8 +42,7 @@ export type YieldFlag =
   | 'solver-failed'        // numerical solver could not converge
 
 /**
- * Brent's method root-finder. Local implementation so we don't depend on
- * mathjs or any external numerics for this one use case.
+ * Brent's method root-finder.
  */
 function brentq(
   f: (x: number) => number,
@@ -49,7 +54,7 @@ function brentq(
   let fa = f(a)
   let fb = f(b)
   if (!isFinite(fa) || !isFinite(fb)) return null
-  if (fa * fb > 0) return null  // no sign change in interval
+  if (fa * fb > 0) return null
 
   if (Math.abs(fa) < Math.abs(fb)) {
     [a, b] = [b, a]
@@ -67,12 +72,10 @@ function brentq(
     if (Math.abs(b - a) < tol) return b
 
     if (fa !== fc && fb !== fc) {
-      // Inverse quadratic interpolation
       s = (a * fb * fc) / ((fa - fb) * (fa - fc)) +
           (b * fa * fc) / ((fb - fa) * (fb - fc)) +
           (c * fa * fb) / ((fc - fa) * (fc - fb))
     } else {
-      // Secant
       s = b - fb * (b - a) / (fb - fa)
     }
 
@@ -108,12 +111,9 @@ function brentq(
     }
   }
 
-  return b  // best guess after maxIter
+  return b
 }
 
-/**
- * Parse an ISO date string (YYYY-MM-DD) to a UTC Date at midnight.
- */
 function parseDate(iso: string): Date {
   const d = new Date(iso + 'T00:00:00Z')
   if (isNaN(d.getTime())) throw new Error(`Invalid date: ${iso}`)
@@ -121,14 +121,72 @@ function parseDate(iso: string): Date {
 }
 
 /**
- * Compute YTM. Returns null if inputs are invalid.
- * All inputs as percent values and ISO dates to minimize caller-side mistakes.
+ * v25: Compute modified duration and convexity from an already-known yield.
+ * Called by the FI table and curve panel where we don't need to re-solve YTM.
  *
- * @param cleanPrice - quoted price per ₦100 face (e.g. 109.82)
- * @param couponPct  - annual coupon rate as percent (e.g. 18.5 for 18.5%). 0 for zero-coupon.
- * @param maturityDateIso - YYYY-MM-DD
- * @param settlementDateIso - YYYY-MM-DD (typically the price date)
- * @param freq - coupon frequency per year (default 2 = semi-annual, standard for FGN)
+ * Modified duration: percentage price change per 100bps yield change.
+ *   ModDuration = -1/Price * dPrice/dy = MacaulayDuration / (1 + y/freq)
+ *
+ * Convexity: second-order curvature.
+ *   Convexity = (1/Price) * d²Price/dy²
+ *
+ * Returns null if inputs are invalid or bond is matured.
+ */
+export function computeDurationConvexity(
+  ytmPct: number,
+  couponPct: number,
+  maturityDateIso: string,
+  settlementDateIso: string,
+  freq = 2,
+): { mod_duration: number; convexity: number } | null {
+  if (!isFinite(ytmPct) || ytmPct <= -90) return null
+  if (!isFinite(couponPct) || couponPct < 0) return null
+
+  let mat: Date, set: Date
+  try {
+    mat = parseDate(maturityDateIso)
+    set = parseDate(settlementDateIso)
+  } catch {
+    return null
+  }
+
+  const daysToMaturity = Math.round((mat.getTime() - set.getTime()) / 86_400_000)
+  if (daysToMaturity <= 0) return null
+
+  const face = 100
+  const years = daysToMaturity / 365.25
+  const nPeriods = Math.max(1, Math.round(years * freq))
+  const periodicCoupon = (couponPct / 100 * face) / freq
+
+  const y = ytmPct / 100
+  const r = y / freq
+  if (r <= -1) return null
+
+  let pvSum = 0
+  let weightedT = 0   // Σ t · PV(CF_t), where t is in years
+  let convexSum = 0   // Σ k(k+1) · PV(CF_t) / (1+r)²
+
+  for (let k = 1; k <= nPeriods; k++) {
+    const t = k / freq
+    const cf = (k === nPeriods) ? periodicCoupon + face : periodicCoupon
+    const pvCF = cf / Math.pow(1 + r, k)
+    pvSum    += pvCF
+    weightedT += t * pvCF
+    convexSum += k * (k + 1) * pvCF / Math.pow(1 + r, 2)
+  }
+
+  if (pvSum <= 0) return null
+
+  const macaulay = weightedT / pvSum                       // years
+  const modDuration = macaulay / (1 + r)                   // years
+  const convexity = convexSum / (pvSum * freq * freq)      // years²
+
+  return { mod_duration: modDuration, convexity }
+}
+
+/**
+ * Compute YTM. Returns null if inputs are invalid.
+ * v25: now also returns mod_duration and convexity (computed from solved y).
  */
 export function computeBondYTM(
   cleanPrice: number,
@@ -150,7 +208,10 @@ export function computeBondYTM(
 
   const daysToMaturity = Math.round((mat.getTime() - set.getTime()) / 86_400_000)
   if (daysToMaturity <= 0) {
-    return { ytm_pct: 0, flag: 'matured', periods: 0, days_to_maturity: daysToMaturity }
+    return {
+      ytm_pct: 0, flag: 'matured', periods: 0, days_to_maturity: daysToMaturity,
+      mod_duration: 0, convexity: 0,
+    }
   }
 
   const face = 100
@@ -158,46 +219,67 @@ export function computeBondYTM(
   const nPeriods = Math.max(1, Math.round(years * freq))
   const periodicCoupon = (couponPct / 100 * face) / freq
 
-  // Zero-coupon edge case: if coupon == 0 and price >= face, no yield signal.
+  // Zero-coupon at par-or-above: no yield signal, no duration/convexity meaning.
   if (periodicCoupon === 0 && cleanPrice >= face) {
-    return { ytm_pct: 0, flag: 'par-at-or-above', periods: nPeriods, days_to_maturity: daysToMaturity }
+    return {
+      ytm_pct: 0, flag: 'par-at-or-above', periods: nPeriods, days_to_maturity: daysToMaturity,
+      mod_duration: 0, convexity: 0,
+    }
   }
 
-  // PV(y) = sum of coupons discounted + face at maturity
-  const pv = (y: number): number => {
-    if (y <= -0.9) return Infinity
-    const r = y / freq
+  const pv = (yi: number): number => {
+    if (yi <= -0.9) return Infinity
+    const ri = yi / freq
     let total = 0
     for (let k = 1; k <= nPeriods; k++) {
-      total += periodicCoupon / Math.pow(1 + r, k)
+      total += periodicCoupon / Math.pow(1 + ri, k)
     }
-    total += face / Math.pow(1 + r, nPeriods)
+    total += face / Math.pow(1 + ri, nPeriods)
     return total
   }
 
-  const f = (y: number) => pv(y) - cleanPrice
+  const f = (yi: number) => pv(yi) - cleanPrice
 
-  const y = brentq(f, -0.5, 2.0)
-  if (y === null) {
-    return { ytm_pct: NaN, flag: 'solver-failed', periods: nPeriods, days_to_maturity: daysToMaturity }
+  const ySolved = brentq(f, -0.5, 2.0)
+  if (ySolved === null) {
+    return {
+      ytm_pct: NaN, flag: 'solver-failed', periods: nPeriods, days_to_maturity: daysToMaturity,
+      mod_duration: NaN, convexity: NaN,
+    }
   }
 
-  const ytmPct = y * 100
+  const ytmPct = ySolved * 100
   let flag: YieldFlag | null = null
   if (ytmPct > 50) flag = 'extreme-high'
   else if (ytmPct < 5) flag = 'extreme-low'
+
+  // Compute duration / convexity from the solved yield, reusing the cashflow grid.
+  const r = ySolved / freq
+  let pvSum = 0
+  let weightedT = 0
+  let convexSum = 0
+  for (let k = 1; k <= nPeriods; k++) {
+    const t = k / freq
+    const cf = (k === nPeriods) ? periodicCoupon + face : periodicCoupon
+    const pvCF = cf / Math.pow(1 + r, k)
+    pvSum     += pvCF
+    weightedT += t * pvCF
+    convexSum += k * (k + 1) * pvCF / Math.pow(1 + r, 2)
+  }
+  const macaulay    = pvSum > 0 ? weightedT / pvSum                 : 0
+  const modDuration = pvSum > 0 ? macaulay / (1 + r)                : 0
+  const convexity   = pvSum > 0 ? convexSum / (pvSum * freq * freq) : 0
 
   return {
     ytm_pct: ytmPct,
     flag,
     periods: nPeriods,
     days_to_maturity: daysToMaturity,
+    mod_duration: modDuration,
+    convexity,
   }
 }
 
-/**
- * Human-readable explanation of a flag. Used in the UI.
- */
 export function explainFlag(flag: YieldFlag): string {
   switch (flag) {
     case 'matured':         return 'Bond has matured — no yield to compute'

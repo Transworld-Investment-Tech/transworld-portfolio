@@ -3,19 +3,15 @@ import { createClient } from '@supabase/supabase-js'
 import * as XLSX from 'xlsx'
 import { computeBondYTM, explainFlag, type YieldFlag } from '@/lib/bond-yield'
 
-// v22: POST /api/admin/import-bond-yields
-// v24: now accepts MULTIPLE files via `files[]` (FormData), returns per-file
-//      results. The actual DB write moves to /accept (sibling route) so the
-//      bulk flow can write to yield_history with service-role permissions.
+// v22:  POST /api/admin/import-bond-yields
+// v24:  Multi-file via files[]; returns per-file results.
+// v25:  Captures Volume / Deals / Value from the brokerage xlsx alongside the
+//       Close price. Threaded through ProposalRow into the /accept payload
+//       so they can be persisted to yield_history. Drives the VWC tag.
 //
-// Backward-compatible API change:
-//   - Reads `files[]` first (preferred). Falls back to single `file` field
-//     for any caller that hasn't migrated.
-//   - Always returns the new shape `{ files: [...] }`.
-//
-// Each file gets its own settlement_date (parsed from Column A row 1+) and
-// its own results array. Errors are per-file — one bad file doesn't fail the
-// whole batch.
+// Defensive column-name detection: NGX brokerage files have used several
+// column header conventions for these fields. We try a list of candidates
+// and pick the first that resolves to a non-null value for that row.
 
 export const maxDuration = 120
 
@@ -50,6 +46,10 @@ interface ProposalRow {
   as_of:             string
   confidence:        'high' | 'medium' | 'low'
   notes:             string
+  // v25: liquidity capture
+  volume:            number | null
+  deals:             number | null
+  value_ngn:         number | null
 }
 
 interface FileResult {
@@ -66,20 +66,13 @@ interface FileResult {
 
 function parseExcelDate(v: any): string | null {
   if (v === null || v === undefined || v === '') return null
-
-  if (v instanceof Date) {
-    return v.toISOString().slice(0, 10)
-  }
-
-  // Excel serial number
+  if (v instanceof Date) return v.toISOString().slice(0, 10)
   if (typeof v === 'number' && v > 10000 && v < 100000) {
     const epoch = new Date(Date.UTC(1899, 11, 30))
     const d = new Date(epoch.getTime() + v * 86_400_000)
     return d.toISOString().slice(0, 10)
   }
-
   const s = String(v).trim()
-  // DD-MMM-YYYY (e.g. "31-Mar-2026") — the brokerage file format
   const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})$/)
   if (m) {
     const months: Record<string, string> = {
@@ -89,10 +82,8 @@ function parseExcelDate(v: any): string | null {
     const mm = months[m[2].toLowerCase()]
     if (mm) return `${m[3]}-${mm}-${m[1].padStart(2, '0')}`
   }
-
   const d = new Date(s)
   if (!isNaN(d.getTime())) return d.toISOString().slice(0, 10)
-
   return null
 }
 
@@ -102,11 +93,45 @@ function parseClose(v: any): number | null {
   return isFinite(n) && n > 0 ? n : null
 }
 
+// v25: parse a numeric cell (volume / deals / value) — non-positive returns null,
+// since "0 volume" and "no volume reported" are different signals; the brokerage
+// file uses 0 to mean "no trades", which we want to preserve as 0 (not null).
+function parseNonNegNum(v: any): number | null {
+  if (v === null || v === undefined || v === '') return null
+  const n = typeof v === 'number' ? v : parseFloat(String(v).replace(/,/g, ''))
+  if (!isFinite(n) || n < 0) return null
+  return n
+}
+
 // Coerce numeric DB columns (which Supabase returns as strings) to numbers.
 const numOrNull = (v: any): number | null => {
   if (v === null || v === undefined) return null
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   return isFinite(n) ? n : null
+}
+
+// v25: Defensive column-name detection.
+// NGX brokerage files have used multiple header conventions for these fields.
+// We resolve once per file (header keys are constant within a file).
+const VOLUME_CANDIDATES = ['Volume', 'Vol', 'Volume Traded', 'Total Volume', 'Quantity', 'Qty']
+const DEALS_CANDIDATES  = ['Deals', 'No. of Deals', 'Trades', 'No. of Trades', 'Number of Deals', 'Total Trades', 'Trade Count']
+const VALUE_CANDIDATES  = ['Value', 'Total Value', 'Value Traded', 'Turnover', 'Value (₦)', 'Value (NGN)', 'Total Value Traded']
+
+function resolveColumnName(headerKeys: string[], candidates: string[]): string | null {
+  // Exact match first
+  const lower = headerKeys.map(k => k.toLowerCase().trim())
+  for (const cand of candidates) {
+    const i = lower.indexOf(cand.toLowerCase().trim())
+    if (i >= 0) return headerKeys[i]
+  }
+  // Fuzzy: contains
+  for (const cand of candidates) {
+    const cl = cand.toLowerCase().trim()
+    for (let i = 0; i < lower.length; i++) {
+      if (lower[i].includes(cl)) return headerKeys[i]
+    }
+  }
+  return null
 }
 
 async function processOneFile(
@@ -125,14 +150,8 @@ async function processOneFile(
     error:                null,
   }
 
-  if (file.size === 0) {
-    result.error = 'File is empty'
-    return result
-  }
-  if (file.size > 20 * 1024 * 1024) {
-    result.error = 'File exceeds 20 MB'
-    return result
-  }
+  if (file.size === 0)              { result.error = 'File is empty'; return result }
+  if (file.size > 20 * 1024 * 1024) { result.error = 'File exceeds 20 MB'; return result }
 
   let rows: XlsxRow[]
   try {
@@ -144,7 +163,7 @@ async function processOneFile(
       return result
     }
     rows = XLSX.utils.sheet_to_json<XlsxRow>(sheet, {
-      range: 1,        // skip row 0 (the title)
+      range: 1,
       defval: null,
       raw: true,
     })
@@ -159,7 +178,7 @@ async function processOneFile(
     return result
   }
 
-  // Settlement date from first row's Market Day
+  // Settlement date
   const firstDate = parseExcelDate(rows[0]['Market Day'])
   if (!firstDate) {
     result.error = `Could not parse Market Day from first row. Got: ${JSON.stringify(rows[0]['Market Day'])}`
@@ -167,7 +186,7 @@ async function processOneFile(
   }
   result.settlement_date = firstDate
 
-  // Sanity: verify all rows agree on the date (within a single file)
+  // All rows must agree on date
   const dateMismatches = rows.filter((r, idx) => {
     if (idx === 0) return false
     const d = parseExcelDate(r['Market Day'])
@@ -178,28 +197,40 @@ async function processOneFile(
     return result
   }
 
-  // Build ticker → close-price map
-  const priceByTicker = new Map<string, number>()
+  // v25: resolve volume / deals / value column names once per file
+  const headerKeys = Object.keys(rows[0])
+  const volCol   = resolveColumnName(headerKeys, VOLUME_CANDIDATES)
+  const dealsCol = resolveColumnName(headerKeys, DEALS_CANDIDATES)
+  const valCol   = resolveColumnName(headerKeys, VALUE_CANDIDATES)
+
+  // Build ticker → { close, volume, deals, value } map
+  interface RowSnapshot { close: number; volume: number | null; deals: number | null; value: number | null }
+  const snapshotByTicker = new Map<string, RowSnapshot>()
+
   for (const row of rows) {
     const ticker = typeof row['Security Code'] === 'string' ? row['Security Code'].trim() : null
     if (!ticker) continue
     const price = parseClose(row['Close'])
     if (price === null) continue
-    priceByTicker.set(ticker, price)
+    snapshotByTicker.set(ticker, {
+      close:  price,
+      volume: volCol   ? parseNonNegNum(row[volCol])   : null,
+      deals:  dealsCol ? parseNonNegNum(row[dealsCol]) : null,
+      value:  valCol   ? parseNonNegNum(row[valCol])   : null,
+    })
   }
 
-  if (priceByTicker.size === 0) {
+  if (snapshotByTicker.size === 0) {
     result.error = 'No valid Security Code / Close pairs found'
     return result
   }
 
-  // Match against FI instruments and compute YTM
   const proposals: ProposalRow[] = []
   const unmatched: string[] = []
 
   for (const raw of instruments) {
-    const price = priceByTicker.get(raw.instrument_id)
-    if (price === undefined) {
+    const snap = snapshotByTicker.get(raw.instrument_id)
+    if (!snap) {
       unmatched.push(raw.instrument_id)
       continue
     }
@@ -209,67 +240,55 @@ async function processOneFile(
 
     if (!raw.maturity_date) {
       proposals.push({
-        instrument_id:     raw.instrument_id,
-        name:              raw.name,
-        coupon_pct:        couponNum,
-        maturity_date:     null,
-        clean_price:       price,
-        settlement_date:   firstDate,
-        ytm_pct:           NaN,
-        flag:              'solver-failed',
-        flag_explanation:  'No maturity date in DB — cannot compute YTM',
-        current_yield:     currentYield,
-        source:            `Brokerage file ${firstDate}`,
-        as_of:             firstDate,
-        confidence:        'low',
-        notes:             `Price \u20a6${price.toFixed(2)}; no maturity for YTM`,
+        instrument_id: raw.instrument_id, name: raw.name,
+        coupon_pct: couponNum, maturity_date: null,
+        clean_price: snap.close, settlement_date: firstDate,
+        ytm_pct: NaN, flag: 'solver-failed',
+        flag_explanation: 'No maturity date in DB — cannot compute YTM',
+        current_yield: currentYield,
+        source: `Brokerage file ${firstDate}`, as_of: firstDate,
+        confidence: 'low',
+        notes: `Price \u20a6${snap.close.toFixed(2)}; no maturity for YTM`,
+        volume: snap.volume, deals: snap.deals, value_ngn: snap.value,
       })
       continue
     }
 
     const couponPct = couponNum ?? 0
     const freq      = couponFreqNum !== null && couponFreqNum > 0 ? couponFreqNum : 2
-    const r = computeBondYTM(price, couponPct, raw.maturity_date, firstDate, freq)
+    const r = computeBondYTM(snap.close, couponPct, raw.maturity_date, firstDate, freq)
 
     if (!r) {
       proposals.push({
-        instrument_id:     raw.instrument_id,
-        name:              raw.name,
-        coupon_pct:        couponNum,
-        maturity_date:     raw.maturity_date,
-        clean_price:       price,
-        settlement_date:   firstDate,
-        ytm_pct:           NaN,
-        flag:              'solver-failed',
-        flag_explanation:  'Could not compute YTM from inputs',
-        current_yield:     currentYield,
-        source:            `Brokerage file ${firstDate}`,
-        as_of:             firstDate,
-        confidence:        'low',
-        notes:             `Price \u20a6${price.toFixed(2)}, coupon ${couponPct}%, matures ${raw.maturity_date}`,
+        instrument_id: raw.instrument_id, name: raw.name,
+        coupon_pct: couponNum, maturity_date: raw.maturity_date,
+        clean_price: snap.close, settlement_date: firstDate,
+        ytm_pct: NaN, flag: 'solver-failed',
+        flag_explanation: 'Could not compute YTM from inputs',
+        current_yield: currentYield,
+        source: `Brokerage file ${firstDate}`, as_of: firstDate,
+        confidence: 'low',
+        notes: `Price \u20a6${snap.close.toFixed(2)}, coupon ${couponPct}%, matures ${raw.maturity_date}`,
+        volume: snap.volume, deals: snap.deals, value_ngn: snap.value,
       })
       continue
     }
 
     let confidence: 'high' | 'medium' | 'low' = 'high'
     if (r.flag) confidence = 'low'
-    else if (Math.abs(r.ytm_pct - couponPct) < 0.01 && price === 100) confidence = 'medium'
+    else if (Math.abs(r.ytm_pct - couponPct) < 0.01 && snap.close === 100) confidence = 'medium'
 
     proposals.push({
-      instrument_id:     raw.instrument_id,
-      name:              raw.name,
-      coupon_pct:        couponNum,
-      maturity_date:     raw.maturity_date,
-      clean_price:       price,
-      settlement_date:   firstDate,
-      ytm_pct:           r.ytm_pct,
-      flag:              r.flag,
-      flag_explanation:  r.flag ? explainFlag(r.flag) : null,
-      current_yield:     currentYield,
-      source:            `Brokerage file ${firstDate}`,
-      as_of:             firstDate,
+      instrument_id: raw.instrument_id, name: raw.name,
+      coupon_pct: couponNum, maturity_date: raw.maturity_date,
+      clean_price: snap.close, settlement_date: firstDate,
+      ytm_pct: r.ytm_pct, flag: r.flag,
+      flag_explanation: r.flag ? explainFlag(r.flag) : null,
+      current_yield: currentYield,
+      source: `Brokerage file ${firstDate}`, as_of: firstDate,
       confidence,
-      notes:             `Clean price \u20a6${price.toFixed(2)}, ${couponPct.toFixed(2)}% coupon, matures ${raw.maturity_date}`,
+      notes: `Clean price \u20a6${snap.close.toFixed(2)}, ${couponPct.toFixed(2)}% coupon, matures ${raw.maturity_date}`,
+      volume: snap.volume, deals: snap.deals, value_ngn: snap.value,
     })
   }
 
@@ -299,7 +318,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'Expected multipart/form-data' }, { status: 400 })
   }
 
-  // Prefer plural `files[]`; fall back to singular `file` for any pre-v24 caller.
   let files = formData.getAll('files').filter((v): v is File => v instanceof File)
   if (files.length === 0) {
     const single = formData.get('file')
@@ -310,13 +328,10 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'No file(s) provided. Use field name "files" (plural) or "file" (singular).' }, { status: 400 })
   }
 
-  // Cap on number of files per request to keep the function within timeout.
-  // 50 monthly files * ~1s each = ~50s. We allow up to 80.
   if (files.length > 80) {
     return NextResponse.json({ error: `Too many files in one request (${files.length}). Maximum is 80.` }, { status: 400 })
   }
 
-  // Fetch FI instruments once and reuse across all files
   const db = createClient(supabaseUrl, supabaseKey)
   const { data: instruments, error: iErr } = await db
     .from('instruments')
@@ -330,9 +345,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: 'No FI instruments in DB' }, { status: 400 })
   }
 
-  // Process each file in series. Each file is small (~250KB) and YTM solving
-  // is fast (~50ms total per file), so series is fine and avoids any memory
-  // pressure from holding 50 xlsx ArrayBuffers concurrently.
   const fileResults: FileResult[] = []
   for (const f of files) {
     const r = await processOneFile(f, instruments as any as BondInstrument[])
