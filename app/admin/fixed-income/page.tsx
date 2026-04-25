@@ -5,6 +5,7 @@ import { supabase } from '@/lib/supabase'
 import {
   ArrowLeft, Edit2, Search, X, Save, Info, Sparkles,
   AlertCircle, CheckCircle2, Upload, FileSpreadsheet, AlertTriangle,
+  History,
 } from 'lucide-react'
 
 // v21z: Fixed Income admin page.
@@ -16,6 +17,10 @@ import {
 //                equity NAV reconstruction. 70/70 FI tickers match. YTM is
 //                computed from clean price + coupon + maturity server-side,
 //                with extreme yields flagged for review.
+// v24:           Bulk historical upload — accepts N files, parses each,
+//                shows per-file summary, accepts all valid proposals into
+//                yield_history (with conditional update of instruments.yield_*).
+//                Existing single-file flow preserved with same UX.
 
 const YIELD_STALE_DAYS = 14
 
@@ -57,6 +62,20 @@ interface ProposalRow {
 
 interface ReviewRow extends ProposalRow {
   accepted: boolean
+}
+
+// v24: server returns { files: FileResult[] }. The legacy single-file flow
+// extracts files[0] and renders it the same way as before.
+interface FileResult {
+  filename:             string
+  settlement_date:      string | null
+  rows_in_file:         number
+  fi_instruments_in_db: number
+  matched:              number
+  unmatched_count:      number
+  unmatched_ids:        string[]
+  results:              ProposalRow[]
+  error:                string | null
 }
 
 interface ImportResponse {
@@ -109,9 +128,7 @@ function formatDate(iso: string | null): string {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: '2-digit' })
 }
 
-// Bulletproof numeric formatter. Handles anything the DB or API might throw at
-// us — null, undefined, strings, NaN, numbers. Always returns a safe string
-// so no .toFixed() call can ever crash the render.
+// Bulletproof numeric formatter (pitfall #73).
 function fmtPct(v: unknown, dp = 2, suffix = '%'): string {
   if (v === null || v === undefined) return '—'
   const n = typeof v === 'number' ? v : parseFloat(String(v))
@@ -119,19 +136,23 @@ function fmtPct(v: unknown, dp = 2, suffix = '%'): string {
   return `${n.toFixed(dp)}${suffix}`
 }
 
-// Same for naira amounts.
 function fmtNaira(v: unknown, dp = 2): string {
   if (v === null || v === undefined) return '—'
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   if (!isFinite(n)) return '—'
-  return `₦${n.toFixed(dp)}`
+  return `\u20a6${n.toFixed(dp)}`
 }
 
-// Truthiness-safe coercion for style toggles that want "is there a real number here".
 function hasNum(v: unknown): boolean {
   if (v === null || v === undefined) return false
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   return isFinite(n)
+}
+
+const numOrNull = (v: any): number | null => {
+  if (v === null || v === undefined) return null
+  const n = typeof v === 'number' ? v : parseFloat(String(v))
+  return isFinite(n) ? n : null
 }
 
 export default function FixedIncomePage() {
@@ -150,17 +171,29 @@ export default function FixedIncomePage() {
   const [editSaving, setEditSaving] = useState(false)
   const [editError, setEditError] = useState('')
 
-  // Upload modal
+  // Single-file upload modal (existing v22 flow)
   const [uploadOpen, setUploadOpen] = useState(false)
   const [uploadFile, setUploadFile] = useState<File | null>(null)
   const [uploadLoading, setUploadLoading] = useState(false)
   const [uploadError, setUploadError] = useState('')
 
-  // Review modal
+  // Single-file review modal
   const [proposals, setProposals] = useState<ReviewRow[] | null>(null)
   const [importMeta, setImportMeta] = useState<ImportResponse | null>(null)
   const [batchSaving, setBatchSaving] = useState(false)
   const [batchSaveMsg, setBatchSaveMsg] = useState('')
+
+  // v24: Bulk historical upload modal
+  const [bulkOpen, setBulkOpen] = useState(false)
+  const [bulkFiles, setBulkFiles] = useState<File[]>([])
+  const [bulkParsing, setBulkParsing] = useState(false)
+  const [bulkParseError, setBulkParseError] = useState('')
+
+  // v24: Bulk historical results modal
+  const [bulkResults, setBulkResults] = useState<FileResult[] | null>(null)
+  const [bulkSelections, setBulkSelections] = useState<Map<string, boolean>>(new Map())
+  const [bulkSaving, setBulkSaving] = useState(false)
+  const [bulkSaveError, setBulkSaveError] = useState('')
 
   useEffect(() => { load() }, [])
 
@@ -178,16 +211,9 @@ export default function FixedIncomePage() {
       return
     }
 
-    const toNum = (v: any): number | null => {
-      if (v === null || v === undefined) return null
-      const n = typeof v === 'number' ? v : parseFloat(String(v))
-      return isFinite(n) ? n : null
-    }
-
-    // Diagnostic: surface any weird data that got past coercion (paste to console)
     const weird = (data ?? []).filter((i: any) =>
-      (i.coupon_pct !== null && i.coupon_pct !== undefined && toNum(i.coupon_pct) === null) ||
-      (i.yield_pct !== null && i.yield_pct !== undefined && toNum(i.yield_pct) === null)
+      (i.coupon_pct !== null && i.coupon_pct !== undefined && numOrNull(i.coupon_pct) === null) ||
+      (i.yield_pct !== null && i.yield_pct !== undefined && numOrNull(i.yield_pct) === null)
     )
     if (weird.length > 0) {
       console.warn('[Fixed income] Rows with un-coerceable numeric fields:',
@@ -202,11 +228,11 @@ export default function FixedIncomePage() {
         type: i.type,
         sub_type: subType,
         rationale,
-        coupon_pct: toNum(i.coupon_pct),
-        coupon_freq: toNum(i.coupon_freq),
+        coupon_pct: numOrNull(i.coupon_pct),
+        coupon_freq: numOrNull(i.coupon_freq),
         maturity_date: i.maturity_date ?? null,
         approved: !!i.approved,
-        yield_pct: toNum(i.yield_pct),
+        yield_pct: numOrNull(i.yield_pct),
         yield_source: i.yield_source ?? null,
         yield_as_of: i.yield_as_of ?? null,
         yield_last_refreshed_at: i.yield_last_refreshed_at ?? null,
@@ -293,7 +319,7 @@ export default function FixedIncomePage() {
     }
   }
 
-  // ─── Upload flow ───
+  // ─── Single-file upload flow (v22, preserved) ───
 
   function openUpload() {
     setUploadOpen(true)
@@ -320,38 +346,50 @@ export default function FixedIncomePage() {
     setUploadError('')
     try {
       const fd = new FormData()
-      fd.append('file', uploadFile)
+      // v24: API now prefers `files[]` (plural). Server falls back to `file`
+      // for backward compat, but we send the new field name.
+      fd.append('files', uploadFile)
       const res = await fetch('/api/admin/import-bond-yields', { method: 'POST', body: fd })
-      const body = await res.json()
+      const body = await res.json() as { files?: FileResult[]; error?: string }
       if (!res.ok) {
         setUploadError(body?.error || `HTTP ${res.status}`)
         return
       }
-      const imp = body as ImportResponse
-      if (imp.results.length === 0) {
+      const fileResult = body.files?.[0]
+      if (!fileResult) {
+        setUploadError('No result for the uploaded file')
+        return
+      }
+      if (fileResult.error) {
+        setUploadError(fileResult.error)
+        return
+      }
+      if (fileResult.results.length === 0) {
         setUploadError('No matches. File parsed but no FI tickers matched. Check the file is the brokerage PrintDownload format.')
         return
       }
-      // Defensive: coerce numeric fields to actual numbers in case the API ever
-      // sends them through as strings (Supabase numerics arrive as strings by
-      // default, and we want the page to be resilient to that drift).
-      const numOrNull = (v: any): number | null => {
-        if (v === null || v === undefined) return null
-        const n = typeof v === 'number' ? v : parseFloat(String(v))
-        return isFinite(n) ? n : null
-      }
-      // Default: auto-accept all rows that are flag-free and not NaN
-      const review: ReviewRow[] = imp.results.map(p => {
+
+      // Coerce numerics (defensive — pitfalls #72/73)
+      const review: ReviewRow[] = fileResult.results.map(p => {
         const ytm = numOrNull(p.ytm_pct)
         return {
           ...p,
-          coupon_pct:   numOrNull(p.coupon_pct),
+          coupon_pct:    numOrNull(p.coupon_pct),
           current_yield: numOrNull(p.current_yield),
-          clean_price:  numOrNull(p.clean_price) ?? 0,
-          ytm_pct:      ytm ?? NaN,
-          accepted: !p.flag && ytm !== null,
+          clean_price:   numOrNull(p.clean_price) ?? 0,
+          ytm_pct:       ytm ?? NaN,
+          accepted:      !p.flag && ytm !== null,
         }
       })
+      const imp: ImportResponse = {
+        settlement_date:      fileResult.settlement_date!,
+        rows_in_file:         fileResult.rows_in_file,
+        fi_instruments_in_db: fileResult.fi_instruments_in_db,
+        matched:              fileResult.matched,
+        unmatched_count:      fileResult.unmatched_count,
+        unmatched_ids:        fileResult.unmatched_ids,
+        results:              fileResult.results,
+      }
       setProposals(review)
       setImportMeta(imp)
       setUploadOpen(false)
@@ -362,7 +400,7 @@ export default function FixedIncomePage() {
     }
   }
 
-  // ─── Review + batch save ───
+  // ─── Single-file review + accept ───
 
   function toggleAccept(idx: number) {
     setProposals(prev => {
@@ -377,6 +415,8 @@ export default function FixedIncomePage() {
     setProposals(prev => prev ? prev.map(p => ({ ...p, accepted: accept && !p.flag && isFinite(p.ytm_pct) })) : prev)
   }
 
+  // v24: now POSTs to /accept which writes yield_history + conditionally
+  // updates instruments.yield_*. Replaces the previous N-supabase-calls pattern.
   async function saveBatch() {
     if (!proposals) return
     const accepted = proposals.filter(p => p.accepted && isFinite(p.ytm_pct))
@@ -384,35 +424,200 @@ export default function FixedIncomePage() {
     setBatchSaving(true)
     setBatchSaveMsg('')
     try {
-      const nowIso = new Date().toISOString()
-      const results = await Promise.all(accepted.map(p => {
-        const ytm = typeof p.ytm_pct === 'number' ? p.ytm_pct : parseFloat(String(p.ytm_pct))
-        return (supabase.from('instruments') as any)
-          .update({
-            yield_pct: Number(ytm.toFixed(4)),
-            yield_as_of: p.as_of,
-            yield_source: 'brokerage',
-            yield_notes: p.notes,
-            yield_last_refreshed_at: nowIso,
-          })
-          .eq('instrument_id', p.instrument_id)
+      const payload = accepted.map(p => ({
+        instrument_id: p.instrument_id,
+        yield_pct:     p.ytm_pct,
+        yield_as_of:   p.as_of,
+        coupon_pct:    p.coupon_pct,
+        maturity_date: p.maturity_date,
+        clean_price:   p.clean_price,
+        notes:         p.notes,
       }))
-      const errors = results.filter((r: any) => r?.error)
-      if (errors.length > 0) {
-        setBatchSaveMsg(`✗ ${errors.length} save${errors.length === 1 ? '' : 's'} failed`)
-      } else {
-        setBatchSaveMsg(`✓ Saved ${accepted.length} yield${accepted.length === 1 ? '' : 's'}`)
-        setProposals(null)
-        setImportMeta(null)
-        await load()
+      const res = await fetch('/api/admin/import-bond-yields/accept', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ proposals: payload }),
+      })
+      const body = await res.json()
+      if (!res.ok) {
+        setBatchSaveMsg(`\u2717 ${body?.error || 'Accept failed'}`)
+        return
       }
+      setBatchSaveMsg(`\u2713 Saved ${body.history_inserted} to history, ${body.current_updated} updated to current`)
+      setProposals(null)
+      setImportMeta(null)
+      await load()
     } catch (e) {
-      setBatchSaveMsg(`✗ ${(e as Error).message}`)
+      setBatchSaveMsg(`\u2717 ${(e as Error).message}`)
     } finally {
       setBatchSaving(false)
       setTimeout(() => setBatchSaveMsg(''), 8000)
     }
   }
+
+  // ─── Bulk historical upload flow (v24) ───
+
+  function openBulk() {
+    setBulkOpen(true)
+    setBulkFiles([])
+    setBulkParseError('')
+  }
+
+  function onBulkFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const fs = Array.from(e.target.files ?? [])
+    setBulkFiles(fs)
+    setBulkParseError('')
+  }
+
+  async function submitBulk() {
+    if (bulkFiles.length === 0) {
+      setBulkParseError('Choose at least one file')
+      return
+    }
+    if (bulkFiles.length > 80) {
+      setBulkParseError(`Maximum 80 files per batch (got ${bulkFiles.length})`)
+      return
+    }
+    const oversized = bulkFiles.filter(f => f.size > 20 * 1024 * 1024)
+    if (oversized.length > 0) {
+      setBulkParseError(`${oversized.length} file(s) exceed 20 MB: ${oversized.map(f => f.name).join(', ')}`)
+      return
+    }
+    setBulkParsing(true)
+    setBulkParseError('')
+    try {
+      const fd = new FormData()
+      for (const f of bulkFiles) fd.append('files', f)
+      const res = await fetch('/api/admin/import-bond-yields', { method: 'POST', body: fd })
+      const body = await res.json() as { files?: FileResult[]; error?: string }
+      if (!res.ok) {
+        setBulkParseError(body?.error || `HTTP ${res.status}`)
+        return
+      }
+      const files = body.files ?? []
+      if (files.length === 0) {
+        setBulkParseError('No files parsed')
+        return
+      }
+      // Coerce numerics in every result row
+      const coerced: FileResult[] = files.map(f => ({
+        ...f,
+        results: (f.results ?? []).map(p => ({
+          ...p,
+          coupon_pct:    numOrNull(p.coupon_pct),
+          current_yield: numOrNull(p.current_yield),
+          clean_price:   numOrNull(p.clean_price) ?? 0,
+          ytm_pct:       numOrNull(p.ytm_pct) ?? NaN,
+        })),
+      }))
+      // Default selection: include any file that parsed AND has at least 1
+      // valid (no flag, finite YTM) proposal
+      const sels = new Map<string, boolean>()
+      for (const f of coerced) {
+        const hasValid = !f.error && f.results.some(p => !p.flag && isFinite(p.ytm_pct))
+        sels.set(f.filename, hasValid)
+      }
+      setBulkResults(coerced)
+      setBulkSelections(sels)
+      setBulkOpen(false)
+    } catch (e) {
+      setBulkParseError((e as Error).message)
+    } finally {
+      setBulkParsing(false)
+    }
+  }
+
+  function toggleBulkFile(filename: string) {
+    setBulkSelections(prev => {
+      const next = new Map(prev)
+      next.set(filename, !next.get(filename))
+      return next
+    })
+  }
+
+  function toggleAllBulk(include: boolean) {
+    setBulkSelections(prev => {
+      const next = new Map<string, boolean>()
+      for (const f of bulkResults ?? []) {
+        const eligible = !f.error && f.results.some(p => !p.flag && isFinite(p.ytm_pct))
+        next.set(f.filename, include && eligible)
+      }
+      return next
+    })
+  }
+
+  async function saveBulk() {
+    if (!bulkResults) return
+    const includedFiles = bulkResults.filter(f => bulkSelections.get(f.filename))
+    const proposals: any[] = []
+    for (const f of includedFiles) {
+      for (const p of f.results) {
+        if (!p.flag && isFinite(p.ytm_pct)) {
+          proposals.push({
+            instrument_id: p.instrument_id,
+            yield_pct:     p.ytm_pct,
+            yield_as_of:   p.as_of,
+            coupon_pct:    p.coupon_pct,
+            maturity_date: p.maturity_date,
+            clean_price:   p.clean_price,
+            notes:         p.notes,
+          })
+        }
+      }
+    }
+    if (proposals.length === 0) {
+      setBulkSaveError('No valid proposals across the selected files')
+      return
+    }
+    setBulkSaving(true)
+    setBulkSaveError('')
+    try {
+      const res = await fetch('/api/admin/import-bond-yields/accept', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify({ proposals }),
+      })
+      const body = await res.json()
+      if (!res.ok) {
+        setBulkSaveError(body?.error || `HTTP ${res.status}`)
+        return
+      }
+      setBatchSaveMsg(`\u2713 Bulk: ${body.history_inserted} historical yields across ${body.unique_dates} dates · ${body.current_updated} updated to current`)
+      setBulkResults(null)
+      setBulkSelections(new Map())
+      await load()
+    } catch (e) {
+      setBulkSaveError((e as Error).message)
+    } finally {
+      setBulkSaving(false)
+      setTimeout(() => setBatchSaveMsg(''), 12000)
+    }
+  }
+
+  // Helpers for the bulk-results header summary
+  const bulkSummary = useMemo(() => {
+    if (!bulkResults) return null
+    const inc = bulkResults.filter(f => bulkSelections.get(f.filename))
+    let total = 0, valid = 0, flagged = 0
+    const dates = new Set<string>()
+    for (const f of inc) {
+      for (const p of f.results) {
+        total++
+        if (p.flag || !isFinite(p.ytm_pct)) flagged++
+        else valid++
+      }
+      if (f.settlement_date) dates.add(f.settlement_date)
+    }
+    const sortedDates = Array.from(dates).sort()
+    return {
+      includedFiles:  inc.length,
+      totalFiles:     bulkResults.length,
+      total, valid, flagged,
+      uniqueDates:    sortedDates.length,
+      minDate:        sortedDates[0] ?? null,
+      maxDate:        sortedDates[sortedDates.length - 1] ?? null,
+    }
+  }, [bulkResults, bulkSelections])
 
   return (
     <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
@@ -431,10 +636,18 @@ export default function FixedIncomePage() {
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
           {batchSaveMsg && (
-            <span style={{ fontSize: 11, color: batchSaveMsg.startsWith('✓') ? 'var(--pos)' : 'var(--neg)' }}>
+            <span style={{ fontSize: 11, color: batchSaveMsg.startsWith('\u2713') ? 'var(--pos)' : 'var(--neg)' }}>
               {batchSaveMsg}
             </span>
           )}
+          <button
+            className="btn-h"
+            onClick={openBulk}
+            title="Upload multiple historical brokerage files at once"
+          >
+            <History size={12} />
+            Bulk historical upload
+          </button>
           <button
             className="btn-h btn-h-primary"
             onClick={openUpload}
@@ -457,7 +670,7 @@ export default function FixedIncomePage() {
         ) : (
           <span style={{ color: 'var(--pos)' }}>All yields fresh</span>
         )}
-        . Upload a brokerage PrintDownload Price List — the same xlsx used for equity NAV reconstruction — to compute YTM across the FI universe in one step.
+        . Single file → review per row. Bulk historical → multi-file with per-file summary, populates yield_history for time-series analysis.
       </div>
 
       <div style={{ maxWidth: 1400 }}>
@@ -578,6 +791,8 @@ export default function FixedIncomePage() {
             Yields feed AI report generation and scenario analysis. YTM is computed from the brokerage clean price,
             coupon, and maturity using a standard semi-annual bond formula. Outlier yields ({'>'} 50% or {'<'} 5%)
             are flagged for review — usually a sign the clean price is stale. Manual Edit takes precedence.
+            All accepted yields write to <code style={{ fontSize: 10, padding: '1px 4px', background: 'var(--bg-soft)', borderRadius: 2 }}>yield_history</code>;
+            current values on this page reflect the most-recent date for each instrument.
           </span>
         </div>
       </div>
@@ -674,7 +889,7 @@ export default function FixedIncomePage() {
         </div>
       )}
 
-      {/* ─── Upload modal ─── */}
+      {/* ─── Single-file upload modal ─── */}
       {uploadOpen && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
@@ -755,7 +970,7 @@ export default function FixedIncomePage() {
         </div>
       )}
 
-      {/* ─── Proposals review modal ─── */}
+      {/* ─── Single-file proposals review modal ─── */}
       {proposals && importMeta && (
         <div
           style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
@@ -860,6 +1075,214 @@ export default function FixedIncomePage() {
                 {batchSaving ? 'Saving…' : `Accept ${proposals.filter(p => p.accepted).length} yield${proposals.filter(p => p.accepted).length === 1 ? '' : 's'}`}
               </button>
               <button onClick={() => setProposals(null)} disabled={batchSaving} className="btn-h">Cancel</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── v24: Bulk historical upload modal ─── */}
+      {bulkOpen && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
+          onClick={() => !bulkParsing && setBulkOpen(false)}
+        >
+          <div className="panel" style={{ maxWidth: 700, width: '100%', margin: 0 }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Historical onboarding</div>
+                <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
+                  Bulk historical upload
+                </div>
+              </div>
+              <button onClick={() => !bulkParsing && setBulkOpen(false)} disabled={bulkParsing} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: bulkParsing ? 'not-allowed' : 'pointer', padding: 4 }}>
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+              <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.6, background: 'var(--bg-soft)', padding: '12px 14px', borderRadius: 3, border: '1px solid var(--border-soft)' }}>
+                <strong style={{ color: 'var(--text)' }}>Upload N monthly EOM brokerage files at once.</strong> Each file's
+                as-of date is auto-detected from the Market Day column. Server computes YTM per row, returns a per-file summary
+                you can review before saving. All accepted yields are written to <code style={{ fontSize: 10 }}>yield_history</code>;
+                the most-recent date for each instrument also updates the current snapshot used by AI reports.
+                Maximum 80 files per batch. Re-uploading the same date is idempotent.
+              </div>
+
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Files
+                  <span style={{ color: 'var(--text-4)', marginLeft: 6, fontSize: 10 }}>— select multiple .xlsx files (Cmd/Ctrl-click)</span>
+                </label>
+                <div style={{
+                  border: '1px dashed var(--border-strong)',
+                  borderRadius: 4,
+                  padding: '18px 14px',
+                  background: 'var(--bg-soft)',
+                  textAlign: 'center' as const,
+                }}>
+                  <input
+                    type="file"
+                    multiple
+                    accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    onChange={onBulkFileChange}
+                    disabled={bulkParsing}
+                    style={{ display: 'block', margin: '0 auto', fontSize: 12 }}
+                  />
+                  {bulkFiles.length > 0 && (
+                    <div style={{ marginTop: 10, fontSize: 11, color: 'var(--text-2)', display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      <FileSpreadsheet size={12} />
+                      <span>{bulkFiles.length} file{bulkFiles.length === 1 ? '' : 's'} selected</span>
+                      <span style={{ color: 'var(--text-3)' }}>· {(bulkFiles.reduce((s, f) => s + f.size, 0) / 1024 / 1024).toFixed(1)} MB total</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {bulkParseError && (
+                <div className="alert-h alert-h-critical" style={{ fontSize: 11, display: 'flex', alignItems: 'flex-start', gap: 6 }}>
+                  <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                  <span>{bulkParseError}</span>
+                </div>
+              )}
+
+              <div style={{ display: 'flex', gap: 8, paddingTop: 4 }}>
+                <button
+                  onClick={submitBulk}
+                  disabled={bulkParsing || bulkFiles.length === 0}
+                  className="btn-h btn-h-primary"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                >
+                  <Sparkles size={12} style={bulkParsing ? { animation: 'spin 0.7s linear infinite' } : undefined} />
+                  {bulkParsing ? `Parsing ${bulkFiles.length} file${bulkFiles.length === 1 ? '' : 's'}…` : `Parse ${bulkFiles.length || ''} file${bulkFiles.length === 1 ? '' : 's'}`}
+                </button>
+                <button onClick={() => setBulkOpen(false)} disabled={bulkParsing} className="btn-h">Cancel</button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ─── v24: Bulk historical results modal ─── */}
+      {bulkResults && bulkSummary && (
+        <div
+          style={{ position: 'fixed', inset: 0, background: 'rgba(10,31,58,.55)', backdropFilter: 'blur(3px)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 24 }}
+          onClick={() => !bulkSaving && setBulkResults(null)}
+        >
+          <div className="panel" style={{ maxWidth: 1100, width: '100%', margin: 0, maxHeight: '88vh', display: 'flex', flexDirection: 'column' }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginBottom: 14 }}>
+              <div>
+                <div style={{ fontSize: 10, fontWeight: 600, letterSpacing: '0.18em', color: 'var(--gold)', textTransform: 'uppercase' as const }}>Bulk parsed</div>
+                <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, marginTop: 4, color: 'var(--text)' }}>
+                  {bulkResults.length} file{bulkResults.length === 1 ? '' : 's'} parsed
+                </div>
+                <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 4 }}>
+                  Selected: {bulkSummary.includedFiles} of {bulkSummary.totalFiles} files ·{' '}
+                  <span style={{ color: 'var(--pos)', fontWeight: 500 }}>{bulkSummary.valid.toLocaleString()} valid</span>
+                  {bulkSummary.flagged > 0 && <span style={{ color: 'var(--warn)' }}> · {bulkSummary.flagged} flagged</span>}
+                  {bulkSummary.uniqueDates > 0 && <span> · {bulkSummary.uniqueDates} unique date{bulkSummary.uniqueDates === 1 ? '' : 's'} ({formatDate(bulkSummary.minDate)} → {formatDate(bulkSummary.maxDate)})</span>}
+                </div>
+              </div>
+              <button onClick={() => !bulkSaving && setBulkResults(null)} disabled={bulkSaving} style={{ color: 'var(--text-3)', background: 'none', border: 'none', cursor: bulkSaving ? 'not-allowed' : 'pointer', padding: 4 }}>
+                <X size={16} />
+              </button>
+            </div>
+
+            <div style={{ display: 'flex', gap: 8, marginBottom: 10, fontSize: 11 }}>
+              <button onClick={() => toggleAllBulk(true)} disabled={bulkSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Include all</button>
+              <button onClick={() => toggleAllBulk(false)} disabled={bulkSaving} className="btn-h" style={{ fontSize: 11, padding: '3px 10px' }}>Exclude all</button>
+            </div>
+
+            <div style={{ overflowY: 'auto', flex: 1, border: '1px solid var(--border-soft)', borderRadius: 3 }}>
+              <table className="h-table" style={{ width: '100%' }}>
+                <thead style={{ position: 'sticky' as const, top: 0, background: 'var(--card)', zIndex: 1 }}>
+                  <tr>
+                    <th style={{ width: 36 }}></th>
+                    <th>File</th>
+                    <th>Date</th>
+                    <th className="num">Match</th>
+                    <th className="num">Valid</th>
+                    <th className="num">Flagged</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bulkResults.map(f => {
+                    const eligible = !f.error && f.results.some(p => !p.flag && isFinite(p.ytm_pct))
+                    const included = !!bulkSelections.get(f.filename)
+                    const valid = f.results.filter(p => !p.flag && isFinite(p.ytm_pct)).length
+                    const flagged = f.results.filter(p => p.flag || !isFinite(p.ytm_pct)).length
+                    return (
+                      <tr key={f.filename} style={included ? {} : { opacity: 0.55 }}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={included}
+                            onChange={() => toggleBulkFile(f.filename)}
+                            disabled={bulkSaving || !eligible}
+                            style={{ accentColor: 'var(--gold)' }}
+                            title={!eligible ? 'No valid proposals in this file' : undefined}
+                          />
+                        </td>
+                        <td>
+                          <div style={{ fontSize: 11, fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>{f.filename}</div>
+                          {f.error && (
+                            <div style={{ fontSize: 10, color: 'var(--neg)', marginTop: 2 }}>{f.error}</div>
+                          )}
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                          {f.settlement_date ? formatDate(f.settlement_date) : '—'}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-2)' }}>
+                          {f.matched}/{f.fi_instruments_in_db}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: valid > 0 ? 'var(--pos)' : 'var(--text-4)' }}>
+                          {valid}
+                        </td>
+                        <td className="num" style={{ fontFamily: 'var(--font-mono)', fontSize: 11, color: flagged > 0 ? 'var(--warn)' : 'var(--text-4)' }}>
+                          {flagged}
+                        </td>
+                        <td style={{ fontSize: 11 }}>
+                          {f.error ? (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, color: 'var(--neg)' }}>
+                              <AlertCircle size={11} /> error
+                            </span>
+                          ) : valid === 0 ? (
+                            <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5, color: 'var(--text-3)' }}>
+                              <AlertTriangle size={11} /> no valid
+                            </span>
+                          ) : (
+                            <span style={{ color: 'var(--pos)', display: 'inline-flex', alignItems: 'center', gap: 5 }}>
+                              <CheckCircle2 size={11} /> ok
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+
+            {bulkSaveError && (
+              <div className="alert-h alert-h-critical" style={{ fontSize: 11, display: 'flex', alignItems: 'flex-start', gap: 6, marginTop: 10 }}>
+                <AlertCircle size={13} style={{ flexShrink: 0, marginTop: 1 }} />
+                <span>{bulkSaveError}</span>
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, paddingTop: 14, borderTop: '1px solid var(--border-soft)', marginTop: 12 }}>
+              <button
+                onClick={saveBulk}
+                disabled={bulkSaving || bulkSummary.valid === 0}
+                className="btn-h btn-h-primary"
+                style={{ flex: 1, justifyContent: 'center' }}
+              >
+                <CheckCircle2 size={12} />
+                {bulkSaving
+                  ? 'Saving…'
+                  : `Accept ${bulkSummary.valid.toLocaleString()} valid yield${bulkSummary.valid === 1 ? '' : 's'} across ${bulkSummary.uniqueDates} date${bulkSummary.uniqueDates === 1 ? '' : 's'}`}
+              </button>
+              <button onClick={() => setBulkResults(null)} disabled={bulkSaving} className="btn-h">Cancel</button>
             </div>
           </div>
         </div>
