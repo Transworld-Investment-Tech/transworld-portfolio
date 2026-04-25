@@ -468,6 +468,10 @@ export default function FixedIncomePage() {
         maturity_date: p.maturity_date,
         clean_price:   p.clean_price,
         notes:         p.notes,
+        // v25d: forward liquidity capture from import route → /accept → yield_history
+        volume:        (p as any).volume     ?? null,
+        deals:         (p as any).deals      ?? null,
+        value_ngn:     (p as any).value_ngn  ?? null,
       }))
       const res = await fetch('/api/admin/import-bond-yields/accept', {
         method:  'POST',
@@ -597,6 +601,10 @@ export default function FixedIncomePage() {
             maturity_date: p.maturity_date,
             clean_price:   p.clean_price,
             notes:         p.notes,
+            // v25d: forward liquidity capture from import route → /accept → yield_history
+            volume:        (p as any).volume     ?? null,
+            deals:         (p as any).deals      ?? null,
+            value_ngn:     (p as any).value_ngn  ?? null,
           })
         }
       }
