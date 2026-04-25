@@ -1,7 +1,11 @@
 // v23: Fixed Income context module.
 // v25: Extended FIInstrument with mod_duration, convexity, vwc_tag.
-//      Prompt block now mentions duration as a risk-budget metric and
-//      VWC tag as a liquidity signal.
+// v25c: Filters AI prompt to watchlist members only. Approach (a):
+//       a separate fetch on the watchlist table → IN filter on instruments.
+//       The full instruments universe (now 160+ rows) lives in the DB and
+//       is visible everywhere else (Holdings page, /admin/fixed-income table,
+//       yield curve viz). But the AI prompt is scoped to watchlist-curated
+//       items only, so it doesn't get to recommend off-watchlist names.
 //
 // Single source of truth for how FI yield data is fetched, grouped,
 // formatted, and flagged for AI prompt injection.
@@ -21,10 +25,9 @@ export interface FIInstrument {
   yield_as_of:   string | null
   sub_type:      string
   group:         FIGroup
-  // v25 additions
-  mod_duration:  number | null    // years; null if can't compute
-  convexity:     number | null    // years²
-  vwc_tag:       VWCTag           // traded / quoted / stale
+  mod_duration:  number | null
+  convexity:     number | null
+  vwc_tag:       VWCTag
 }
 
 // ── Numeric coercion at the DB-to-JS boundary (pitfall #72) ──────────────
@@ -60,10 +63,6 @@ function groupOf(subType: string): FIGroup {
   return 'corporate'
 }
 
-// v25: VWC tag — read from latest yield_history row's volume + age of yield_as_of.
-//   traded   → most recent yield_history row for this instrument has volume > 0
-//   quoted   → recent yield_history row exists but volume is 0 / null
-//   stale    → no yield_history row in last YIELD_STALE_DAYS
 const YIELD_STALE_DAYS = 14
 
 function vwcTagFor(
@@ -81,25 +80,42 @@ function vwcTagFor(
 
 // ── Public: fetch + shape ─────────────────────────────────────────────────
 export async function fetchFIUniverse(db: any): Promise<FIInstrument[]> {
+  // v25c step 1: fetch watchlist-curated FI tickers.
+  // The instruments table now holds the full NGX FI universe (160+ rows),
+  // but we only let the AI see what the watchlist explicitly endorses.
+  const { data: wlData, error: wlErr } = await db
+    .from('watchlist')
+    .select('ticker')
+    .eq('section', 'fixed_income')
+    .eq('active', true)
+    .limit(500)
+
+  if (wlErr || !wlData) return []
+  const watchlistTickers = (wlData as any[])
+    .map(w => w.ticker as string)
+    .filter(t => !!t)
+
+  if (watchlistTickers.length === 0) return []
+
+  // v25c step 2: pull instruments restricted to that ticker list.
   const { data, error } = await db
     .from('instruments')
     .select('instrument_id, name, coupon_pct, maturity_date, yield_pct, yield_as_of, notes')
     .eq('sleeve_id', 'fi')
     .eq('approved', true)
+    .in('instrument_id', watchlistTickers)
     .not('yield_pct',     'is', null)
     .not('maturity_date', 'is', null)
     .order('maturity_date', { ascending: true })
 
   if (error || !data) return []
 
-  // v25: also pull the latest volume per instrument from yield_history.
-  // We grab volume from the most recent yield_history row per instrument
-  // by ordering desc then taking the first occurrence client-side.
+  // v25 step 3: pull latest volume per instrument for VWC tagging.
   const { data: histData } = await db
     .from('yield_history')
     .select('instrument_id, yield_as_of, volume')
     .order('yield_as_of', { ascending: false })
-    .limit(2000)
+    .limit(5000)
 
   const latestVolumeBy = new Map<string, number | null>()
   for (const r of (histData ?? []) as any[]) {
@@ -117,7 +133,6 @@ export async function fetchFIUniverse(db: any): Promise<FIInstrument[]> {
     const subType = parseSubType(r.notes, r.instrument_id, r.name)
     const couponNum = toNum(r.coupon_pct)
 
-    // Compute duration/convexity from the known yield + today as settlement.
     let modDur: number | null = null
     let convex: number | null = null
     if (couponNum !== null && r.maturity_date) {
@@ -189,7 +204,6 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
     ? new Date(latestAsOf).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
     : 'unknown'
 
-  // v25: VWC tally — gives the AI a sense of how much of the universe is real
   const tradedCount = items.filter(i => i.vwc_tag === 'traded').length
   const quotedCount = items.filter(i => i.vwc_tag === 'quoted').length
   const staleCount  = items.filter(i => i.vwc_tag === 'stale').length
@@ -197,7 +211,7 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
   const lines: string[] = [
     '',
     '═══════════════════════════════════════════════════════',
-    `FIXED INCOME UNIVERSE — yields as of ${asOfDisplay}`,
+    `FIXED INCOME UNIVERSE (watchlist-curated) — yields as of ${asOfDisplay}`,
     '═══════════════════════════════════════════════════════',
     `${items.length} instruments with current market yields. Tenor = years to maturity from today.`,
     `Liquidity signal: ${tradedCount} traded recently · ${quotedCount} quoted (no recent volume) · ${staleCount} stale.`,
@@ -229,9 +243,10 @@ export function buildFIContextBlock(items: FIInstrument[]): string {
   }
 
   lines.push('INSTRUCTIONS FOR AI: When recommending fixed income positions, cite specific')
-  lines.push('instruments by ticker and current yield from the universe above. Match tenor to')
-  lines.push("the scenario's / mandate's time horizon. Do not invent FI instruments that are")
-  lines.push('not in this universe.')
+  lines.push('instruments by ticker and current yield from the universe above. The universe')
+  lines.push('is curated — these are the instruments approved for client mandates. Match')
+  lines.push("tenor to the scenario's / mandate's time horizon. Do not invent FI instruments")
+  lines.push('that are not in this universe.')
   lines.push('')
   lines.push('LIQUIDITY GUIDANCE: Prefer TRADED instruments for any recommendation that')
   lines.push('involves actually entering a position at scale. QUOTED instruments are valid')
