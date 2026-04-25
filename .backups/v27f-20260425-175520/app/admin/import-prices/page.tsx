@@ -1,16 +1,9 @@
 'use client'
-import { useState, useRef, useCallback, useEffect } from 'react'
+import { useState, useRef, useCallback } from 'react'
 import Link from 'next/link'
 import { ArrowLeft, Upload, RefreshCw, CheckCircle, AlertCircle, FileSpreadsheet, Database } from 'lucide-react'
-import { supabase } from '@/lib/supabase'
 
 // v21o: Historical price importer + NAV reconstruction.
-// v27f: Step 2 panel scoped per-portfolio. Operator can pick "All active
-//   portfolios" (default) or a single portfolio from a dropdown. Per-portfolio
-//   result table now shows client name + portfolio label instead of raw UUID.
-//   Underlying route at /api/admin/reconstruct-nav already supported a
-//   portfolioId body param; this release exposes it in the UI and pairs it
-//   with a Postgres RPC fix to the route's distinct-dates query.
 //
 // Step 1 — Import: Upload all Brokerage PrintDownload Price List xlsx files.
 //   Files are batched in groups of 8 to stay within Vercel body size limits.
@@ -36,26 +29,11 @@ interface BatchResult {
   error?:         string
 }
 
-interface PortfolioResultRow {
-  portfolioId:        string
-  navEntriesAdded:    number
-  datesProcessed?:    number
-  instrumentsTracked?: number
-}
-
 interface ReconResult {
-  navEntriesAdded:      number
-  portfoliosProcessed:  number
-  portfolioResults:     PortfolioResultRow[]
-  totalDatesAvailable?: number
-  error?:               string
-}
-
-interface PortfolioOption {
-  id:          string
-  label:       string
-  name:        string
-  client_name: string
+  navEntriesAdded:     number
+  portfoliosProcessed: number
+  portfolioResults:    Array<{ portfolioId: string; navEntriesAdded: number }>
+  error?: string
 }
 
 export default function ImportPricesPage() {
@@ -69,48 +47,6 @@ export default function ImportPricesPage() {
 
   const [reconstructing, setReconstructing] = useState(false)
   const [reconResult, setReconResult] = useState<ReconResult | null>(null)
-
-  // v27f: portfolio scoping
-  const [portfolios, setPortfolios] = useState<PortfolioOption[]>([])
-  const [selectedPortfolioId, setSelectedPortfolioId] = useState<string>('')
-
-  useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const { data, error } = await supabase
-        .from('portfolios')
-        .select('id, label, name, clients(name)')
-        .eq('status', 'active')
-
-      if (cancelled) return
-      if (error || !data) {
-        setPortfolios([])
-        return
-      }
-
-      const opts: PortfolioOption[] = (data as any[]).map(p => {
-        const clientField = p.clients
-        const clientName = Array.isArray(clientField)
-          ? (clientField[0]?.name ?? '')
-          : (clientField?.name ?? '')
-        return {
-          id:          String(p.id),
-          label:       String(p.label ?? ''),
-          name:        String(p.name ?? ''),
-          client_name: String(clientName),
-        }
-      })
-
-      // sort by client name then label
-      opts.sort((a, b) => {
-        const c = a.client_name.localeCompare(b.client_name)
-        return c !== 0 ? c : a.label.localeCompare(b.label)
-      })
-
-      setPortfolios(opts)
-    })()
-    return () => { cancelled = true }
-  }, [])
 
   function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
     const files = Array.from(e.target.files ?? [])
@@ -165,8 +101,7 @@ export default function ImportPricesPage() {
     setReconstructing(true)
     setReconResult(null)
     try {
-      const body = selectedPortfolioId ? { portfolioId: selectedPortfolioId } : {}
-      const res  = await fetch('/api/admin/reconstruct-nav', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+      const res  = await fetch('/api/admin/reconstruct-nav', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({}) })
       const json = await res.json()
       setReconResult(res.ok ? json : { ...json, error: json.error ?? 'Failed' })
     } catch (e: any) {
@@ -188,16 +123,6 @@ export default function ImportPricesPage() {
   const allDates    = Array.from(new Set(batchResults.flatMap(r => r.datesImported ?? []))).sort()
   const hasErrors   = batchResults.some(r => r.error)
   const progress    = totalBatches > 0 ? Math.round((currentBatch / totalBatches) * 100) : 0
-
-  // v27f: helpers for the result table
-  const portfolioMap = new Map(portfolios.map(p => [p.id, p]))
-  const selectedPortfolio = selectedPortfolioId ? portfolioMap.get(selectedPortfolioId) : null
-
-  function fmtPortfolio(pid: string): string {
-    const p = portfolioMap.get(pid)
-    if (!p) return pid
-    return `${p.client_name} · Portfolio ${p.label}`
-  }
 
   return (
     <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
@@ -375,41 +300,15 @@ export default function ImportPricesPage() {
               Inserts into nav_log — unlocks all performance period tabs.
             </div>
           </div>
-          <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-            {/* v27f: portfolio scope dropdown */}
-            <select
-              value={selectedPortfolioId}
-              onChange={e => setSelectedPortfolioId(e.target.value)}
-              disabled={reconstructing}
-              style={{
-                padding: '8px 10px',
-                fontSize: 12,
-                fontFamily: 'var(--font-sans)',
-                color: 'var(--text)',
-                background: 'var(--bg-soft)',
-                border: '1px solid var(--border)',
-                borderRadius: 4,
-                minWidth: 240,
-                cursor: reconstructing ? 'not-allowed' : 'pointer',
-              }}
-            >
-              <option value="">All active portfolios</option>
-              {portfolios.map(p => (
-                <option key={p.id} value={p.id}>
-                  {p.client_name} · Portfolio {p.label}
-                </option>
-              ))}
-            </select>
-            <button
-              className="btn-h btn-h-primary"
-              onClick={runReconstruct}
-              disabled={reconstructing}
-            >
-              {reconstructing
-                ? <><RefreshCw size={12} className="animate-spin" /> Reconstructing…</>
-                : <><Database size={12} /> {selectedPortfolio ? 'Reconstruct selected' : 'Reconstruct all portfolios'}</>}
-            </button>
-          </div>
+          <button
+            className="btn-h btn-h-primary"
+            onClick={runReconstruct}
+            disabled={reconstructing}
+          >
+            {reconstructing
+              ? <><RefreshCw size={12} className="animate-spin" /> Reconstructing…</>
+              : <><Database size={12} /> Reconstruct all portfolios</>}
+          </button>
         </div>
 
         <div style={{ fontSize: 12, color: 'var(--text-2)', marginBottom: 20, lineHeight: 1.7 }}>
@@ -429,31 +328,23 @@ export default function ImportPricesPage() {
           <div>
             <div style={{ display: 'flex', gap: 8, alignItems: 'center', padding: '12px 14px', background: 'rgba(45,110,78,0.08)', border: '1px solid rgba(45,110,78,0.2)', borderRadius: 4, marginBottom: 16, fontSize: 12, color: 'var(--pos)' }}>
               <CheckCircle size={14} />
-              {selectedPortfolio ? (
-                reconResult.navEntriesAdded > 0 ? (
-                  <span><strong>{reconResult.navEntriesAdded.toLocaleString()} NAV entries added</strong> for {selectedPortfolio.client_name} · Portfolio {selectedPortfolio.label}. Sub-period performance tabs are now live.</span>
-                ) : (
-                  <span>Already current — no new entries needed for {selectedPortfolio.client_name} · Portfolio {selectedPortfolio.label}.</span>
-                )
-              ) : (
-                <span><strong>{reconResult.navEntriesAdded.toLocaleString()} NAV entries added</strong> across {reconResult.portfoliosProcessed} portfolio{reconResult.portfoliosProcessed !== 1 ? 's' : ''}. Sub-period performance tabs are now live.</span>
-              )}
+              <strong>{reconResult.navEntriesAdded.toLocaleString()} NAV entries added</strong>
+              {' '}across {reconResult.portfoliosProcessed} portfolio{reconResult.portfoliosProcessed !== 1 ? 's' : ''}.
+              Sub-period performance tabs are now live.
             </div>
             {reconResult.portfolioResults?.length > 0 && (
               <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <thead>
                   <tr>
-                    {['Portfolio', 'NAV entries added', 'Status'].map(h => (
+                    {['Portfolio ID', 'NAV entries added', 'Status'].map(h => (
                       <th key={h} style={{ textAlign: 'left', padding: '8px 12px', fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', borderBottom: '1px solid var(--border)' }}>{h}</th>
                     ))}
                   </tr>
                 </thead>
                 <tbody>
-                  {reconResult.portfolioResults.map((r) => (
+                  {reconResult.portfolioResults.map((r: any) => (
                     <tr key={r.portfolioId} style={{ borderBottom: '1px solid var(--border-soft)' }}>
-                      <td style={{ padding: '10px 12px', fontSize: 12, color: 'var(--text)' }}>
-                        {fmtPortfolio(r.portfolioId)}
-                      </td>
+                      <td style={{ padding: '10px 12px', fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-3)' }}>{r.portfolioId}</td>
                       <td style={{ padding: '10px 12px', fontFamily: 'var(--font-serif)', fontSize: 16, fontWeight: 500, color: r.navEntriesAdded > 0 ? 'var(--pos)' : 'var(--text-3)' }}>
                         {r.navEntriesAdded > 0 ? `+${r.navEntriesAdded}` : '0 (already up to date)'}
                       </td>

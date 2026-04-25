@@ -1,21 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 
-// v21o-hotfix-1 + v27f: Three Supabase row-cap bugs fixed across two releases.
+// v21o-hotfix-1: Two Supabase 1000-row default cap bugs fixed.
 //
-// Bug 1 (v21o-hotfix-1, then v27f): allDates query originally returned 1000
-//   rows from market_prices. With ~300 instruments per date, 1000 rows = only
-//   ~3-4 distinct dates processed. v21o-hotfix-1 raised the cap to 50,000;
-//   v27f eliminates the cap entirely by using a Postgres RPC
-//   (get_distinct_market_price_dates) that does SELECT DISTINCT server-side.
-//   The 50k cap silently re-broke once market_prices grew past it (~mid-2022
-//   reconstruction cliff diagnosed in the post-ADE-C / DON-B session — only
-//   89 of 208 distinct dates were being seen by the route).
+// Bug 1: allDates query returned 1000 rows from market_prices. With ~300
+//   instruments per date, 1000 rows = only ~3-4 distinct dates processed.
+//   Fix: .limit(50000) on the allDates query.
 //
-// Bug 2 (v21o-hotfix-1, still in place): allPrices batch query capped at 1000
-//   rows — most pricesByDate entries empty. Fix: filter by portfolio
-//   instruments only (10-15 rows per date instead of 300+), plus .limit(50000)
-//   safety net. Portfolio-instrument filter keeps row counts well under cap.
+// Bug 2: allPrices batch query capped at 1000 rows — most pricesByDate
+//   entries empty. Fix: filter by portfolio instruments only (10-15 rows
+//   per date instead of 300+), plus .limit(50000) safety net.
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -90,22 +84,15 @@ export async function POST(req: NextRequest) {
     }
 
     // ── 2. Get ALL distinct price dates ─────────────────────────────────
-    // v27f: Postgres RPC, server-side SELECT DISTINCT, no row-count limit.
-    // Replaces the previous .from('market_prices').select('price_date')
-    // .limit(50000) approach which was capping at ~89 dates in production.
-    const { data: dateRows, error: dateErr } = await db
-      .rpc('get_distinct_market_price_dates')
+    // FIX: .limit(50000) overrides Supabase default 1000-row cap.
+    // Without this, 1000 rows ÷ ~300 instruments/date = only ~3 dates processed.
+    const { data: dateRows } = await db
+      .from('market_prices')
+      .select('price_date')
+      .order('price_date', { ascending: true })
+      .limit(50000)
 
-    if (dateErr) {
-      return NextResponse.json(
-        { error: `Failed to fetch distinct dates: ${dateErr.message}` },
-        { status: 500 }
-      )
-    }
-
-    const allDates = ((dateRows ?? []) as { price_date: string }[])
-      .map(r => r.price_date)
-      .sort()
+    const allDates = [...new Set((dateRows ?? []).map((r: any) => r.price_date as string))].sort()
 
     if (allDates.length === 0) {
       return NextResponse.json({ ok: true, message: 'No price dates in market_prices', navEntriesAdded: 0 })
