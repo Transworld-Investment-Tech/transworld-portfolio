@@ -2,26 +2,20 @@
 
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Chart, ScatterController, PointElement, LinearScale, Tooltip, Legend, type ChartConfiguration } from 'chart.js'
-import { Calendar, AlertCircle, TrendingUp } from 'lucide-react'
+import { Calendar, AlertCircle, TrendingUp, Building2 } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 import { computeDurationConvexity } from '@/lib/bond-yield'
 
 // v25: Yield curve visualization.
+// v27c: Adds firm-wide overlay mode (Cockpit FI book context).
 //
-// Shows a scatter plot of yields vs. years to maturity for the FI universe
-// at a selected historical date. Colored by the same 5 sub-type groups used
-// in fi-context.ts. Optional portfolio overlay draws holdings as gold
-// diamonds sized by market value.
+// Three modes (precedence order):
+//   1. lockedPortfolioId set → no picker; holdings overlay = that portfolio
+//   2. firmOverlay true     → no picker; holdings overlay = aggregated firm-wide
+//   3. neither             → picker shown; user chooses which portfolio (or none)
 //
-// Data flow:
-//   - on mount: fetch distinct yield_as_of dates from yield_history (DESC)
-//   - on date change: fetch yield_history rows for that date OR (for 'current')
-//                     fetch instruments.yield_* directly
-//   - on portfolio change: fetch holdings + transactions to compute avg cost
-//                          and overlay only the bonds this portfolio holds
-//
-// All numeric coercion at the DB-to-JS boundary (pitfall #72).
-// All .toFixed call sites guarded by hasNum (pitfall #73).
+// Numeric coercion at the DB-to-JS boundary (pitfall #72).
+// All .toFixed call sites guarded by render helpers (pitfall #73).
 
 Chart.register(ScatterController, PointElement, LinearScale, Tooltip, Legend)
 
@@ -51,13 +45,15 @@ interface HoldingPoint {
   quantity:         number
   market_value:     number
   avg_cost:         number
-  // mirrors CurvePoint fields so we can plot it
   tenor_years:      number
   yield_pct:        number
   coupon_pct:       number | null
   maturity_date:    string
   mod_duration:     number | null
   convexity:        number | null
+  // v27c — firm-mode fields (undefined in per-portfolio mode)
+  mandate_count?:   number
+  portfolio_codes?: string[]
 }
 
 interface PortfolioOption {
@@ -67,8 +63,9 @@ interface PortfolioOption {
 }
 
 interface Props {
-  lockedPortfolioId?: string  // If set, picker is hidden and the panel is locked to this portfolio
+  lockedPortfolioId?: string
   lockedPortfolioName?: string
+  firmOverlay?: boolean   // v27c — render aggregated firm-wide FI holdings as overlay
 }
 
 // ─── Numeric helpers ──────────────────────────────────────────────────────
@@ -76,11 +73,6 @@ const numOrNull = (v: unknown): number | null => {
   if (v === null || v === undefined) return null
   const n = typeof v === 'number' ? v : parseFloat(String(v))
   return isFinite(n) ? n : null
-}
-const hasNum = (v: unknown): boolean => {
-  if (v === null || v === undefined) return false
-  const n = typeof v === 'number' ? v : parseFloat(String(v))
-  return isFinite(n)
 }
 function fmtPct(v: unknown, dp = 2): string {
   const n = numOrNull(v); return n === null ? '—' : `${n.toFixed(dp)}%`
@@ -141,24 +133,23 @@ const GROUP_LABEL: Record<FIGroup, string> = {
   corporate:     'Corporate / CP',
 }
 
-// Distinct, accessible colors for the 5 groups + holdings overlay
 const GROUP_COLOR: Record<FIGroup, string> = {
-  federal:       '#0f2947',   // navy
-  federal_sukuk: '#2d6e4e',   // forest green
-  fgs_fgnsb:     '#5780a8',   // muted blue
-  sub_sovereign: '#a67c2a',   // bronze
-  corporate:     '#a63b3b',   // burgundy
+  federal:       '#0f2947',
+  federal_sukuk: '#2d6e4e',
+  fgs_fgnsb:     '#5780a8',
+  sub_sovereign: '#a67c2a',
+  corporate:     '#a63b3b',
 }
-const HOLDINGS_COLOR = '#c9a556'  // bright gold
+const HOLDINGS_COLOR = '#c9a556'
 
 const STALE_DAYS = 14
 
 // ─── Component ────────────────────────────────────────────────────────────
-export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName }: Props) {
+export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName, firmOverlay }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const chartRef  = useRef<Chart | null>(null)
 
-  const [availableDates, setAvailableDates] = useState<string[]>([])  // ISO dates DESC
+  const [availableDates, setAvailableDates] = useState<string[]>([])
   const [selectedDate,   setSelectedDate]   = useState<string>('current')
   const [points,         setPoints]         = useState<CurvePoint[]>([])
   const [pointsLoading,  setPointsLoading]  = useState(true)
@@ -169,10 +160,13 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
   const [holdings,              setHoldings]              = useState<HoldingPoint[]>([])
   const [holdingsLoading,       setHoldingsLoading]       = useState(false)
 
+  // Mode resolution
+  const modePicker = !lockedPortfolioId && !firmOverlay
+  const modeFirm   = !lockedPortfolioId && firmOverlay === true
+
   // ─── Mount: load distinct dates and portfolio options ───────────────────
   useEffect(() => {
     (async () => {
-      // Distinct dates
       const { data: dateData } = await supabase
         .from('yield_history')
         .select('yield_as_of')
@@ -188,8 +182,8 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
       }
       setAvailableDates(dates)
 
-      // Portfolios — only relevant if not locked
-      if (!lockedPortfolioId) {
+      // Portfolio picker — only relevant in mode 3
+      if (modePicker) {
         const { data: pData } = await supabase
           .from('portfolios')
           .select('id, name, client:clients(name)')
@@ -202,7 +196,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         setPortfolios(opts)
       }
     })()
-  }, [lockedPortfolioId])
+  }, [modePicker])
 
   // ─── Load curve points whenever selectedDate changes ────────────────────
   useEffect(() => { loadCurve() }, [selectedDate])
@@ -217,7 +211,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
       let asOfForTenor = today
 
       if (selectedDate === 'current') {
-        // Fall back to instruments.yield_* — the freshest snapshot per instrument
         const { data, error } = await supabase
           .from('instruments')
           .select('instrument_id, name, coupon_pct, maturity_date, yield_pct, yield_as_of, notes')
@@ -229,7 +222,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         if (error) throw error
         raw = data ?? []
       } else {
-        // Fetch yield_history for the chosen date, joined with instruments for name + notes
         const { data: hist, error: hErr } = await supabase
           .from('yield_history')
           .select('instrument_id, yield_as_of, yield_pct, coupon_pct, maturity_date, volume, deals')
@@ -257,8 +249,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         asOfForTenor = selectedDate
       }
 
-      // Latest volume per instrument (across all yield_history) for VWC tag.
-      // Used regardless of whether selectedDate is 'current' or historical.
       const { data: latestVolData } = await supabase
         .from('yield_history')
         .select('instrument_id, yield_as_of, volume')
@@ -271,7 +261,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         }
       }
 
-      // Build CurvePoint[]
       const out: CurvePoint[] = []
       for (const r of raw) {
         const yp = numOrNull(r.yield_pct)
@@ -285,7 +274,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           ? (r.yield_as_of ? String(r.yield_as_of).slice(0, 10) : today)
           : selectedDate
         const tenor = (new Date(matIso + 'T00:00:00Z').getTime() - new Date(asOfForTenor + 'T00:00:00Z').getTime()) / 86_400_000 / 365.25
-        if (tenor <= 0) continue  // matured
+        if (tenor <= 0) continue
 
         let modDur: number | null = null
         let convex: number | null = null
@@ -294,7 +283,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           if (dc) { modDur = dc.mod_duration; convex = dc.convexity }
         }
 
-        // VWC tag — use the latest-volume map for traded/quoted; stale based on yield age
         let vwc: 'traded' | 'quoted' | 'stale' = 'quoted'
         if (selectedDate === 'current') {
           const ageDays = (new Date(today + 'T00:00:00Z').getTime() - new Date(asOfIso + 'T00:00:00Z').getTime()) / 86_400_000
@@ -302,7 +290,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           else if ((latestVolMap.get(r.instrument_id) ?? 0) > 0) vwc = 'traded'
           else vwc = 'quoted'
         } else {
-          // Historical: traded if THIS row's volume > 0; otherwise quoted.
           const v = numOrNull(r.volume)
           if (v !== null && v > 0) vwc = 'traded'
           else vwc = 'quoted'
@@ -326,7 +313,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         })
       }
 
-      // Filter extreme yields to keep the chart readable; user sees them in the table
       const filtered = out.filter(p => p.yield_pct >= 5 && p.yield_pct <= 50)
       setPoints(filtered)
     } catch (e: any) {
@@ -337,13 +323,14 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
     }
   }
 
-  // ─── Load holdings for the selected portfolio ───────────────────────────
+  // ─── Per-portfolio holdings load (modes 1 + 3 picker selection) ────────
   useEffect(() => {
+    if (modeFirm) return  // firm mode handled separately
     if (!overlayPortfolioId) { setHoldings([]); return }
     if (points.length === 0) return
     loadHoldings(overlayPortfolioId)
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overlayPortfolioId, points.length, selectedDate])
+  }, [overlayPortfolioId, points.length, selectedDate, modeFirm])
 
   async function loadHoldings(pid: string) {
     setHoldingsLoading(true)
@@ -354,9 +341,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         .eq('portfolio_id', pid)
 
       const out: HoldingPoint[] = []
-      const today = new Date().toISOString().slice(0, 10)
-      const asOfForTenor = selectedDate === 'current' ? today : selectedDate
-
       for (const h of (holds ?? []) as any[]) {
         const instr = h.instrument
         if (!instr || instr.sleeve_id !== 'fi') continue
@@ -365,25 +349,14 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
         const avgCost = numOrNull(h.avg_cost) ?? 0
         if (qty <= 0) continue
 
-        // Find this instrument in the curve points to grab its yield + duration
         const cp = points.find(p => p.instrument_id === h.instrument_id)
-        if (!cp) continue   // instrument not in current snapshot — skip
-
-        // Market value uses face value × clean-price-equivalent.
-        // For bonds, qty in our system is face value (NGX convention). Mark
-        // current value via the YIELD on the curve, by computing what price
-        // corresponds to that yield from the cashflows. As an approximation
-        // for the overlay, we use qty × (curve_yield_factor) — the user will
-        // see the size of the diamond as relative weight, not absolute Naira.
-        // For a reasonable display value, use qty as-is (face) — this is
-        // adequate for sizing purposes.
-        const marketValue = qty   // face value, adequate for relative sizing
+        if (!cp) continue
 
         out.push({
           instrument_id: h.instrument_id,
           name:          instr.name,
           quantity:      qty,
-          market_value:  marketValue,
+          market_value:  qty,
           avg_cost:      avgCost,
           tenor_years:   cp.tenor_years,
           yield_pct:     cp.yield_pct,
@@ -401,6 +374,87 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
     }
   }
 
+  // ─── v27c — Firm-wide aggregated holdings load (mode 2) ─────────────────
+  useEffect(() => {
+    if (!modeFirm) return
+    if (points.length === 0) return
+    loadFirmHoldings()
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [modeFirm, points.length, selectedDate])
+
+  async function loadFirmHoldings() {
+    setHoldingsLoading(true)
+    try {
+      // Fetch all active portfolios with client_code
+      const { data: pData } = await supabase
+        .from('portfolios')
+        .select('id, client:clients(code, type)')
+        .eq('status', 'active')
+        .limit(2000)
+      const codeByPortfolio = new Map<string, string>()
+      const activePids: string[] = []
+      for (const p of (pData ?? []) as any[]) {
+        activePids.push(p.id)
+        codeByPortfolio.set(p.id, p.client?.code ?? '—')
+      }
+      if (activePids.length === 0) { setHoldings([]); return }
+
+      const { data: holds } = await supabase
+        .from('holdings')
+        .select('portfolio_id, instrument_id, quantity, instrument:instruments(sleeve_id, name)')
+        .in('portfolio_id', activePids)
+        .limit(50000)
+
+      // Aggregate qty per FI instrument
+      const qtyMap   = new Map<string, number>()
+      const codeMap  = new Map<string, Set<string>>()
+      const nameMap  = new Map<string, string>()
+
+      for (const h of (holds ?? []) as any[]) {
+        const sleeve = h.instrument?.sleeve_id
+        if (sleeve !== 'fi') continue
+        const qty = numOrNull(h.quantity) ?? 0
+        if (qty <= 0) continue
+        qtyMap.set(h.instrument_id, (qtyMap.get(h.instrument_id) ?? 0) + qty)
+        let codes = codeMap.get(h.instrument_id)
+        if (!codes) { codes = new Set(); codeMap.set(h.instrument_id, codes) }
+        const code = codeByPortfolio.get(h.portfolio_id)
+        if (code) codes.add(code)
+        if (!nameMap.has(h.instrument_id)) {
+          nameMap.set(h.instrument_id, h.instrument?.name ?? h.instrument_id)
+        }
+      }
+
+      // Join with curve points for plot coordinates
+      const out: HoldingPoint[] = []
+      for (const [instrId, qty] of qtyMap) {
+        const cp = points.find(p => p.instrument_id === instrId)
+        if (!cp) continue
+        const codes = Array.from(codeMap.get(instrId) ?? []).sort()
+        out.push({
+          instrument_id:   instrId,
+          name:            nameMap.get(instrId) ?? instrId,
+          quantity:        qty,
+          market_value:    qty,
+          avg_cost:        0,            // not meaningful aggregated
+          tenor_years:     cp.tenor_years,
+          yield_pct:       cp.yield_pct,
+          coupon_pct:      cp.coupon_pct,
+          maturity_date:   cp.maturity_date,
+          mod_duration:    cp.mod_duration,
+          convexity:       cp.convexity,
+          mandate_count:   codes.length,
+          portfolio_codes: codes,
+        })
+      }
+      setHoldings(out)
+    } catch {
+      setHoldings([])
+    } finally {
+      setHoldingsLoading(false)
+    }
+  }
+
   // ─── Chart render / re-render ───────────────────────────────────────────
   useEffect(() => {
     if (!canvasRef.current) return
@@ -408,7 +462,6 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
 
     const datasets: ChartConfiguration<'scatter'>['data']['datasets'] = []
 
-    // Build one dataset per group
     const groupOrder: FIGroup[] = ['federal', 'federal_sukuk', 'fgs_fgnsb', 'sub_sovereign', 'corporate']
     for (const g of groupOrder) {
       const pts = points.filter(p => p.group === g)
@@ -429,12 +482,13 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
       })
     }
 
-    // Holdings overlay (if any)
     if (holdings.length > 0) {
-      // Size point by market_value relative to max
       const maxMV = Math.max(...holdings.map(h => h.market_value), 1)
+      const overlayLabel = modeFirm
+        ? `Firm-wide holdings — ${holdings.length} bond${holdings.length === 1 ? '' : 's'}`
+        : (lockedPortfolioName ? `Holdings — ${lockedPortfolioName}` : 'Portfolio holdings')
       datasets.push({
-        label: lockedPortfolioName ? `Holdings — ${lockedPortfolioName}` : 'Portfolio holdings',
+        label: overlayLabel,
         data: holdings.map(h => ({
           x: h.tenor_years,
           y: h.yield_pct,
@@ -448,7 +502,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           const h = ctx.raw?._payload as HoldingPoint | undefined
           if (!h) return 8
           const ratio = h.market_value / maxMV
-          return 7 + ratio * 6   // 7 to 13 px
+          return 7 + ratio * 6
         }) as any,
         pointHoverRadius: ((ctx: any) => {
           const h = ctx.raw?._payload as HoldingPoint | undefined
@@ -456,7 +510,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           const ratio = h.market_value / maxMV
           return 10 + ratio * 6
         }) as any,
-        pointStyle: 'rectRot',  // diamond (rotated square)
+        pointStyle: 'rectRot',
       })
     }
 
@@ -505,7 +559,11 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
                 const p = (it.raw as any)?._payload
                 if (!p) return ''
                 const kind = (it.raw as any)?._kind
-                if (kind === 'holding') return `★ ${p.name} (HELD)`
+                if (kind === 'holding') {
+                  const h = p as HoldingPoint
+                  if (h.mandate_count !== undefined) return `★ ${h.name} (FIRM-WIDE)`
+                  return `★ ${h.name} (HELD)`
+                }
                 return p.name
               },
               label: (item) => {
@@ -516,8 +574,16 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
                 if (kind === 'holding') {
                   const h = p as HoldingPoint
                   lines.push(`${h.instrument_id}`)
-                  lines.push(`Qty / Face: ${h.quantity.toLocaleString()}`)
-                  lines.push(`Avg cost: ${fmtNaira(h.avg_cost)}`)
+                  if (h.mandate_count !== undefined) {
+                    lines.push(`Held by: ${h.mandate_count} mandate${h.mandate_count === 1 ? '' : 's'}`)
+                    if (h.portfolio_codes && h.portfolio_codes.length > 0) {
+                      lines.push(`  ${h.portfolio_codes.join(', ')}`)
+                    }
+                    lines.push(`Aggregate face: ${h.quantity.toLocaleString()}`)
+                  } else {
+                    lines.push(`Qty / Face: ${h.quantity.toLocaleString()}`)
+                    lines.push(`Avg cost: ${fmtNaira(h.avg_cost)}`)
+                  }
                   lines.push(`Yield (curve): ${fmtPct(h.yield_pct)}`)
                   lines.push(`Tenor: ${fmtYears(h.tenor_years)} · matures ${fmtDate(h.maturity_date)}`)
                   if (h.coupon_pct !== null) lines.push(`Coupon: ${fmtPct(h.coupon_pct)}`)
@@ -545,7 +611,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
     return () => {
       if (chartRef.current) { chartRef.current.destroy(); chartRef.current = null }
     }
-  }, [points, holdings, lockedPortfolioName])
+  }, [points, holdings, lockedPortfolioName, modeFirm])
 
   // ─── Render ─────────────────────────────────────────────────────────────
   const tradedCount = useMemo(() => points.filter(p => p.vwc_tag === 'traded').length, [points])
@@ -554,11 +620,40 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
 
   const dateLabel = selectedDate === 'current' ? 'Current snapshot' : fmtDate(selectedDate)
 
+  // Footer summary helpers (work in both per-portfolio and firm modes)
+  const totalMV = holdings.reduce((s, h) => s + h.market_value, 0)
+  const wMD = totalMV > 0
+    ? holdings.reduce((s, h) => s + (h.mod_duration ?? 0) * h.market_value, 0) / totalMV
+    : null
+  const wY = totalMV > 0
+    ? holdings.reduce((s, h) => s + h.yield_pct * h.market_value, 0) / totalMV
+    : null
+  const totalMandates = modeFirm
+    ? new Set(holdings.flatMap(h => h.portfolio_codes ?? [])).size
+    : null
+
   return (
     <div className="panel" style={{ marginBottom: 18 }}>
       <div className="panel-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 12 }}>
         <div>
-          <div className="panel-title">Yield curve</div>
+          <div className="panel-title">
+            Yield curve
+            {modeFirm && (
+              <span style={{
+                marginLeft: 10,
+                fontSize: 10,
+                letterSpacing: '0.14em',
+                fontWeight: 600,
+                color: 'var(--gold)',
+                textTransform: 'uppercase',
+                fontFamily: 'var(--font-sans)',
+                fontStyle: 'normal',
+              }}>
+                <Building2 size={11} style={{ display: 'inline', marginRight: 4, verticalAlign: '-1px' }} />
+                Firm-wide overlay
+              </span>
+            )}
+          </div>
           <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
             {points.length > 0
               ? <>{points.length} bonds plotted · <span style={{ color: 'var(--pos)' }}>{tradedCount} traded</span> · {quotedCount} quoted · <span style={{ color: 'var(--warn)' }}>{staleCount} stale</span></>
@@ -582,7 +677,7 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
             </select>
           </div>
 
-          {!lockedPortfolioId && portfolios.length > 0 && (
+          {modePicker && portfolios.length > 0 && (
             <div style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
               <TrendingUp size={12} style={{ color: 'var(--text-3)' }} />
               <select
@@ -630,27 +725,21 @@ export default function YieldCurvePanel({ lockedPortfolioId, lockedPortfolioName
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
             <span style={{ width: 11, height: 11, background: HOLDINGS_COLOR, transform: 'rotate(45deg)', border: '1px solid var(--sidebar-bg)', display: 'inline-block' }} />
             <strong style={{ color: 'var(--text)' }}>
-              {holdingsLoading ? 'Loading holdings…' : `${holdings.length} held bond${holdings.length === 1 ? '' : 's'}`}
+              {holdingsLoading
+                ? 'Loading holdings…'
+                : modeFirm
+                  ? `${holdings.length} firm-wide bond${holdings.length === 1 ? '' : 's'} held by ${totalMandates ?? 0} mandate${totalMandates === 1 ? '' : 's'}`
+                  : `${holdings.length} held bond${holdings.length === 1 ? '' : 's'}`}
             </strong>
             {!holdingsLoading && holdings.length > 0 && (
               <>
                 {' · '}
                 <span>weighted MD: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>
-                  {(() => {
-                    const totalMV = holdings.reduce((s, h) => s + h.market_value, 0)
-                    if (totalMV === 0) return '—'
-                    const wMD = holdings.reduce((s, h) => s + (h.mod_duration ?? 0) * h.market_value, 0) / totalMV
-                    return fmtYears(wMD)
-                  })()}
+                  {wMD !== null ? fmtYears(wMD) : '—'}
                 </span></span>
                 {' · '}
                 <span>weighted yield: <span style={{ fontFamily: 'var(--font-mono)', color: 'var(--text)' }}>
-                  {(() => {
-                    const totalMV = holdings.reduce((s, h) => s + h.market_value, 0)
-                    if (totalMV === 0) return '—'
-                    const wY = holdings.reduce((s, h) => s + h.yield_pct * h.market_value, 0) / totalMV
-                    return fmtPct(wY)
-                  })()}
+                  {wY !== null ? fmtPct(wY) : '—'}
                 </span></span>
               </>
             )}

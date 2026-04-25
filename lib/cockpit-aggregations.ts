@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// COCKPIT AGGREGATIONS (v27)
+// COCKPIT AGGREGATIONS (v27 → v27c)
 // ═══════════════════════════════════════════════════════════════
 //
 // Pure aggregation helpers for the cockpit. Cross-portfolio reading,
@@ -8,15 +8,15 @@
 // All numeric coercion at every Supabase boundary (pitfall #72).
 // All large queries cap at 50000 rows (pitfall #59).
 //
-// v27b — fetchYTDReturns denominator fix.
-//   Previously fell back to p.starting_nav (cost basis from years ago)
-//   when no Jan 1 nav_log entry existed for portfolios that started before
-//   the current year. This produced absurdly inflated YTD numbers
-//   (ADE +1743%, CMFB +157%) on the Mandate Health Grid. The numerator
-//   stayed correct so the beating_benchmark check happened to function,
-//   but the displayed YTD column was misleading. Fixed: return null when
-//   the proper Jan 1 NAV basis is unavailable. Engine and grid both already
-//   handle null cleanly ('na' on benchmark check, '—' in grid YTD column).
+// v27b — fetchYTDReturns denominator fix (returns null when no Jan 1
+//   nav_log entry, instead of falling back to starting_nav cost basis).
+//
+// v27c — three new helpers for the cockpit Phase-1 build-out:
+//   - buildSectorExposureGrid: firm × portfolios heatmap (equity sleeve)
+//   - buildTopMovers: top 5 gainers / losers across the firm book today,
+//     weighted by aggregate NGN exposure
+//   - buildFirmFIHoldings: aggregated FI holdings across all active
+//     portfolios for the YieldCurvePanel firm overlay
 // ═══════════════════════════════════════════════════════════════
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -80,6 +80,53 @@ export interface StaleReportFlag {
   days_overdue:     number     // 0 if within window
 }
 
+// v27c — Sector exposure grid types
+export interface SectorExposureRow {
+  portfolio_id:     string
+  portfolio_name:   string
+  client_code:      string
+  client_name:      string
+  is_internal:      boolean
+  total_equity_nav: number      // total NGN in equity sleeve
+  total_nav:        number      // total NGN across all sleeves
+  sectors:          Record<string, number>  // ngn per sector
+}
+
+export interface SectorExposureData {
+  sectors:      string[]                    // sorted desc by firm exposure
+  firm_totals:  Record<string, number>      // ngn per sector firm-wide
+  firm_total:   number                      // sum across all sectors
+  portfolios:   SectorExposureRow[]         // sorted desc by total_equity_nav
+}
+
+// v27c — Top movers types
+export interface MoverRow {
+  instrument_id:     string
+  name:              string
+  sector:            string | null
+  day_change_pct:    number     // signed percent (e.g. 7.24, -9.92)
+  latest_price:      number
+  price_date:        string
+  firm_exposure_ngn: number     // aggregate NGN held across firm
+  mandate_count:     number     // distinct portfolios holding
+  ngn_impact:        number     // signed = firm_exposure × day_change / 100
+}
+
+export interface TopMoversData {
+  gainers:     MoverRow[]
+  losers:      MoverRow[]
+  as_of_date:  string | null   // most recent price_date observed
+}
+
+// v27c — Firm-wide FI holdings (for YieldCurvePanel firm overlay)
+export interface FirmFIHolding {
+  instrument_id:    string
+  name:             string
+  total_quantity:   number       // sum of face values
+  mandate_count:    number       // distinct portfolios holding
+  portfolio_codes:  string[]     // for tooltip display
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 1. fetchAllActivePortfolios
 //    Returns active portfolios with their client metadata.
@@ -139,7 +186,6 @@ export async function fetchAllActivePortfolios(
 
 // ═══════════════════════════════════════════════════════════════
 // 2. computePortfolioNAV — current market value
-//    Used to compute current totalNAV for each portfolio.
 // ═══════════════════════════════════════════════════════════════
 export async function computeAllPortfolioNAVs(
   db: SupabaseClient,
@@ -155,7 +201,6 @@ export async function computeAllPortfolioNAVs(
 
   const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
 
-  // Latest market price per instrument
   const priceMap = new Map<string, number>()
   if (allInstr.length > 0) {
     const { data: prices } = await db
@@ -184,14 +229,11 @@ export async function computeAllPortfolioNAVs(
 
 // ═══════════════════════════════════════════════════════════════
 // 3. buildFirmAUMTrend — month-end snapshots over the last N months
-//    Forward-fills last-known NAV per portfolio across the date axis
-//    before summing (handles density-varies-by-portfolio).
 // ═══════════════════════════════════════════════════════════════
 export async function buildFirmAUMTrend(
   db: SupabaseClient,
   monthsBack: number = 12
 ): Promise<AUMTrendPoint[]> {
-  // Fetch all nav_log entries for active portfolios
   const { data: portfolios } = await db
     .from('portfolios')
     .select('id')
@@ -208,7 +250,6 @@ export async function buildFirmAUMTrend(
     .limit(50000)
   if (!navRows || navRows.length === 0) return []
 
-  // Group by portfolio for forward-fill lookup
   const byPortfolio = new Map<string, { date: Date; value: number }[]>()
   for (const r of navRows as any[]) {
     const v = numOrNull(r.nav_value)
@@ -218,11 +259,10 @@ export async function buildFirmAUMTrend(
     byPortfolio.set(r.portfolio_id, arr)
   }
 
-  // Build month-end sample dates
   const today = new Date()
   const sampleDates: Date[] = []
   for (let i = monthsBack; i >= 0; i--) {
-    const d = new Date(today.getFullYear(), today.getMonth() - i + 1, 0)  // last day of month
+    const d = new Date(today.getFullYear(), today.getMonth() - i + 1, 0)
     if (d > today) {
       sampleDates.push(today)
     } else {
@@ -230,12 +270,10 @@ export async function buildFirmAUMTrend(
     }
   }
 
-  // Last-known NAV at or before each sample date, summed
   const trend: AUMTrendPoint[] = []
   for (const sample of sampleDates) {
     let total = 0
     for (const [, navs] of byPortfolio) {
-      // Find latest entry with date <= sample
       let lastValue = 0
       for (let i = navs.length - 1; i >= 0; i--) {
         if (navs[i].date <= sample) { lastValue = navs[i].value; break }
@@ -252,7 +290,6 @@ export async function buildFirmAUMTrend(
 
 // ═══════════════════════════════════════════════════════════════
 // 4. buildFirmAllocationRollup
-//    Sum of NGN by sleeve across all active portfolios.
 // ═══════════════════════════════════════════════════════════════
 export async function buildFirmAllocationRollup(
   db: SupabaseClient,
@@ -311,7 +348,7 @@ export async function buildFirmAllocationRollup(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 5. buildIdleCashFlags — portfolios over liq_max
+// 5. buildIdleCashFlags
 // ═══════════════════════════════════════════════════════════════
 export async function buildIdleCashFlags(
   db: SupabaseClient,
@@ -329,8 +366,6 @@ export async function buildIdleCashFlags(
     .eq('sleeve_id', 'liq')
     .limit(50000)
 
-  // Build cash totals per portfolio. Cash holdings are typically valued at avg_cost
-  // (or 1 for CASH_NGN) — no market price.
   const cashByPortfolio = new Map<string, number>()
   const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
   const priceMap = new Map<string, number>()
@@ -361,8 +396,8 @@ export async function buildIdleCashFlags(
     if (totalNAV <= 0) continue
     const cashPct = cash / totalNAV
     const liqMax = p.liq_max
-    if (liqMax === null) continue   // no max defined
-    if (cashPct <= liqMax) continue  // within band
+    if (liqMax === null) continue
+    if (cashPct <= liqMax) continue
 
     flags.push({
       portfolio_id:   p.id,
@@ -378,7 +413,7 @@ export async function buildIdleCashFlags(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 6. buildStaleReports — portfolios with no recent quarterly report
+// 6. buildStaleReports
 // ═══════════════════════════════════════════════════════════════
 export async function buildStaleReports(
   db: SupabaseClient,
@@ -395,7 +430,6 @@ export async function buildStaleReports(
     .order('report_date', { ascending: false })
     .limit(50000)
 
-  // Last report per portfolio (any type)
   const lastByPortfolio = new Map<string, { date: string; type: string }>()
   for (const r of (reports ?? []) as any[]) {
     if (!lastByPortfolio.has(r.portfolio_id)) {
@@ -435,16 +469,7 @@ export async function buildStaleReports(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 7. fetchYTDReturns — simple YTD return per portfolio
-//    Used by mandate-health benchmark check.
-//
-//    v27b — denominator fix.
-//    For portfolios that started this year, denominator = portfolio.starting_nav (correct).
-//    For portfolios that started before this year, denominator = nav_log entry on/before
-//    Jan 1 of this year. If no such nav_log entry exists, return null — do NOT fall back
-//    to starting_nav (cost basis from years ago, produces grossly inflated YTD numbers).
-//    The mandate-health beating_benchmark check returns 'na' when ytdReturn is null.
-//    The Mandate Health Grid YTD column already renders '—' for null.
+// 7. fetchYTDReturns — v27b denominator fix preserved
 // ═══════════════════════════════════════════════════════════════
 export async function fetchYTDReturns(
   db: SupabaseClient,
@@ -458,7 +483,6 @@ export async function fetchYTDReturns(
   const yStart = new Date(today.getFullYear(), 0, 1)
   const yStartIso = yStart.toISOString().slice(0, 10)
 
-  // Bulk fetch all nav_log rows for these portfolios near year start
   const portfolioIds = portfolios.map(p => p.id)
   const { data: navRows } = await db
     .from('nav_log')
@@ -468,7 +492,6 @@ export async function fetchYTDReturns(
     .order('nav_date', { ascending: false })
     .limit(50000)
 
-  // Latest nav at or before Jan 1 per portfolio
   const navAtYearStartMap = new Map<string, number>()
   for (const r of (navRows ?? []) as any[]) {
     if (!navAtYearStartMap.has(r.portfolio_id)) {
@@ -477,7 +500,6 @@ export async function fetchYTDReturns(
     }
   }
 
-  // Year-to-date cashflows
   const { data: txns } = await db
     .from('transactions')
     .select('portfolio_id, trade_date, action, amount, gross_value')
@@ -498,9 +520,6 @@ export async function fetchYTDReturns(
   for (const p of portfolios) {
     const startedThisYear = p.start_date ? new Date(p.start_date) >= yStart : false
 
-    // v27b — strict denominator selection.
-    // If started this year: starting_nav is correct (the deployed capital).
-    // Otherwise: must have Jan 1 nav_log entry — if absent, YTD is not computable.
     let nav0: number | null
     if (startedThisYear) {
       nav0 = p.starting_nav > 0 ? p.starting_nav : null
@@ -516,7 +535,6 @@ export async function fetchYTDReturns(
 
     const navN = navMap.get(p.id) ?? 0
     const flows = flowsByPortfolio.get(p.id) ?? { inflow: 0, outflow: 0 }
-    // Simple YTD return = (endNAV - startNAV - inflows + outflows) / startNAV
     const ytdReturn = (navN - nav0 - flows.inflow + flows.outflow) / nav0
     out.set(p.id, ytdReturn)
   }
@@ -524,7 +542,7 @@ export async function fetchYTDReturns(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 8. Recent transactions count per portfolio (last 90 days, non-FEE)
+// 8. Recent transactions count per portfolio
 // ═══════════════════════════════════════════════════════════════
 export async function fetchRecentTxnCounts(
   db: SupabaseClient,
@@ -577,7 +595,6 @@ export async function fetchDaysSinceLastReport(
       out.set(r.portfolio_id, days)
     }
   }
-  // Null for portfolios with no reports
   for (const pid of portfolioIds) {
     if (!out.has(pid)) out.set(pid, null)
   }
@@ -600,7 +617,6 @@ export async function fetchFeeOutlookInputs(
 
   const portfolioIds = portfolios.map(p => p.id)
 
-  // NAV at or just before Jan 1
   const { data: navRows } = await db
     .from('nav_log')
     .select('portfolio_id, nav_date, nav_value')
@@ -616,7 +632,6 @@ export async function fetchFeeOutlookInputs(
     }
   }
 
-  // Yearly cashflows (TRANSFER_IN / TRANSFER_OUT only — FEE excluded per design)
   const { data: txns } = await db
     .from('transactions')
     .select('portfolio_id, trade_date, action, amount, gross_value')
@@ -662,7 +677,6 @@ export async function fetchHoldingsForPortfolios(
     .in('portfolio_id', portfolioIds)
     .limit(50000)
 
-  // Latest market price per instrument
   const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
   const priceMap = new Map<string, number>()
   if (allInstr.length > 0) {
@@ -754,4 +768,297 @@ export async function fetchNavHistoryForPortfolios(
     out.set(r.portfolio_id, arr)
   }
   return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 14. v27c — buildSectorExposureGrid
+//
+// Firm × portfolios sector heatmap (equity sleeve only).
+// For each active portfolio: sum equity holdings NGN by NGX sector.
+// Sectors are sorted by firm-wide NGN exposure descending.
+// Portfolios are sorted by total equity NAV descending.
+// NULL sector → 'Unclassified'.
+// Internal portfolios are included (caller decides whether to dim them).
+// ═══════════════════════════════════════════════════════════════
+export async function buildSectorExposureGrid(
+  db: SupabaseClient,
+  portfolios: PortfolioWithMeta[],
+  navMap: Map<string, number>
+): Promise<SectorExposureData> {
+  if (portfolios.length === 0) {
+    return { sectors: [], firm_totals: {}, firm_total: 0, portfolios: [] }
+  }
+
+  const portfolioIds = portfolios.map(p => p.id)
+  const portfolioMeta = new Map(portfolios.map(p => [p.id, p]))
+
+  // Pull equity holdings only — instrument.sleeve_id = 'eq' OR holding.sleeve_id = 'eq'
+  const { data: holds } = await db
+    .from('holdings')
+    .select('portfolio_id, instrument_id, quantity, avg_cost, sleeve_id, instrument:instruments(sleeve_id, type, sector)')
+    .in('portfolio_id', portfolioIds)
+    .limit(50000)
+
+  // Latest market price per instrument
+  const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
+  const priceMap = new Map<string, number>()
+  if (allInstr.length > 0) {
+    const { data: prices } = await db
+      .from('market_prices')
+      .select('instrument_id, price, price_date')
+      .in('instrument_id', allInstr)
+      .order('price_date', { ascending: false })
+      .limit(50000)
+    for (const p of (prices ?? []) as any[]) {
+      if (!priceMap.has(p.instrument_id)) {
+        const v = numOrNull(p.price)
+        if (v !== null) priceMap.set(p.instrument_id, v)
+      }
+    }
+  }
+
+  // Walk holdings, accumulate NGN per (portfolio, sector)
+  const portfolioSectorMap = new Map<string, Map<string, number>>()  // pid → sector → ngn
+  const portfolioEquityNav = new Map<string, number>()
+  const firmTotalsByeSector = new Map<string, number>()
+
+  for (const h of (holds ?? []) as any[]) {
+    const sleeve = h.sleeve_id ?? h.instrument?.sleeve_id ?? 'other'
+    if (sleeve !== 'eq' && h.instrument?.type !== 'Stock') continue
+    const qty = num(h.quantity)
+    if (qty <= 0) continue
+    const px = priceMap.get(h.instrument_id) ?? num(h.avg_cost)
+    const ngn = qty * px
+    if (ngn <= 0) continue
+
+    const sector = (h.instrument?.sector ?? '').trim() || 'Unclassified'
+
+    let sectorMap = portfolioSectorMap.get(h.portfolio_id)
+    if (!sectorMap) { sectorMap = new Map(); portfolioSectorMap.set(h.portfolio_id, sectorMap) }
+    sectorMap.set(sector, (sectorMap.get(sector) ?? 0) + ngn)
+
+    portfolioEquityNav.set(h.portfolio_id, (portfolioEquityNav.get(h.portfolio_id) ?? 0) + ngn)
+    firmTotalsByeSector.set(sector, (firmTotalsByeSector.get(sector) ?? 0) + ngn)
+  }
+
+  // Sort sectors by firm exposure desc
+  const sortedSectors = Array.from(firmTotalsByeSector.entries())
+    .sort((a, b) => b[1] - a[1])
+    .map(([s]) => s)
+
+  const firmTotal = Array.from(firmTotalsByeSector.values()).reduce((s, v) => s + v, 0)
+
+  // Build per-portfolio rows
+  const rows: SectorExposureRow[] = []
+  for (const p of portfolios) {
+    const sectorMap = portfolioSectorMap.get(p.id) ?? new Map()
+    const sectors: Record<string, number> = {}
+    for (const [s, n] of sectorMap) sectors[s] = n
+    const totalEquityNav = portfolioEquityNav.get(p.id) ?? 0
+    rows.push({
+      portfolio_id:     p.id,
+      portfolio_name:   p.name,
+      client_code:      p.client_code,
+      client_name:      p.client_name,
+      is_internal:      p.is_internal,
+      total_equity_nav: totalEquityNav,
+      total_nav:        navMap.get(p.id) ?? 0,
+      sectors,
+    })
+  }
+
+  // Sort portfolios by total equity NAV desc, internal sinks to bottom
+  rows.sort((a, b) => {
+    if (a.is_internal !== b.is_internal) return a.is_internal ? 1 : -1
+    return b.total_equity_nav - a.total_equity_nav
+  })
+
+  const firm_totals: Record<string, number> = {}
+  for (const [s, n] of firmTotalsByeSector) firm_totals[s] = n
+
+  return {
+    sectors:    sortedSectors,
+    firm_totals,
+    firm_total: firmTotal,
+    portfolios: rows,
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 15. v27c — buildTopMovers
+//
+// Top 5 gainers / losers across firm holdings today, weighted by
+// aggregate NGN exposure. Equity-only — bonds don't have meaningful
+// daily price movement on NGX.
+//
+// Sort: |ngn_impact| descending, where ngn_impact = firm_exposure × day_change/100
+//   - gainers: positive day_change, sorted desc
+//   - losers:  negative day_change, sorted asc (most negative first)
+//
+// as_of_date = max price_date observed (used for staleness display).
+// ═══════════════════════════════════════════════════════════════
+export async function buildTopMovers(
+  db: SupabaseClient,
+  portfolios: PortfolioWithMeta[],
+): Promise<TopMoversData> {
+  const empty: TopMoversData = { gainers: [], losers: [], as_of_date: null }
+  if (portfolios.length === 0) return empty
+
+  const portfolioIds = portfolios.map(p => p.id)
+
+  // Pull equity holdings only
+  const { data: holds } = await db
+    .from('holdings')
+    .select('portfolio_id, instrument_id, quantity, avg_cost, instrument:instruments(name, type, sector, sleeve_id)')
+    .in('portfolio_id', portfolioIds)
+    .limit(50000)
+
+  // Aggregate quantity per instrument across firm
+  const qtyByInstr  = new Map<string, number>()
+  const portfoliosByInstr = new Map<string, Set<string>>()
+  const metaByInstr = new Map<string, { name: string; sector: string | null }>()
+
+  for (const h of (holds ?? []) as any[]) {
+    const sleeve = h.instrument?.sleeve_id
+    const itype  = h.instrument?.type
+    if (sleeve !== 'eq' && itype !== 'Stock') continue
+    const qty = num(h.quantity)
+    if (qty <= 0) continue
+    qtyByInstr.set(h.instrument_id, (qtyByInstr.get(h.instrument_id) ?? 0) + qty)
+    let pset = portfoliosByInstr.get(h.instrument_id)
+    if (!pset) { pset = new Set(); portfoliosByInstr.set(h.instrument_id, pset) }
+    pset.add(h.portfolio_id)
+    if (!metaByInstr.has(h.instrument_id)) {
+      metaByInstr.set(h.instrument_id, {
+        name:   h.instrument?.name ?? h.instrument_id,
+        sector: h.instrument?.sector ?? null,
+      })
+    }
+  }
+
+  if (qtyByInstr.size === 0) return empty
+
+  // Latest price per instrument (with day_change)
+  const instrIds = Array.from(qtyByInstr.keys())
+  const { data: prices } = await db
+    .from('market_prices')
+    .select('instrument_id, price, price_date, day_change')
+    .in('instrument_id', instrIds)
+    .order('price_date', { ascending: false })
+    .limit(50000)
+
+  // First-seen wins (rows are date-desc) → latest price per instrument
+  const latestByInstr = new Map<string, { price: number; day_change: number; price_date: string }>()
+  let maxPriceDate: string | null = null
+  for (const p of (prices ?? []) as any[]) {
+    if (latestByInstr.has(p.instrument_id)) continue
+    const px  = numOrNull(p.price)
+    const chg = numOrNull(p.day_change)
+    if (px === null || chg === null) continue
+    latestByInstr.set(p.instrument_id, {
+      price:      px,
+      day_change: chg,
+      price_date: p.price_date,
+    })
+    if (!maxPriceDate || p.price_date > maxPriceDate) maxPriceDate = p.price_date
+  }
+
+  // Build mover rows
+  const movers: MoverRow[] = []
+  for (const [instrId, qty] of qtyByInstr) {
+    const latest = latestByInstr.get(instrId)
+    if (!latest) continue
+    if (latest.day_change === 0) continue   // not a mover
+
+    const meta     = metaByInstr.get(instrId)!
+    const exposure = qty * latest.price
+    if (exposure <= 0) continue
+
+    const ngnImpact = exposure * (latest.day_change / 100)
+
+    movers.push({
+      instrument_id:     instrId,
+      name:              meta.name,
+      sector:            meta.sector,
+      day_change_pct:    latest.day_change,
+      latest_price:      latest.price,
+      price_date:        latest.price_date,
+      firm_exposure_ngn: exposure,
+      mandate_count:     portfoliosByInstr.get(instrId)?.size ?? 0,
+      ngn_impact:        ngnImpact,
+    })
+  }
+
+  // Split + sort + slice top 5 each
+  const gainers = movers
+    .filter(m => m.day_change_pct > 0)
+    .sort((a, b) => b.ngn_impact - a.ngn_impact)
+    .slice(0, 5)
+
+  const losers = movers
+    .filter(m => m.day_change_pct < 0)
+    .sort((a, b) => a.ngn_impact - b.ngn_impact)   // most negative first
+    .slice(0, 5)
+
+  return {
+    gainers,
+    losers,
+    as_of_date: maxPriceDate,
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// 16. v27c — buildFirmFIHoldings
+//
+// Aggregated FI holdings across all active portfolios.
+// One row per FI instrument actually held by ≥1 active portfolio.
+// Used by YieldCurvePanel firm overlay.
+// ═══════════════════════════════════════════════════════════════
+export async function buildFirmFIHoldings(
+  db: SupabaseClient,
+  portfolios: PortfolioWithMeta[]
+): Promise<FirmFIHolding[]> {
+  if (portfolios.length === 0) return []
+
+  const portfolioIds = portfolios.map(p => p.id)
+  const portfolioCodeMap = new Map(portfolios.map(p => [p.id, p.client_code]))
+
+  const { data: holds } = await db
+    .from('holdings')
+    .select('portfolio_id, instrument_id, quantity, instrument:instruments(name, sleeve_id)')
+    .in('portfolio_id', portfolioIds)
+    .limit(50000)
+
+  const qtyByInstr      = new Map<string, number>()
+  const namesByInstr    = new Map<string, string>()
+  const codesByInstr    = new Map<string, Set<string>>()
+
+  for (const h of (holds ?? []) as any[]) {
+    const sleeve = h.instrument?.sleeve_id
+    if (sleeve !== 'fi') continue
+    const qty = num(h.quantity)
+    if (qty <= 0) continue
+    qtyByInstr.set(h.instrument_id, (qtyByInstr.get(h.instrument_id) ?? 0) + qty)
+    if (!namesByInstr.has(h.instrument_id)) {
+      namesByInstr.set(h.instrument_id, h.instrument?.name ?? h.instrument_id)
+    }
+    let codes = codesByInstr.get(h.instrument_id)
+    if (!codes) { codes = new Set(); codesByInstr.set(h.instrument_id, codes) }
+    const code = portfolioCodeMap.get(h.portfolio_id)
+    if (code) codes.add(code)
+  }
+
+  const out: FirmFIHolding[] = []
+  for (const [id, q] of qtyByInstr) {
+    const codes = Array.from(codesByInstr.get(id) ?? []).sort()
+    out.push({
+      instrument_id:   id,
+      name:            namesByInstr.get(id) ?? id,
+      total_quantity:  q,
+      mandate_count:   codes.length,
+      portfolio_codes: codes,
+    })
+  }
+
+  return out.sort((a, b) => b.total_quantity - a.total_quantity)
 }

@@ -8,28 +8,23 @@ import MandateHealthGrid from '@/components/cockpit/MandateHealthGrid'
 import FeeOutlookPanel from '@/components/cockpit/FeeOutlookPanel'
 import IdleCashPanel from '@/components/cockpit/IdleCashPanel'
 import StaleReportsPanel from '@/components/cockpit/StaleReportsPanel'
+import SectorExposureGrid from '@/components/cockpit/SectorExposureGrid'
+import TopMoversPanel from '@/components/cockpit/TopMoversPanel'
 import type { MandateHealth } from '@/lib/mandate-health'
 import type { FeeOutlook } from '@/lib/fee-outlook'
+import type { SectorExposureData, TopMoversData } from '@/lib/cockpit-aggregations'
 
 // v27 — FIRM COCKPIT
+// v27c — Added Sector Exposure Grid, Top Movers, FI book overlay on yield curve.
 //
-// New home page. The thinking-tool above per-portfolio depth.
-// Three API calls, staggered:
-//   1. /api/cockpit/summary  — KPIs + AUM trend + allocation + idle cash + stale reports
-//   2. /api/cockpit/health   — Mandate Health Grid
-//   3. /api/cockpit/fee-outlook — Fee Outlook table
+// Five API calls, fired in parallel:
+//   1. /api/cockpit/summary         — KPIs + AUM trend + allocation + idle cash + stale reports
+//   2. /api/cockpit/health          — Mandate Health Grid
+//   3. /api/cockpit/fee-outlook     — Fee Outlook table
+//   4. /api/cockpit/sector-exposure — Sector heatmap (v27c)
+//   5. /api/cockpit/top-movers      — Daily NGN-impact movers (v27c)
 //
 // The pre-cockpit "All Portfolios" home is preserved at /portfolios.
-//
-// Surfaces:
-//   - 4 KPI tiles
-//   - Firm AUM trend (12mo line)
-//   - Firm allocation rollup donut
-//   - Mandate Health Grid (11 best-practice checks × portfolios)
-//   - Fee Outlook (DMA benchmark tracking)
-//   - Idle Cash flags
-//   - Stale Reports flags
-//   - FI yield curve panel (read-only universe view)
 
 const FirmAUMTrend         = dynamic(() => import('@/components/cockpit/FirmAUMTrend'),         { ssr: false })
 const FirmAllocationDonut  = dynamic(() => import('@/components/cockpit/FirmAllocationDonut'),  { ssr: false })
@@ -51,27 +46,35 @@ interface SummaryPayload {
 }
 
 export default function CockpitPage() {
-  const [summary, setSummary]           = useState<SummaryPayload | null>(null)
+  const [summary, setSummary]               = useState<SummaryPayload | null>(null)
   const [summaryLoading, setSummaryLoading] = useState(true)
 
-  const [health, setHealth]             = useState<MandateHealth[]>([])
-  const [healthLoading, setHealthLoading] = useState(true)
+  const [health, setHealth]                 = useState<MandateHealth[]>([])
+  const [healthLoading, setHealthLoading]   = useState(true)
 
-  const [feeOutlook, setFeeOutlook]     = useState<FeeOutlook[]>([])
-  const [feeLoading, setFeeLoading]     = useState(true)
+  const [feeOutlook, setFeeOutlook]         = useState<FeeOutlook[]>([])
+  const [feeLoading, setFeeLoading]         = useState(true)
 
-  const [refreshing, setRefreshing]     = useState(false)
+  // v27c — sector exposure + top movers state
+  const [sectorData, setSectorData]         = useState<SectorExposureData | null>(null)
+  const [sectorLoading, setSectorLoading]   = useState(true)
+
+  const [movers, setMovers]                 = useState<TopMoversData | null>(null)
+  const [moversLoading, setMoversLoading]   = useState(true)
+
+  const [refreshing, setRefreshing]         = useState(false)
 
   const loadAll = useCallback(async () => {
     setRefreshing(true)
     setSummaryLoading(true); setHealthLoading(true); setFeeLoading(true)
+    setSectorLoading(true); setMoversLoading(true)
 
-    // Fire all three in parallel — they read from the same tables but
-    // each endpoint is independent so failures are isolated.
-    const [sRes, hRes, fRes] = await Promise.allSettled([
+    const [sRes, hRes, fRes, secRes, movRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
       fetch('/api/cockpit/health').then(r => r.json()),
       fetch('/api/cockpit/fee-outlook').then(r => r.json()),
+      fetch('/api/cockpit/sector-exposure').then(r => r.json()),
+      fetch('/api/cockpit/top-movers').then(r => r.json()),
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -82,6 +85,12 @@ export default function CockpitPage() {
 
     if (fRes.status === 'fulfilled' && !fRes.value.error) setFeeOutlook(fRes.value.portfolios ?? [])
     setFeeLoading(false)
+
+    if (secRes.status === 'fulfilled' && !secRes.value.error) setSectorData(secRes.value)
+    setSectorLoading(false)
+
+    if (movRes.status === 'fulfilled' && !movRes.value.error) setMovers(movRes.value)
+    setMoversLoading(false)
 
     setRefreshing(false)
   }, [])
@@ -174,6 +183,26 @@ export default function CockpitPage() {
             <MandateHealthGrid loading={healthLoading} data={health} />
           </div>
 
+          {/* v27c — Sector Exposure Grid */}
+          <div className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <div className="panel-title">Sector Exposure Grid</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                  Equity sleeve only · NGX sectors sorted by firm-wide concentration · click mandate to drill in
+                </div>
+              </div>
+              <div className="panel-meta">
+                {sectorLoading
+                  ? 'Loading…'
+                  : sectorData
+                    ? `${sectorData.sectors.length} sector${sectorData.sectors.length === 1 ? '' : 's'} · ${sectorData.portfolios.length} mandate${sectorData.portfolios.length === 1 ? '' : 's'}`
+                    : '—'}
+              </div>
+            </div>
+            <SectorExposureGrid loading={sectorLoading} data={sectorData} />
+          </div>
+
           {/* Fee Outlook */}
           <div className="panel" style={{ marginBottom: 20 }}>
             <div className="panel-header">
@@ -188,6 +217,26 @@ export default function CockpitPage() {
               </div>
             </div>
             <FeeOutlookPanel loading={feeLoading} data={feeOutlook} />
+          </div>
+
+          {/* v27c — Top Movers */}
+          <div className="panel" style={{ marginBottom: 20 }}>
+            <div className="panel-header">
+              <div>
+                <div className="panel-title">Top Movers — firm book today</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                  Equities ranked by NGN impact (exposure × day-change) · top 5 each side
+                </div>
+              </div>
+              <div className="panel-meta">
+                {moversLoading
+                  ? 'Loading…'
+                  : movers
+                    ? `${movers.gainers.length} gainers · ${movers.losers.length} losers`
+                    : '—'}
+              </div>
+            </div>
+            <TopMoversPanel loading={moversLoading} data={movers} />
           </div>
 
           {/* Idle Cash + Stale Reports */}
@@ -222,8 +271,8 @@ export default function CockpitPage() {
             </div>
           </div>
 
-          {/* FI yield curve — book context, universe view (no overlay in v27) */}
-          <YieldCurvePanel />
+          {/* v27c — FI yield curve with firm-wide overlay */}
+          <YieldCurvePanel firmOverlay />
 
         </main>
       </div>
