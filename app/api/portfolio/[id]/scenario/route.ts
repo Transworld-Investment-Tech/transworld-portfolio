@@ -2,8 +2,11 @@ import { NextRequest } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
 import { supabaseAdmin } from '@/lib/supabase'
 import { buildScenarioPrompt, type ScenarioInput } from '@/lib/scenario-engine'
+import { fetchFIUniverse } from '@/lib/fi-context'
 
 // v21y: Portfolio Scenario Analysis — streaming POST endpoint.
+// v23: FI universe injected via fetchFIUniverse (pulled alongside other
+//      context in the initial Promise.all).
 //
 // Request body: { scenario: string }
 // Response: NDJSON stream of { t: 'delta', x: '...' } messages during
@@ -38,11 +41,13 @@ export async function POST(
 
   const db = supabaseAdmin()
 
-  const [portRes, holdRes, sleeveRes, watchRes, fxRes] = await Promise.all([
+  // v23: fiUniverse added to parallel fetch
+  const [portRes, holdRes, sleeveRes, watchRes, fiUniverse, fxRes] = await Promise.all([
     db.from('portfolios').select('*, client:clients(name,code,type)').eq('id', portfolioId).single(),
     db.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId),
     db.from('sleeve_targets').select('*').eq('portfolio_id', portfolioId).order('sort_order'),
     db.from('watchlist').select('ticker, name, section, sub_type, rank, rationale').eq('active', true).order('rank'),
+    fetchFIUniverse(db),
     fetch('https://api.exchangerate-api.com/v4/latest/USD').then(r => r.json()).catch(() => null),
   ])
 
@@ -124,8 +129,9 @@ export async function POST(
     },
     holdings,
     sleeves,
-    watchlist: watchRes.data ?? [],
-    fxRate:    fxRes?.rates?.NGN ?? null,
+    watchlist:  watchRes.data ?? [],
+    fiUniverse,                                  // v23
+    fxRate:     fxRes?.rates?.NGN ?? null,
     scenario,
   }
 

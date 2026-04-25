@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { buildCashFlows, solveIRR } from '@/lib/analytics'
 import { generateConsolidatedReport } from '@/lib/consolidated-report'
+import { fetchFIUniverse } from '@/lib/fi-context'
 
 // v21k: /api/clients/[clientId]/report
+// v23: FI universe injected via fetchFIUniverse.
 //   GET  — fetch saved consolidated reports for this client
 //   POST — generate + save a consolidated AI report
 
@@ -82,8 +84,9 @@ export async function POST(
 
   const portfolioIds = portfolios.map((p: any) => p.id as string)
 
-  // ── 2. Holdings + prices + transactions + watchlist + FX ──────────────
-  const [holdRes, pricesRes, txRes, watchlistRes, fxRes] = await Promise.all([
+  // ── 2. Holdings + prices + transactions + watchlist + FI + FX ──────────
+  // v23: fiUniverse added to this parallel batch.
+  const [holdRes, pricesRes, txRes, watchlistRes, fiUniverse, fxRes] = await Promise.all([
     db.from('holdings')
       .select('portfolio_id, instrument_id, quantity, avg_cost, sleeve_id, instrument:instruments(name, type, sector, coupon_pct)')
       .in('portfolio_id', portfolioIds),
@@ -98,6 +101,7 @@ export async function POST(
       .select('ticker, name, section, sub_type, rank, rationale')
       .eq('active', true)
       .order('rank'),
+    fetchFIUniverse(db),
     fetch('https://api.exchangerate-api.com/v4/latest/USD').then(r => r.json()).catch(() => null),
   ])
 
@@ -180,6 +184,7 @@ export async function POST(
     combinedHoldings,
     reportType,
     watchlist: watchlistRes.data ?? [],
+    fiUniverse,                         // v23: FI yields universe
     fxRate: fxRes?.rates?.NGN,
   })
 

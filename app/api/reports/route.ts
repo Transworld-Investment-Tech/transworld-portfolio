@@ -1,7 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { generateAIReport, type ReportType } from '@/lib/report-engine'
+import { fetchFIUniverse } from '@/lib/fi-context'
 
+// v23: FI universe injected into report prompt via fetchFIUniverse.
 // Extend Vercel serverless function timeout to 5 minutes for long AI report generation
 export const maxDuration = 300
 
@@ -45,8 +47,9 @@ export async function POST(req: NextRequest) {
 
     const heldInstrumentIds = (holdRes.data ?? []).map((h: any) => h.instrument_id as string)
 
-    // ── Stage 2: prices (filtered), sleeves, watchlist, FX in parallel ────
-    const [sleeveRes, pricesRes, watchlistRes, fxRes] = await Promise.all([
+    // ── Stage 2: prices (filtered), sleeves, watchlist, FI, FX in parallel ────
+    // v23: fiUniverse added to this stage.
+    const [sleeveRes, pricesRes, watchlistRes, fiUniverse, fxRes] = await Promise.all([
       db.from('sleeve_targets')
         .select('*')
         .eq('portfolio_id', portfolioId)
@@ -61,6 +64,7 @@ export async function POST(req: NextRequest) {
         .select('ticker, name, section, sub_type, rank, rationale')
         .eq('active', true)
         .order('rank'),
+      fetchFIUniverse(db),
       fetch('https://api.exchangerate-api.com/v4/latest/USD')
         .then(r => r.json())
         .catch(() => null),
@@ -90,6 +94,7 @@ export async function POST(req: NextRequest) {
       watchlist:    watchlistRes.data || [],
       transactions: txRes.data || [],      // v21n: now populated
       navHistory:   navRes.data || [],     // v21n: now populated
+      fiUniverse,                           // v23: FI yields universe
     })
 
     // Save to reports table

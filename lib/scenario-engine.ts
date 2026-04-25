@@ -1,6 +1,9 @@
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
+import type { FIInstrument } from './fi-context'
+import { buildFIContextBlock } from './fi-context'
 
 // v21y: Portfolio Scenario Analysis engine.
+// v23: FI universe with current yields injected (buildFIContextBlock).
 //
 // Ephemeral, interactive, client-facing analysis triggered from the Portfolio
 // Overview. First real use case is for Kenneth Okafor — how a ₦20M addition
@@ -74,6 +77,7 @@ export interface ScenarioInput {
   holdings:    ScenarioHolding[]
   sleeves:     ScenarioSleeve[]
   watchlist:   ScenarioWatchItem[]
+  fiUniverse:  FIInstrument[]          // v23: FI yields universe
   fxRate:      number | null
   scenario:    string
 }
@@ -87,7 +91,7 @@ function fmtPct(n: number, digits = 1): string {
 }
 
 export function buildScenarioPrompt(input: ScenarioInput): string {
-  const { portfolio, holdings, sleeves, watchlist, fxRate, scenario } = input
+  const { portfolio, holdings, sleeves, watchlist, fiUniverse, fxRate, scenario } = input
 
   const today  = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
   const equities = holdings.filter(h => h.type === 'Stock')
@@ -130,6 +134,9 @@ export function buildScenarioPrompt(input: ScenarioInput): string {
       ? ['  Eagle-eye pipeline: ' + watchEagle.map(w => w.name).join(', ')]
       : []),
   ].join('\n')
+
+  // v23: FI universe block (current market yields for the ~60 active FI names)
+  const fiBlock = buildFIContextBlock(fiUniverse)
 
   return `You are a senior portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria.
 You are producing a scenario analysis for a specific client portfolio. The output will be shared
@@ -178,6 +185,7 @@ ${fixedIncBlock}
 
 WATCHLIST CONTEXT:
 ${watchBlock}
+${fiBlock}
 
 STEP 3 \u2014 THE SCENARIO
 
@@ -206,7 +214,9 @@ scenario, give a realistic range and the drivers. Be specific. Use numbers.
 Concrete, actionable proposals. For capital additions, specify tickers and naira amounts
 (a compact allocation table is appropriate here). For macro scenarios, specify trades to
 consider (buy/trim/hedge) with sizes. Cross-reference the Transworld watchlist \u2014 prefer
-names on the watchlist for any new buy recommendations. Every recommendation must have a
+names on the watchlist for any new buy recommendations. For any fixed income recommendation,
+cite a specific instrument from the FIXED INCOME UNIVERSE above with its current yield and
+tenor \u2014 match tenor to the scenario's time horizon. Every recommendation must have a
 one-sentence rationale.
 
 ## Risks and Considerations

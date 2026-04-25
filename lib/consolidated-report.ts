@@ -1,7 +1,11 @@
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
+import type { FIInstrument } from './fi-context'
+import { buildFIContextBlock } from './fi-context'
 
 // v21k: generateConsolidatedReport()
+// v23: FI universe with current yields injected (buildFIContextBlock).
+//
 // Parallel to generateAIReport() in lib/report-engine.ts but adapted for
 // a multi-portfolio consolidated view. Covers all active portfolios for
 // a client in a single report with per-portfolio breakdown, combined
@@ -34,6 +38,7 @@ export interface ConsolidatedReportInput {
     ticker: string; name: string; section: string
     sub_type: string | null; rank: number; rationale: string | null
   }>
+  fiUniverse?: FIInstrument[]   // v23: FI yields universe
   fxRate?: number
 }
 
@@ -101,13 +106,14 @@ function buildConsolidatedWatchlistContext(
 
 export async function generateConsolidatedReport(input: ConsolidatedReportInput): Promise<string> {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
-  const { portfolios, summary, combinedHoldings, reportType, watchlist, fxRate } = input
+  const { portfolios, summary, combinedHoldings, reportType, watchlist, fiUniverse, fxRate } = input
 
   const period  = periodLabel(reportType)
   const today   = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
   const equities = combinedHoldings.filter(h => h.type === 'Stock')
   const tickers  = equities.map(h => h.instrument_id).join(', ')
   const watchCtx = buildConsolidatedWatchlistContext(combinedHoldings, watchlist)
+  const fiContext = buildFIContextBlock(fiUniverse ?? [])   // v23
 
   const prompt = `You are a senior investment analyst and portfolio strategist at Transworld Investment and Securities, Lagos, Nigeria. You have deep expertise in Nigerian capital markets — NGX equities, FGN bonds, NTBs, CBN monetary policy, and discretionary portfolio management.
 
@@ -119,13 +125,13 @@ Generated: ${today}
 ═══════════════════════════════════════════════════════
 CLIENT: ${input.client.name} (${input.client.code}) — ${input.client.type}
 MANDATE TYPE: ${input.client.type}
-FX RATE: ${fxRate ? `₦${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
+FX RATE: ${fxRate ? `\u20a6${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
 ═══════════════════════════════════════════════════════
 
 CONSOLIDATED PERFORMANCE SUMMARY:
-  Total starting NAV:  ₦${(summary.totalStartingNAV / 1e6).toFixed(2)}M
-  Total current NAV:   ₦${(summary.totalNAV / 1e6).toFixed(2)}M
-  Combined P&L:        ₦${(summary.totalPnL / 1e6).toFixed(2)}M  (${fmtPct(summary.totalPnLPct)} total return)
+  Total starting NAV:  \u20a6${(summary.totalStartingNAV / 1e6).toFixed(2)}M
+  Total current NAV:   \u20a6${(summary.totalNAV / 1e6).toFixed(2)}M
+  Combined P&L:        \u20a6${(summary.totalPnL / 1e6).toFixed(2)}M  (${fmtPct(summary.totalPnLPct)} total return)
   Blended IRR:         ${summary.blendedIRR !== null ? (summary.blendedIRR * 100).toFixed(1) + '%' : 'N/A'} p.a. (Newton-Raphson; merged cash flows across all portfolios)
   Active portfolios:   ${portfolios.length}
 
@@ -134,29 +140,30 @@ ${portfolios.map(p => {
   const gain    = p.current_nav - p.starting_nav
   const gainPct = p.starting_nav > 0 ? gain / p.starting_nav : 0
   return `  Portfolio ${p.label} — ${p.name}
-    Starting NAV: ₦${(p.starting_nav / 1e6).toFixed(2)}M  (${p.start_date ?? 'N/A'})
-    Current NAV:  ₦${(p.current_nav / 1e6).toFixed(2)}M
-    P&L:          ₦${(gain / 1e6).toFixed(2)}M  (${gainPct >= 0 ? '+' : ''}${(gainPct * 100).toFixed(1)}%)
+    Starting NAV: \u20a6${(p.starting_nav / 1e6).toFixed(2)}M  (${p.start_date ?? 'N/A'})
+    Current NAV:  \u20a6${(p.current_nav / 1e6).toFixed(2)}M
+    P&L:          \u20a6${(gain / 1e6).toFixed(2)}M  (${gainPct >= 0 ? '+' : ''}${(gainPct * 100).toFixed(1)}%)
     Income target: ${fmtPct(p.income_target)} p.a.`
 }).join('\n\n')}
 
 COMBINED EQUITY HOLDINGS (${equities.length} positions — ${tickers}):
 ${equities.map(h => {
   const pnlPct = h.blendedAvgCost > 0 ? (h.latestPrice - h.blendedAvgCost) / h.blendedAvgCost : 0
-  const inPortfolios = h.breakdown.map(b => `Port.${b.label}: ${Math.round(b.quantity).toLocaleString()} @ ₦${b.avgCost.toFixed(2)}`).join(' | ')
+  const inPortfolios = h.breakdown.map(b => `Port.${b.label}: ${Math.round(b.quantity).toLocaleString()} @ \u20a6${b.avgCost.toFixed(2)}`).join(' | ')
   return `  ${h.instrument_id} (${h.name}):
-    Total: ${Math.round(h.totalQuantity).toLocaleString()} shares | blended cost ₦${h.blendedAvgCost.toFixed(2)} | price ₦${h.latestPrice.toFixed(2)}
-    Value: ₦${(h.totalValue / 1e6).toFixed(2)}M | weight: ${(h.weight * 100).toFixed(1)}% | unrealised: ${h.totalPnL >= 0 ? '+' : ''}₦${(h.totalPnL / 1e6).toFixed(2)}M (${pnlPct >= 0 ? '+' : ''}${(pnlPct * 100).toFixed(1)}%)
+    Total: ${Math.round(h.totalQuantity).toLocaleString()} shares | blended cost \u20a6${h.blendedAvgCost.toFixed(2)} | price \u20a6${h.latestPrice.toFixed(2)}
+    Value: \u20a6${(h.totalValue / 1e6).toFixed(2)}M | weight: ${(h.weight * 100).toFixed(1)}% | unrealised: ${h.totalPnL >= 0 ? '+' : ''}\u20a6${(h.totalPnL / 1e6).toFixed(2)}M (${pnlPct >= 0 ? '+' : ''}${(pnlPct * 100).toFixed(1)}%)
     By portfolio: ${inPortfolios}`
 }).join('\n\n')}
 
 ${combinedHoldings.filter(h => h.type !== 'Stock').length > 0
   ? 'FIXED INCOME / CASH:\n' + combinedHoldings.filter(h => h.type !== 'Stock').map(h =>
-      `  ${h.name}: ₦${(h.totalValue / 1e6).toFixed(2)}M | yield ${(h as any).coupon_pct ?? 0}%`
+      `  ${h.name}: \u20a6${(h.totalValue / 1e6).toFixed(2)}M | yield ${(h as any).coupon_pct ?? 0}%`
     ).join('\n')
   : 'FIXED INCOME / CASH: None held across any portfolio.'}
 
 ${watchCtx}
+${fiContext}
 
 ═══════════════════════════════════════════════════════
 REPORT STRUCTURE (write in clean markdown with ## headers)
@@ -168,7 +175,7 @@ REPORT STRUCTURE (write in clean markdown with ## headers)
 ## CONSOLIDATED PERFORMANCE REVIEW
 Total NAV, combined P&L, blended IRR vs mandate targets.
 Which portfolio is the strongest performer and why?
-Are combined income targets being met? Shortfall in ₦.
+Are combined income targets being met? Shortfall in \u20a6.
 
 ## PORTFOLIO-BY-PORTFOLIO BREAKDOWN
 For each portfolio (${portfolios.map(p => `Portfolio ${p.label}`).join(', ')}):
@@ -188,7 +195,8 @@ NGX YTD performance, sector rotation, banking recapitalisation progress.
 How does the combined equity book position the client vs the broader market?
 
 ### Fixed Income Opportunity
-NTB 364D at ~18.47%, FGN 10yr at ~16.06%.
+Reference the FIXED INCOME UNIVERSE block above — cite specific instruments with their
+current market yields rather than abstract rate anchors.
 For this client's combined NAV — what is the total income foregone by being underweight fixed income?
 
 ### FX & Macro Risks
@@ -213,16 +221,18 @@ For each stock held across all portfolios (${tickers}):
 - Is there any duplication risk — same position in multiple portfolios where consolidation/rebalancing would be more efficient?
 - Any holding NOT on the watchlist across any portfolio?
 
-### Fixed Income Gap vs FI Watchlist
-Given the combined FI exposure — what specific instruments from the FI watchlist should be prioritised for the combined mandate?
+### Fixed Income Gap vs FI Watchlist and Universe
+Given the combined FI exposure — using the FIXED INCOME UNIVERSE above, recommend 2-4 specific
+instruments to prioritise for the combined mandate. Cite ticker, current yield, and tenor
+rationale. Flag any recommendation that relies on a \u26a0-tagged line with a liquidity caveat.
 
 ## CONSOLIDATED RISK & COMPLIANCE
-Check each portfolio's mandate limits. Flag any breaches with specific ₦ amounts.
+Check each portfolio's mandate limits. Flag any breaches with specific \u20a6 amounts.
 Flag any cross-portfolio concentration that may not be visible at individual level.
 
 ## REBALANCING & ACTION PLAN
 Concrete trades across portfolios. Prioritise by urgency.
-Where to trim, where to add — with ₦ sizes and which portfolio executes.
+Where to trim, where to add — with \u20a6 sizes and which portfolio executes.
 
 ## PORTFOLIO MANAGER ACTION LIST
 1–5 actions ranked by urgency. Format:
@@ -235,7 +245,7 @@ Key data events and watchlist triggers to monitor.
 ---
 *Consolidated report generated ${today} | Transworld Investment and Securities — Discretionary Account Management*
 *Covers: ${portfolios.map(p => `Portfolio ${p.label} (${p.name})`).join(', ')}*
-*Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). Valuations are analytical estimates.*
+*Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). FI Universe: ${(fiUniverse ?? []).length} instruments. Valuations are analytical estimates.*
 *All investment decisions remain at the discretion of the portfolio manager.*`
 
   const response = await client.messages.create({

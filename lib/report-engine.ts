@@ -2,8 +2,11 @@ import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
 import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
 import { buildCashFlows, solveIRR } from './analytics'
+import type { FIInstrument } from './fi-context'
+import { buildFIContextBlock } from './fi-context'
 
 // v21n: Critical fix to the performance section of the AI report prompt.
+// v23: FI universe with current yields injected (buildFIContextBlock).
 //
 // BEFORE: The prompt showed (currentNAV − startingNAV) / startingNAV as
 // "Total P&L" with a percentage — e.g. +20,090% for OOO Portfolio A.
@@ -43,6 +46,7 @@ export interface ReportInput {
   transactions?: any[]
   navHistory?:   any[]
   watchlist?:    WatchlistItem[]
+  fiUniverse?:   FIInstrument[]   // v23: FI yields universe
 }
 
 function periodLabel(type: ReportType, from?: string, to?: string): string {
@@ -97,7 +101,7 @@ function computePerformanceMetrics(portfolio: Portfolio, transactions: any[], cu
   const inflowRatio     = starting > 0 ? totalInflows / starting : 0
   const hprIsDistorted  = rawHPR !== null && Math.abs(rawHPR) > 2 && inflowRatio > 1
   const hprDistortionNote = hprIsDistorted
-    ? `Raw HPR is distorted because ₦${(totalInflows/1e6).toFixed(2)}M was added as capital (${inflowRatio.toFixed(1)}× the starting NAV of ₦${(starting/1e6).toFixed(2)}M). This capital growth inflates the simple ratio. DO NOT cite ${(rawHPR! * 100).toFixed(0)}% as the portfolio return.`
+    ? `Raw HPR is distorted because \u20a6${(totalInflows/1e6).toFixed(2)}M was added as capital (${inflowRatio.toFixed(1)}\u00d7 the starting NAV of \u20a6${(starting/1e6).toFixed(2)}M). This capital growth inflates the simple ratio. DO NOT cite ${(rawHPR! * 100).toFixed(0)}% as the portfolio return.`
     : ''
 
   // ITD IRR via Newton-Raphson — accounts for timing and size of all flows
@@ -175,7 +179,7 @@ function buildWatchlistContext(
     '2. In your opportunity section, identify the TOP 3 watchlist names not in the portfolio most relevant to this mandate.',
     '3. Flag any portfolio holding not on the watchlist and explain why it may or may not be concerning.',
     '4. Reference the eagle-eye items in your macro/forward guidance section.',
-    '5. For fixed income: cross-reference the FI watchlist with any fixed income gaps in the portfolio.',
+    '5. For fixed income: cross-reference the FI watchlist with any fixed income gaps in the portfolio, AND use the FIXED INCOME UNIVERSE block below to cite specific instruments with current market yields.',
     '═══════════════════════════════════════════════════════',
   ]
 
@@ -186,7 +190,7 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
   const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   const {
     portfolio, holdings, sleeveDefs, reportType,
-    dateFrom, dateTo, fxRate, transactions, navHistory, watchlist,
+    dateFrom, dateTo, fxRate, transactions, navHistory, watchlist, fiUniverse,
   } = input
 
   const tot    = computeNAV(holdings)
@@ -204,7 +208,7 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
   // NAV history summary (now populated since route fetches nav_log)
   const navSummary = navHistory && navHistory.length > 0
     ? '\nNAV HISTORY:\n' + navHistory.map((n: any) =>
-        `  ${n.nav_date}: ₦${(n.nav_value/1e6).toFixed(2)}M${n.notes ? ' — ' + n.notes : ''}`
+        `  ${n.nav_date}: \u20a6${(n.nav_value/1e6).toFixed(2)}M${n.notes ? ' — ' + n.notes : ''}`
       ).join('\n')
     : ''
 
@@ -214,12 +218,15 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
     .slice(-20)
   const txSummary = recentTx.length > 0
     ? '\nRECENT TRANSACTIONS (last 20 buy/sell/transfer events):\n' + recentTx.map((t: any) =>
-        `  ${t.trade_date} | ${t.action} | ${t.instrument_id || '—'} | ${t.quantity ? Number(t.quantity).toLocaleString() + ' @ ₦' + Number(t.price || 0).toFixed(2) : '₦' + Number(t.amount || 0).toLocaleString()} | fees: ₦${Number(t.fees || 0).toLocaleString()}`
+        `  ${t.trade_date} | ${t.action} | ${t.instrument_id || '—'} | ${t.quantity ? Number(t.quantity).toLocaleString() + ' @ \u20a6' + Number(t.price || 0).toFixed(2) : '\u20a6' + Number(t.amount || 0).toLocaleString()} | fees: \u20a6${Number(t.fees || 0).toLocaleString()}`
       ).join('\n')
     : ''
 
   // Watchlist context
   const watchlistContext = buildWatchlistContext(holdings, watchlist ?? [], reportType)
+
+  // v23: FI universe block
+  const fiContext = buildFIContextBlock(fiUniverse ?? [])
 
   // ── v21n: Performance section for the prompt ──────────────────────────────
   // IRR is the headline. Raw HPR is shown for context with explicit warnings
@@ -231,8 +238,8 @@ PORTFOLIO PERFORMANCE — CRITICAL: READ CAREFULLY BEFORE ANALYSING
 ═══════════════════════════════════════════════════════
 
 STARTING POINT:
-  Starting NAV:    ₦${(portfolio.starting_nav/1e6).toFixed(2)}M  (inception ${portfolio.start_date})
-  Current NAV:     ₦${(tot/1e6).toFixed(2)}M
+  Starting NAV:    \u20a6${(portfolio.starting_nav/1e6).toFixed(2)}M  (inception ${portfolio.start_date})
+  Current NAV:     \u20a6${(tot/1e6).toFixed(2)}M
 
 HEADLINE RETURN METRIC — USE THIS IN YOUR ANALYSIS:
   ITD IRR (p.a.):  ${perf.itdIRR !== null ? ((perf.itdIRR * 100).toFixed(2) + '% per annum') : 'N/A (insufficient cash flow data)'}
@@ -241,20 +248,20 @@ HEADLINE RETURN METRIC — USE THIS IN YOUR ANALYSIS:
   This is the correct metric to cite when discussing portfolio performance.
 
 ABSOLUTE P&L (net of external flows):
-  ₦${perf.absoluteReturn !== null ? ((perf.absoluteReturn >= 0 ? '+' : '') + (perf.absoluteReturn/1e6).toFixed(2) + 'M') : 'N/A'}
+  \u20a6${perf.absoluteReturn !== null ? ((perf.absoluteReturn >= 0 ? '+' : '') + (perf.absoluteReturn/1e6).toFixed(2) + 'M') : 'N/A'}
   = (Current NAV − Starting NAV) − Net capital additions
   This is the investment gain attributable to portfolio management decisions.
 
 EXTERNAL CAPITAL FLOWS SINCE INCEPTION:
-  Total inflows (TRANSFER_IN):  ₦${(perf.totalInflows/1e6).toFixed(2)}M
-  Total outflows (TRANSFER_OUT): ₦${(perf.totalOutflows/1e6).toFixed(2)}M
-  Net capital added:             ₦${(perf.netCashFlows >= 0 ? '+' : '') + (perf.netCashFlows/1e6).toFixed(2)}M
+  Total inflows (TRANSFER_IN):  \u20a6${(perf.totalInflows/1e6).toFixed(2)}M
+  Total outflows (TRANSFER_OUT): \u20a6${(perf.totalOutflows/1e6).toFixed(2)}M
+  Net capital added:             \u20a6${(perf.netCashFlows >= 0 ? '+' : '') + (perf.netCashFlows/1e6).toFixed(2)}M
 
 RAW HPR — CONTEXT ONLY, DO NOT USE AS PRIMARY RETURN METRIC:
   Raw HPR: ${perf.rawHPR !== null ? ((perf.rawHPR * 100).toFixed(2) + '%') : 'N/A'}
   = (Current NAV − Starting NAV) / Starting NAV
   This is NOT adjusted for the timing or size of capital additions.
-${perf.hprIsDistorted ? `  ⚠️  WARNING: ${perf.hprDistortionNote}` : '  This metric is reasonable for this portfolio — capital flows were not large enough to significantly distort it.'}
+${perf.hprIsDistorted ? `  \u26a0\ufe0f  WARNING: ${perf.hprDistortionNote}` : '  This metric is reasonable for this portfolio — capital flows were not large enough to significantly distort it.'}
 
 INSTRUCTION TO AI: When writing this report, always cite the ITD IRR as the portfolio's return.
 Never present the Raw HPR as the portfolio's performance. If you reference any return percentage,
@@ -274,7 +281,7 @@ PORTFOLIO DATA
 CLIENT: ${(portfolio as any).client?.name ?? 'N/A'}
 PORTFOLIO: ${portfolio.name}
 CURRENCY: ${portfolio.currency}
-FX RATE: ${fxRate ? `₦${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
+FX RATE: ${fxRate ? `\u20a6${Math.round(fxRate).toLocaleString()}/USD` : 'N/A'}
 ${performanceSection}
 
 MANDATE:
@@ -286,7 +293,7 @@ MANDATE:
   DD action:      ${fmt.pct(portfolio.dd_action)}
 
 SLEEVE ALLOCATION:
-${sv.map((s: any) => `  ${s.name}: ${fmt.pct(s.act)} actual vs ${fmt.pct(s.target_pct)} target | ₦${(s.val/1e6).toFixed(2)}M | ${s.status} | diff: ${(s.diff>=0?'+':'')}₦${(Math.abs(s.diff)/1e6).toFixed(2)}M`).join('\n')}
+${sv.map((s: any) => `  ${s.name}: ${fmt.pct(s.act)} actual vs ${fmt.pct(s.target_pct)} target | \u20a6${(s.val/1e6).toFixed(2)}M | ${s.status} | diff: ${(s.diff>=0?'+':'')}\u20a6${(Math.abs(s.diff)/1e6).toFixed(2)}M`).join('\n')}
 
 EQUITY HOLDINGS:
 ${equities.map(h => {
@@ -294,15 +301,16 @@ ${equities.map(h => {
   const v = h.quantity * p
   const pnl = h.quantity * (p - h.avg_cost)
   return `  ${h.instrument_id} (${h.instrument?.name}):
-    ${Math.round(h.quantity).toLocaleString()} shares | avg cost ₦${h.avg_cost.toFixed(2)} | price ₦${p.toFixed(2)}
-    value ₦${(v/1e6).toFixed(2)}M | weight ${(v/tot*100).toFixed(1)}% | unrealised P&L ${pnl>=0?'+':''}₦${(pnl/1e6).toFixed(2)}M (${((p-h.avg_cost)/h.avg_cost*100).toFixed(1)}%)`
+    ${Math.round(h.quantity).toLocaleString()} shares | avg cost \u20a6${h.avg_cost.toFixed(2)} | price \u20a6${p.toFixed(2)}
+    value \u20a6${(v/1e6).toFixed(2)}M | weight ${(v/tot*100).toFixed(1)}% | unrealised P&L ${pnl>=0?'+':''}\u20a6${(pnl/1e6).toFixed(2)}M (${((p-h.avg_cost)/h.avg_cost*100).toFixed(1)}%)`
 }).join('\n\n')}
 
 FIXED INCOME / CASH:
-${fixedInc.length > 0 ? fixedInc.map(h => `  ${h.instrument?.name}: ₦${(h.quantity/1e6).toFixed(2)}M face | yield ${h.instrument?.coupon_pct ?? 0}%`).join('\n') : '  None held — cash only'}
+${fixedInc.length > 0 ? fixedInc.map(h => `  ${h.instrument?.name}: \u20a6${(h.quantity/1e6).toFixed(2)}M face | yield ${h.instrument?.coupon_pct ?? 0}%`).join('\n') : '  None held — cash only'}
 ${navSummary}
 ${txSummary}
 ${watchlistContext}
+${fiContext}
 
 ═══════════════════════════════════════════════════════
 REPORT STRUCTURE (write in clean markdown with ## headers)
@@ -314,7 +322,7 @@ When citing the portfolio's return, use the ITD IRR (${perf.itdIRR !== null ? (p
 
 ## PORTFOLIO PERFORMANCE REVIEW
 Lead with the ITD IRR as the headline return metric.
-Then discuss absolute ₦ P&L (net of external flows).
+Then discuss absolute \u20a6 P&L (net of external flows).
 Provide context on why the portfolio's Raw HPR looks the way it does (capital flows).
 Analyse returns vs mandate targets. NAV trajectory from history (if available). Income target tracking.
 
@@ -329,7 +337,9 @@ Your knowledge of NGX YTD performance, sector dynamics, banking recapitalisation
 How does this portfolio's equity positioning fit the current backdrop?
 
 ### Fixed Income Opportunity
-NTB 364D at ~18.47%, FGN 10yr at ~16.06%. Real yields. Duration positioning.
+Reference the FIXED INCOME UNIVERSE block above — cite specific instruments with their
+current market yields (e.g. "FG212035S1 at 19.42% in the 8-9yr belly"). Do not quote
+abstract rate anchors; use the actual quoted yields from the universe.
 For this portfolio specifically — what is the income foregone by being underweight fixed income?
 
 ### FX & Macro Risks
@@ -364,16 +374,19 @@ Identify the 3–5 most compelling watchlist equities NOT currently held. For ea
 Which of the eagle-eye watch items (if any) from the watchlist are most relevant to monitor for this portfolio over the next quarter?
 
 ## FIXED INCOME & CASH ANALYSIS
-Assess against mandate. Quantify income foregone. Recommend specific instruments from the FI watchlist.
-If the FI watchlist has relevant state or corporate bonds not in portfolio, mention them.
+Assess against mandate. Quantify income foregone.
+Using the FIXED INCOME UNIVERSE block, recommend 2-4 specific instruments appropriate for
+this portfolio's tenor preferences and income target. Cite ticker and current yield.
+Flag any recommendation that relies on a \u26a0-tagged line by explicitly noting the liquidity caveat.
 
 ## RISK & COMPLIANCE REVIEW
 Each risk limit — is it breached? By how much? What action does it require?
-Specific ₦ amounts for any breach.
+Specific \u20a6 amounts for any breach.
 
 ## REBALANCING RECOMMENDATIONS
-Concrete trades with approximate ₦ sizes.
-Prioritise by urgency. Cross-reference watchlist for the buys.
+Concrete trades with approximate \u20a6 sizes.
+Prioritise by urgency. Cross-reference watchlist for the buys. For FI buys, cite specific
+instruments and yields from the FIXED INCOME UNIVERSE.
 
 ## PORTFOLIO MANAGER ACTION LIST
 1–5 actions ranked by urgency. Format:
@@ -387,7 +400,7 @@ Include any eagle-eye watchlist items approaching a trigger point.
 ---
 *Report generated ${today} | Transworld Investment and Securities — Discretionary Account Management*
 *Performance: ITD IRR ${perf.itdIRR !== null ? (perf.itdIRR * 100).toFixed(2) + '% p.a.' : 'N/A'} (Money-Weighted Return, Newton-Raphson). Valuations are analytical estimates.*
-*Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities).*
+*Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). FI Universe: ${(fiUniverse ?? []).length} instruments.*
 *All investment decisions remain at the discretion of the portfolio manager.*`
 
   const response = await client.messages.create({
