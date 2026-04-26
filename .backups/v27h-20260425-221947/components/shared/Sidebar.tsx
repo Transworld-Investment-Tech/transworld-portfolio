@@ -98,7 +98,6 @@ export default function Sidebar({
         position: 'sticky',
         top: 0,
         height: '100vh',
-        overflowY: 'auto',
         fontFamily: 'var(--font-sans)',
       }}
     >

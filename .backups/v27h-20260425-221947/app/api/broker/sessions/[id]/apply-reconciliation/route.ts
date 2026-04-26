@@ -1,15 +1,9 @@
 /**
- * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27h
+ * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27g
  *
- * v27h change: Added step 8 — re-infer portfolio start metadata after
- * reconciliation transfers are written. Without this, portfolios whose
- * only history is a canonical apply (DON-C-style: created with
- * starting_nav=0, populated only via this route) stayed at starting_nav=0
- * forever even after reconciliation gave them ~₦55M of holdings.
- *
- * v27g baseline: Applies CSCS variance reconciliation as TRANSFER_IN/OUT
- * transactions. Called by the variance panel post-commit when an operator
- * picks rows to apply.
+ * Applies CSCS variance reconciliation as TRANSFER_IN/OUT transactions.
+ * Called by the variance panel post-commit when an operator picks rows
+ * to apply.
  *
  * Body shape:
  *   {
@@ -51,7 +45,6 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 import { reconstructPortfolioNav } from '@/lib/nav-reconstruct'
-import { inferPortfolioStart } from '@/lib/portfolio-metadata'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -259,82 +252,6 @@ export async function POST(
       navReconstruction.error = `unexpected: ${e.message || 'unknown'}`
     }
 
-    // 8. v27h: Re-infer portfolio start metadata after reconciliation.
-    //
-    // Reconciliation transfers may shift the earliest transaction date
-    // (e.g., on a portfolio whose only history is the canonical apply,
-    // earliest is the apply date itself; on a portfolio with prior CN
-    // history, earliest stays at the original first trade). Either way,
-    // running inferPortfolioStart now ensures starting_nav reflects
-    // current transaction reality. Without this step, DON-C-style
-    // portfolios (created with starting_nav=0, populated only via
-    // apply-reconciliation) stay at 0 forever.
-    let metadataBackfill: {
-      attempted: boolean
-      applied: boolean
-      reason: string
-      previous?: { start_date: string | null; starting_nav: number }
-      updated?: { start_date: string; starting_nav: number; method: string }
-      error?: string
-    } = { attempted: false, applied: false, reason: 'not evaluated' }
-
-    try {
-      metadataBackfill.attempted = true
-      const { data: portfolioRow } = await db
-        .from('portfolios')
-        .select('start_date, starting_nav')
-        .eq('id', portfolio_id)
-        .single()
-      const previousNav = Number(portfolioRow?.starting_nav ?? 0)
-      const previousStart = portfolioRow?.start_date ?? null
-
-      const inferResult = await inferPortfolioStart(db, portfolio_id)
-      if (!inferResult.ok || !inferResult.inferred) {
-        metadataBackfill = {
-          attempted: true, applied: false,
-          reason: `inference failed: ${inferResult.error ?? 'unknown'}`,
-          error: inferResult.error,
-          previous: { start_date: previousStart, starting_nav: previousNav },
-        }
-      } else {
-        const inferred = inferResult.inferred
-        const { error: upErr } = await db
-          .from('portfolios')
-          .update({
-            start_date:   inferred.start_date,
-            starting_nav: inferred.starting_nav,
-            updated_at:   new Date().toISOString(),
-          })
-          .eq('id', portfolio_id)
-
-        if (upErr) {
-          metadataBackfill = {
-            attempted: true, applied: false,
-            reason: `UPDATE failed: ${upErr.message}`,
-            error: upErr.message,
-            previous: { start_date: previousStart, starting_nav: previousNav },
-          }
-        } else {
-          metadataBackfill = {
-            attempted: true, applied: true,
-            reason: `re-inferred from transactions (previous starting_nav=${previousNav})`,
-            previous: { start_date: previousStart, starting_nav: previousNav },
-            updated: {
-              start_date:   inferred.start_date,
-              starting_nav: inferred.starting_nav,
-              method:       inferred.method,
-            },
-          }
-        }
-      }
-    } catch (e: any) {
-      metadataBackfill = {
-        attempted: true, applied: false,
-        reason: `unexpected error: ${e.message || 'unknown'}`,
-        error: e.message,
-      }
-    }
-
     return NextResponse.json({
       ok:           true,
       transferred,
@@ -347,7 +264,6 @@ export async function POST(
         errors:                holdingsRebuild.errors,
       },
       nav_reconstruction: navReconstruction,
-      metadata_backfill:  metadataBackfill,
       elapsed_ms: Date.now() - started,
     })
   } catch (err: any) {

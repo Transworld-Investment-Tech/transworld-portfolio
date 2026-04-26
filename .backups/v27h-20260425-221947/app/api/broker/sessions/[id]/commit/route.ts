@@ -1,24 +1,20 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v27h
+ * app/api/broker/sessions/[id]/commit/route.ts — v27g
  *
- * v27h change: Step 11 always re-infers portfolio start metadata.
+ * v27g change: Added step 12 auto-fire NAV reconstruction.
  *
- * The v21g-hotfix-1 isStale gate (only-infer-when-starting_nav-is-zero)
- * has been removed. Earliest transaction date IS inception by definition,
- * so a manually-set non-zero starting_nav from before the first real
- * trade is always wrong and gets superseded. v27h drops the gate and
- * always re-infers, so a freshly-built portfolio (or one that just had
- * canonical reconciliation transfers written) gets its starting_nav
- * and start_date anchored to actual transaction history every time.
+ * After the v21d holdings rebuild (step 10) and v21g-hotfix-1 metadata
+ * backfill (step 11) succeed, we call lib/nav-reconstruct's
+ * reconstructPortfolioNav helper for the just-committed portfolio.
+ * Closes the second half of pitfall #86 — until v27g, every broker
+ * rebuild required a manual click of "Reconstruct selected" on
+ * /admin/import-prices Step 2 to populate nav_log. Now it fires
+ * automatically on commit.
  *
- * v27g change preserved: Step 12 auto-fires NAV reconstruction. After
- * the v21d holdings rebuild (step 10) and metadata backfill (step 11),
- * we call lib/nav-reconstruct's reconstructPortfolioNav helper for the
- * just-committed portfolio. Closes the second half of pitfall #86.
- *
- * Best-effort like step 9 — wrapped in try/catch so a reconstruction
- * failure doesn't undo the commit. Result surfaced in the response under
- * nav_reconstruction key alongside holdings_rebuild and metadata_backfill.
+ * Best-effort like step 9 and step 11 — wrapped in try/catch so a
+ * reconstruction failure doesn't undo the commit. Result is surfaced
+ * in the response under nav_reconstruction key alongside
+ * holdings_rebuild and metadata_backfill.
  *
  * v21l baseline preserved: alias map loaded once, applied defensively
  * to instrument_id on every committed row.
@@ -273,20 +269,7 @@ export async function POST(
     // 10. v21d: Rebuild holdings.
     const holdingsRebuild = await rebuildPortfolioHoldings(db, portfolio_id)
 
-    // 11. v27h: always re-infer portfolio start metadata.
-    //
-    // Earliest transaction date IS inception by definition. The previous
-    // v21g-hotfix-1 isStale gate (only-infer-when-starting_nav-is-zero)
-    // preserved manually-set values, but a manually-set starting_nav from
-    // before any real transactions exist is meaningless — by definition
-    // it gets superseded by the first real trade. v27h drops the gate
-    // and always re-infers, so the displayed starting NAV is always
-    // anchored to actual transaction history.
-    //
-    // inferPortfolioStart handles all cases: clean BUY-first portfolios
-    // (cash + position value on day 1), OOO sale-of-pre-existing-shares
-    // (mark-to-sell-price, NAV = sale proceeds), and reconciliation-only
-    // portfolios (post-canonical-apply, NAV = sum of TRANSFER_IN values).
+    // 11. v21g-hotfix-1: Infer and backfill portfolio start metadata.
     let metadataBackfill: {
       attempted: boolean
       applied: boolean
@@ -310,45 +293,55 @@ export async function POST(
           error: pfErr.message,
         }
       } else {
-        const previousNav = Number(portfolioRow?.starting_nav ?? 0)
-        metadataBackfill.attempted = true
-        const inferResult = await inferPortfolioStart(db, portfolio_id)
+        const currentNav = Number(portfolioRow?.starting_nav ?? 0)
+        const isStale    = currentNav === 0 || portfolioRow?.starting_nav === null
 
-        if (!inferResult.ok || !inferResult.inferred) {
+        if (!isStale) {
           metadataBackfill = {
             attempted: true, applied: false,
-            reason: `inference failed: ${inferResult.error ?? 'unknown'}`,
-            error: inferResult.error,
-            previous: { start_date: portfolioRow.start_date, starting_nav: previousNav },
+            reason: `starting_nav=${currentNav} is non-zero — deliberate value preserved`,
+            previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
           }
         } else {
-          const inferred = inferResult.inferred
-          const { error: updatePfErr } = await db
-            .from('portfolios')
-            .update({
-              start_date:   inferred.start_date,
-              starting_nav: inferred.starting_nav,
-              updated_at:   new Date().toISOString(),
-            })
-            .eq('id', portfolio_id)
+          metadataBackfill.attempted = true
+          const inferResult = await inferPortfolioStart(db, portfolio_id)
 
-          if (updatePfErr) {
+          if (!inferResult.ok || !inferResult.inferred) {
             metadataBackfill = {
               attempted: true, applied: false,
-              reason: `UPDATE failed: ${updatePfErr.message}`,
-              error: updatePfErr.message,
-              previous: { start_date: portfolioRow.start_date, starting_nav: previousNav },
+              reason: `inference failed: ${inferResult.error ?? 'unknown'}`,
+              error: inferResult.error,
+              previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
             }
           } else {
-            metadataBackfill = {
-              attempted: true, applied: true,
-              reason: `re-inferred from transactions (previous starting_nav=${previousNav})`,
-              previous: { start_date: portfolioRow.start_date, starting_nav: previousNav },
-              updated: {
+            const inferred = inferResult.inferred
+            const { error: updatePfErr } = await db
+              .from('portfolios')
+              .update({
                 start_date:   inferred.start_date,
                 starting_nav: inferred.starting_nav,
-                method:       inferred.method,
-              },
+                updated_at:   new Date().toISOString(),
+              })
+              .eq('id', portfolio_id)
+
+            if (updatePfErr) {
+              metadataBackfill = {
+                attempted: true, applied: false,
+                reason: `UPDATE failed: ${updatePfErr.message}`,
+                error: updatePfErr.message,
+                previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
+              }
+            } else {
+              metadataBackfill = {
+                attempted: true, applied: true,
+                reason: `stale metadata (starting_nav was ${currentNav}) — backfilled from transactions`,
+                previous: { start_date: portfolioRow.start_date, starting_nav: currentNav },
+                updated: {
+                  start_date:   inferred.start_date,
+                  starting_nav: inferred.starting_nav,
+                  method:       inferred.method,
+                },
+              }
             }
           }
         }
