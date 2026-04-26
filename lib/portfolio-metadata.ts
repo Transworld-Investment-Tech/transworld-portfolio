@@ -1,60 +1,49 @@
 /**
- * lib/portfolio-metadata.ts — v21g-hotfix-1
+ * lib/portfolio-metadata.ts — v27i
  *
- * Derives a portfolio's `start_date` and `starting_nav` from its
- * transaction history. Called from the broker commit route AFTER
- * holdings rebuild, and applied conditionally (only when existing
- * metadata is obviously stale).
+ * v27i change: Replaced the single-line `startingNav = cashOnDay + positionValue`
+ * with conservation-of-value logic. The old formulation hit a degenerate case
+ * for any portfolio whose day-1 events were pure BUYs (no same-day TRANSFER_IN
+ * cash): cashOnDay = -grossValue, positionValue = +grossValue, sum = 0 →
+ * safeNav fallback to 1. This was visible after v27h's "always re-infer"
+ * landed: DON A's 21.48M starting_nav got overwritten with 1 because its
+ * earliest date (2020-07-23) had BUYs without an explicit cash transfer.
  *
- * Why this exists:
- *   Portfolios created through /admin/portfolios/new with
- *   starting_nav = 0 (the intended pattern for broker-first
- *   onboarding) end up with start_date = creation_date, which is
- *   wrong — the real inception is the earliest transaction's
- *   trade_date. Without this fix, IRR and period metrics are all
- *   anchored to the wrong date and null-out for any lookback
- *   window that starts before the (incorrect) portfolio.start_date.
+ * The new logic:
+ *   starting_nav = max(preDayNav, postDayNav)
+ * where:
+ *   preDayNav = preDayCashFloor + preDayPositionValue
+ *     preDayCashFloor   = max(0, -cashOnDay)  // min cash that had to exist pre-day to fund net outflow
+ *     preDayPositionValue = sum over instruments where SELL/TRANSFER_OUT today implies pre-day shares
+ *   postDayNav = postDayCash + postDayPositionValue
+ *     postDayCash        = max(0, cashOnDay)
+ *     postDayPositionValue = current EOD positions (sum of netQtyAfter × price)
  *
- * Algorithm:
- *   1. Find the earliest trade_date in transactions for this portfolio.
- *   2. If no transactions, return null — nothing to infer.
- *   3. Compute NAV on that earliest date:
- *      a. Gather all transactions on the earliest date.
- *      b. Cash component: sum of TRANSFER_INs minus TRANSFER_OUTs
- *         minus FEEs minus gross BUY values plus gross SELL values.
- *      c. Position component: for each instrument with net_qty > 0
- *         after that day's transactions, value at the latest
- *         transaction price that day; if no price that day, use
- *         avg_cost (for BUYs on that day) or 0.
- *      d. Pre-history SELLs (the OOO case): if there's a SELL on
- *         the earliest date for shares with no prior BUY/TRANSFER_IN,
- *         the shares must have existed pre-history. Treat the SELL's
- *         price as the mark-to-market for those shares and roll their
- *         implied value into starting_nav. Net of the same-day SELL
- *         this nets to cash, same total NAV.
+ * Walks through correctly for every case observed in the production data:
+ *   - BUY-only day:        pre-day cash = grossValue, post-day position = grossValue → max ✓
+ *   - TRANSFER_IN cash:    post-day cash = amount → ✓
+ *   - SELL pre-history:    pre-day position = qty × sale price → ✓ (matches user's stated rule)
+ *   - Mixed BUY+TRANSFER_IN: post-day NAV captures total injected → ✓
+ *   - SELL+BUY same day:   conservation makes both sides equal → ✓
  *
- * Design decisions:
- *   - We return a float NAV, not an integer. starting_nav is NUMERIC
- *     in the schema and represents NGN.
- *   - "Method" in the return describes which code path computed the
- *     NAV, for logging/auditability. Not persisted.
- *   - Non-throwing. Errors are returned as { error } so the caller
- *     (commit route) can surface as a warning without aborting.
+ * The safeNav = 1 fallback now only triggers in true degenerate cases (e.g.,
+ * day with only zero-quantity rows or perfectly-cancelling FEE-against-zero
+ * scenarios). Real portfolios won't hit it.
  *
- * Staleness decision lives in the CALLER, not here. This function
- * just computes the "what should it be" value. The caller decides
- * whether to overwrite.
+ * v21g-hotfix-1 baseline preserved otherwise: same control flow, same
+ * netQtyAfterDay/netQtyBeforeDay tracking, same lastPriceOnDay map, same
+ * non-throwing { ok, inferred?, error? } return shape.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
 
 export interface InferredStart {
-  start_date: string          // ISO date YYYY-MM-DD
-  starting_nav: number        // in NGN
-  method: string              // human-readable description of how we got here
-  earliest_txn_date: string   // same as start_date — explicit for clarity
-  position_value: number      // instrument-valued component
-  cash_value: number          // cash-flow component
+  start_date: string
+  starting_nav: number
+  method: string
+  earliest_txn_date: string
+  position_value: number
+  cash_value: number
 }
 
 export interface InferResult {
@@ -95,36 +84,40 @@ export async function inferPortfolioStart(
 
   const earliestDate = transactions[0].trade_date
 
-  // ── 2. Separate transactions into "on earliest date" vs "later" ──
+  // ── 2. Filter to earliest-day transactions ───────────────────
   const onEarliest = transactions.filter((t) => t.trade_date === earliestDate)
 
-  // ── 3. Build cumulative position state JUST FOR the earliest day ─
-  //      This handles the OOO case where the earliest day's activity
-  //      reveals pre-history positions (e.g. a SELL with no prior BUY).
-  //      Net quantity per instrument AFTER the day's transactions is
-  //      what we'd hold at close-of-day on earliestDate.
+  // ── 3. Build state for the earliest day ──────────────────────
+  //
+  // netQtyAfterDay[i]  = net qty held at close of day for instrument i
+  //                     (can go negative if SELL exceeds same-day BUYs;
+  //                     we clamp to 0 when computing post-day position value)
+  //
+  // netQtyBeforeDay[i] = minimum implied pre-day qty (set when SELL or
+  //                     TRANSFER_OUT on day 1 implies pre-existing shares)
+  //
+  // lastPriceOnDay[i]  = last price observed for instrument i today
+  //                     (used for marking pre-day positions to market)
+  //
+  // cashOnDay          = net cash flow from day's events
+  //                     (+ TRANSFER_IN amount, + SELL grossValue,
+  //                      − TRANSFER_OUT amount, − BUY grossValue, − FEE amount)
 
-  const netQtyAfterDay = new Map<string, number>()
-  const netQtyBeforeDay = new Map<string, number>()   // to detect pre-history
-  const lastPriceOnDay = new Map<string, number>()    // for mark-to-market
-
-  // Pre-day state starts at zero (by definition there are no earlier
-  // transactions). Build it up from the day's events.
-
-  let cashOnDay = 0  // net cash impact of earliest-day events
+  const netQtyAfterDay  = new Map<string, number>()
+  const netQtyBeforeDay = new Map<string, number>()
+  const lastPriceOnDay  = new Map<string, number>()
+  let   cashOnDay       = 0
 
   for (const tx of onEarliest) {
-    const qty = tx.quantity ?? 0
-    const price = tx.price ?? 0
+    const qty        = tx.quantity ?? 0
+    const price      = tx.price ?? 0
     const grossValue = tx.gross_value ?? (qty * price)
-    const amount = tx.amount ?? 0
+    const amount     = tx.amount ?? 0
 
     if (tx.instrument_id) {
       const before = netQtyBeforeDay.get(tx.instrument_id) ?? 0
-      const after = netQtyAfterDay.get(tx.instrument_id) ?? 0
+      const after  = netQtyAfterDay.get(tx.instrument_id) ?? 0
 
-      // Record price seen today for this instrument (used later for
-      // mark-to-market of pre-history shares).
       if (price > 0) {
         lastPriceOnDay.set(tx.instrument_id, price)
       }
@@ -136,14 +129,11 @@ export async function inferPortfolioStart(
           break
         case 'SELL':
           netQtyAfterDay.set(tx.instrument_id, after - qty)
-          // SELL implies at least `qty` shares existed pre-day
           netQtyBeforeDay.set(tx.instrument_id, Math.max(before, qty))
           cashOnDay += grossValue
           break
         case 'TRANSFER_IN':
           netQtyAfterDay.set(tx.instrument_id, after + qty)
-          // TRANSFER_IN with no quantity is a cash deposit (instrument_id null)
-          // but defensive: if instrument_id is set, treat as shares in
           break
         case 'TRANSFER_OUT':
           netQtyAfterDay.set(tx.instrument_id, after - qty)
@@ -151,91 +141,97 @@ export async function inferPortfolioStart(
           break
       }
     } else {
-      // Instrument-less cash events (TRANSFER_IN/OUT/FEE as cash)
+      // Instrument-less cash events
       switch (tx.action) {
-        case 'TRANSFER_IN':
-          cashOnDay += amount
-          break
-        case 'TRANSFER_OUT':
-          cashOnDay -= amount
-          break
-        case 'FEE':
-          cashOnDay -= amount
-          break
+        case 'TRANSFER_IN':  cashOnDay += amount; break
+        case 'TRANSFER_OUT': cashOnDay -= amount; break
+        case 'FEE':          cashOnDay -= amount; break
       }
     }
   }
 
-  // ── 4. Compute NAV at close-of-day on earliestDate ────────────
-  //      NAV = value of positions held at EOD + cash from day's events
+  // ── 4. v27i: Conservation-of-value NAV computation ────────────
   //
-  //      For pre-history shares: any instrument with netQtyBeforeDay > 0
-  //      that we DON'T already see in earlier transactions is a pre-
-  //      history position. Its "cost basis" is unknown; we use the
-  //      day's transaction price as mark-to-market.
+  // Old (degenerate for BUY-only day 1):
+  //   startingNav = cashOnDay + positionValue
   //
-  //      For clean portfolios: netQtyBeforeDay is empty, position
-  //      value is simply the EOD qty × price-on-day (or avg cost for
-  //      BUYs that day, which is their price).
+  // New: starting_nav = max(preDayNav, postDayNav)
+  //
+  // For a clean rebalancing day (BUY funded by SELL), pre and post are
+  // equal — the day shifts assets between cash and shares, total value
+  // conserved. For TRANSFER_IN days, post > pre (capital injected). For
+  // TRANSFER_OUT/FEE days, pre > post (capital removed). Max captures the
+  // value that participated in inception either way.
 
-  let positionValue = 0
+  // EOD position value: positions held at close of day
+  let postDayPositionValue = 0
   for (const [instrId, qtyAfter] of netQtyAfterDay.entries()) {
     if (qtyAfter <= 0) continue
     const price = lastPriceOnDay.get(instrId) ?? 0
-    positionValue += qtyAfter * price
+    postDayPositionValue += qtyAfter * price
   }
 
-  // Pre-history adjustment: if an instrument had shares pre-day
-  // (inferred from a SELL on the earliest day), the cash we already
-  // counted from the SELL implicitly captures those shares' value.
-  // Post-day qty + cash = total NAV = pre-day holdings value.
-  //
-  // Example: OOO 2016-01-28
-  //   Pre-day:  4,000 GUARANTY (unknown cost basis)
-  //   Day:      SELL 4,000 GUARANTY @ ₦15.30 → cash +61,200
-  //   Post-day: 0 GUARANTY, +61,200 cash
-  //   NAV = 0 (positions) + 61,200 (cash) = 61,200 ✓
-  //
-  // Example: clean start with BUY
-  //   Pre-day:  nothing
-  //   Day:      TRANSFER_IN 5,000,000 cash, BUY 1,000 X @ ₦100 → cash +5M−100K
-  //   Post-day: 1,000 X, +4,900,000 cash
-  //   NAV = (1,000 × 100) + 4,900,000 = 5,000,000 ✓
-  //
-  // In both cases, cashOnDay + positionValue gives the right NAV.
+  // SOD position value: positions implied to have existed pre-day
+  // (instruments with same-day SELL or TRANSFER_OUT)
+  let preDayPositionValue = 0
+  for (const [instrId, qtyBefore] of netQtyBeforeDay.entries()) {
+    if (qtyBefore <= 0) continue
+    const price = lastPriceOnDay.get(instrId) ?? 0
+    preDayPositionValue += qtyBefore * price
+  }
 
-  const startingNav = cashOnDay + positionValue
+  // SOD cash floor: minimum cash that had to exist pre-day to fund a net
+  // outflow. If day has more outflow than inflow, pre-day cash must cover
+  // the gap. If day has more inflow, pre-day cash floor is 0.
+  const preDayCashFloor = Math.max(0, -cashOnDay)
 
-  // Determine method label for logging
-  const hasPreHistory = Array.from(netQtyBeforeDay.values()).some((v) => v > 0)
+  // EOD cash: assuming the minimum pre-day cash, what's left after the day
+  const postDayCash = Math.max(0, cashOnDay)
+
+  const preDayNav  = preDayCashFloor + preDayPositionValue
+  const postDayNav = postDayCash + postDayPositionValue
+  const startingNav = Math.max(preDayNav, postDayNav)
+
+  // ── 5. Method label (for logging/audit trail) ────────────────
+  const hasPreHistoryPositions = preDayPositionValue > 0
+  const hasEodPositions        = postDayPositionValue > 0
+  const hasNetInflow           = cashOnDay > 0
+  const hasNetOutflow          = cashOnDay < 0
+
   let method: string
-  if (hasPreHistory) {
+  if (hasPreHistoryPositions && hasEodPositions) {
+    method = `mixed: pre-history + EOD positions on ${earliestDate}`
+  } else if (hasPreHistoryPositions) {
     method = `pre-history positions mark-to-market on ${earliestDate}`
-  } else if (positionValue > 0 && cashOnDay !== 0) {
-    method = `positions + cash on ${earliestDate}`
-  } else if (positionValue > 0) {
-    method = `positions only on ${earliestDate}`
-  } else if (cashOnDay > 0) {
-    method = `cash only on ${earliestDate}`
+  } else if (hasEodPositions && hasNetInflow) {
+    method = `positions + net inflow on ${earliestDate}`
+  } else if (hasEodPositions && hasNetOutflow) {
+    method = `BUY funded by pre-existing cash on ${earliestDate}`
+  } else if (hasEodPositions) {
+    method = `positions only (clean inception) on ${earliestDate}`
+  } else if (hasNetInflow) {
+    method = `cash inflow only on ${earliestDate}`
+  } else if (hasNetOutflow) {
+    method = `cash outflow against pre-existing cash on ${earliestDate}`
   } else {
-    method = `degenerate: net NAV ≤ 0 on ${earliestDate}`
+    method = `degenerate: zero net activity on ${earliestDate}`
   }
 
-  // Guard against negative or zero NAV — that usually means our
-  // inference is wrong (e.g. portfolio history starts with a BUY
-  // implying pre-existing cash we didn't capture). Return a small
-  // positive placeholder rather than a number that will break IRR.
+  // True-degenerate guard: only triggers when both pre and post NAV are 0,
+  // which requires day 1 to have only zero-quantity transactions or
+  // perfectly-cancelling cash events with no positions. Real portfolios
+  // shouldn't hit this.
   const safeNav = startingNav > 0 ? startingNav : 1
 
   return {
     ok: true,
     inferred: {
-      start_date: earliestDate,
-      starting_nav: safeNav,
+      start_date:        earliestDate,
+      starting_nav:      safeNav,
       method,
       earliest_txn_date: earliestDate,
-      position_value: positionValue,
-      cash_value: cashOnDay,
+      position_value:    postDayPositionValue,
+      cash_value:        cashOnDay,
     },
   }
 }
