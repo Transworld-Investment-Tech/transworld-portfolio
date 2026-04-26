@@ -68,7 +68,6 @@ export default function PortfolioSettingsPage() {
       start_date:     portfolio.start_date || null,
       income_target:  Number(portfolio.income_target),
       cap_target:     Number(portfolio.cap_target),
-      target_return:  Number(portfolio.target_return) || 0.15,
       liq_min:        Number(portfolio.liq_min),
       dd_alert:       Number(portfolio.dd_alert),
       dd_action:      Number(portfolio.dd_action),
@@ -288,15 +287,13 @@ export default function PortfolioSettingsPage() {
             <div className="panel-title">Return targets &amp; risk thresholds</div>
           </div>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
-            {/* v27k: target_return field — DMA performance fee threshold */}
             {[
-              ['Income target (%)',                  'income_target'],
-              ['Cap. appreciation target (%)',       'cap_target'],
-              ['Performance fee threshold (%)',      'target_return'],
-              ['Max single equity (% NAV)',          'max_eq_single'],
-              ['Max equity sleeve (%)',              'max_eq_sleeve'],
-              ['Drawdown alert (%)',                 'dd_alert'],
-              ['Drawdown action threshold (%)',      'dd_action'],
+              ['Income target (%)',             'income_target'],
+              ['Cap. appreciation target (%)',  'cap_target'],
+              ['Max single equity (% NAV)',     'max_eq_single'],
+              ['Max equity sleeve (%)',         'max_eq_sleeve'],
+              ['Drawdown alert (%)',            'dd_alert'],
+              ['Drawdown action threshold (%)', 'dd_action'],
             ].map(([label, key]) => (
               <div key={key}>
                 <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>{label}</label>

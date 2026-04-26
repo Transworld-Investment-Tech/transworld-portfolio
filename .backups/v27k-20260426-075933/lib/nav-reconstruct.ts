@@ -1,28 +1,21 @@
 /**
- * lib/nav-reconstruct.ts — v27k
+ * lib/nav-reconstruct.ts — v27g
  *
- * v27k change: three-level price fallback eliminates the day-to-day NAV
- * oscillation that was visible on portfolios with sparse market_prices
- * coverage (DON-C showed ±70% swings between adjacent days because some
- * holdings had market prices on day N but fell back to avg cost on day N+1).
+ * Per-portfolio NAV reconstruction helper, extracted from
+ * app/api/admin/reconstruct-nav/route.ts. Shared between the original
+ * route (which loops over active portfolios) and the new commit-time
+ * auto-fire (closes the second half of pitfall #86).
  *
- * Old chain (v27g):
- *   price = prices[instrId] ?? avgCost
- *
- * New chain (v27k):
- *   price = prices[instrId] ?? lastKnownPrice.get(instrId) ?? avgCost
- *
- * The lastKnownPrice map is rebuilt per-portfolio (not global) and updated
- * each time a date HAS market price for an instrument. On dates where the
- * market_prices table is sparse for a given instrument, the most recent
- * known price is carried forward instead of dropping to cost basis. NAV
- * trajectory becomes monotonic-ish (only changes when actual transactions
- * or actual price updates happen) — same behavior as a real broker
- * statement.
- *
- * To benefit, existing nav_log rows must be wiped and rebuilt. Use the
- * companion POST /api/admin/rebuild-nav endpoint (destructive) to wipe
- * and rebuild firm-wide.
+ * Algorithm preserved bit-for-bit from v27f route:
+ *   1. Fetch distinct price dates via get_distinct_market_price_dates RPC
+ *      (server-side SELECT DISTINCT, no row-cap risk — pitfall #92 fix).
+ *   2. Load portfolio's transactions sorted ascending.
+ *   3. Filter market_prices to portfolio's distinct instruments only
+ *      (~10-15 rows per date instead of ~300+).
+ *   4. Skip dates already in nav_log (idempotent).
+ *   5. Replay transactions to each new date via replayToDate;
+ *      compute NAV using market price ?? avg cost; CASH_NGN priced at 1.
+ *   6. Insert new nav_log rows with notes 'Reconstructed from historical prices'.
  */
 
 import { SupabaseClient } from '@supabase/supabase-js'
@@ -81,12 +74,22 @@ export interface ReconstructResult {
   error?:             string
 }
 
+/**
+ * Reconstruct NAV for a single portfolio.
+ *
+ * @param db          Supabase admin client (service role).
+ * @param portfolioId Target portfolio UUID.
+ * @param allDates    Optional pre-fetched distinct price dates. If omitted,
+ *                    the helper fetches them via the v27f RPC. Passing dates
+ *                    in is the firm-wide caller's optimization (one fetch,
+ *                    N portfolios).
+ */
 export async function reconstructPortfolioNav(
   db: SupabaseClient,
   portfolioId: string,
   allDates?: string[]
 ): Promise<ReconstructResult> {
-  // ── 1. Fetch dates ────────────────────────────────────────────────
+  // ── 1. Fetch dates (or use the caller's pre-fetched set) ──────────
   let dates = allDates
   if (!dates) {
     const { data: dateRows, error: dateErr } = await db.rpc('get_distinct_market_price_dates')
@@ -101,11 +104,16 @@ export async function reconstructPortfolioNav(
     }
     dates = ((dateRows ?? []) as { price_date: string }[])
       .map(r => r.price_date)
-      .sort()  // ascending — critical for v27k carry-forward logic
+      .sort()
   }
 
   if (dates.length === 0) {
-    return { portfolioId, navEntriesAdded: 0, datesProcessed: 0, instrumentsTracked: 0 }
+    return {
+      portfolioId,
+      navEntriesAdded: 0,
+      datesProcessed: 0,
+      instrumentsTracked: 0,
+    }
   }
 
   // ── 2. Load transactions ──────────────────────────────────────────
@@ -117,7 +125,12 @@ export async function reconstructPortfolioNav(
     .limit(50000)
 
   if (!txns || txns.length === 0) {
-    return { portfolioId, navEntriesAdded: 0, datesProcessed: dates.length, instrumentsTracked: 0 }
+    return {
+      portfolioId,
+      navEntriesAdded: 0,
+      datesProcessed: dates.length,
+      instrumentsTracked: 0,
+    }
   }
 
   // ── 3. Filter prices to portfolio's instruments only ──────────────
@@ -148,47 +161,24 @@ export async function reconstructPortfolioNav(
     (existingNav ?? []).map((n: any) => n.nav_date as string)
   )
 
-  // ── 5. Replay & compute (v27k: with lastKnownPrice carry-forward) ─
+  // ── 5. Replay & compute ───────────────────────────────────────────
   const firstTxDate = txns[0].trade_date as string
   const newNavEntries: any[] = []
 
-  // v27k: maintain last-known price per instrument across the date walk.
-  // Each iteration:
-  //   (a) if market_prices has a value for instrument today, update lastKnownPrice
-  //   (b) when valuing today's holdings, use market price → lastKnown → avgCost
-  // This produces monotonic NAV trajectories (no oscillation from sparse coverage).
-  const lastKnownPrice = new Map<string, number>()
-
   for (const date of dates) {
     if (date < firstTxDate) continue
-
-    const prices = priceMap[date] ?? {}
-
-    // v27k step (a): update lastKnownPrice for any instrument with today's data,
-    // BEFORE the existing-date skip. We want carry-forward to be unaffected by
-    // whether we re-emit a nav_log row — the price information is real either way.
-    for (const [instrId, price] of Object.entries(prices)) {
-      if (price > 0) lastKnownPrice.set(instrId, price)
-    }
-
     if (existingDates.has(date)) continue
 
     const holdings = replayToDate(txns, date)
     if (Object.keys(holdings).length === 0) continue
 
-    // v27k step (b): three-level fallback.
+    const prices = priceMap[date] ?? {}
     let nav = 0
+
     for (const [instrId, { quantity, avgCost }] of Object.entries(holdings)) {
-      let price: number
-      if (instrId === 'CASH_NGN') {
-        price = 1
-      } else if (prices[instrId] !== undefined) {
-        price = prices[instrId]
-      } else if (lastKnownPrice.has(instrId)) {
-        price = lastKnownPrice.get(instrId)!
-      } else {
-        price = avgCost
-      }
+      const price = instrId === 'CASH_NGN'
+        ? 1
+        : (prices[instrId] ?? avgCost)
       nav += quantity * price
     }
 
