@@ -5,11 +5,16 @@ import {
   computePeriodMetrics, PERIODS, type PeriodKey,
   buildCashFlows, calculateIRR, BENCHMARKS,
 } from '@/lib/analytics'
+import { computeFeeMetrics } from '@/lib/fee-calc'
 
-// v27j: allPeriodsSummary now surfaces `available`, `unavailableReason`,
-// and `dynamicLabel` so the portfolio page can gate button rendering
-// (disable + tooltip) before the user clicks. Without this, only the
-// currently-selected period's metrics carry availability info.
+// v27j: allPeriodsSummary surfaces `available`, `unavailableReason`, and
+// `dynamicLabel` so the portfolio page can gate button rendering.
+//
+// v27l: route now also computes feeMetrics server-side using
+// computeFeeMetrics from lib/fee-calc.ts. Returned alongside `period` in the
+// response. Page uses this to render the fee calculation panel without an
+// extra DB round-trip. Fee math reads portfolio.target_return (default 0.15
+// per the v27k schema migration).
 
 export async function GET(req: NextRequest) {
   const portfolioId = req.nextUrl.searchParams.get('portfolioId')
@@ -47,6 +52,25 @@ export async function GET(req: NextRequest) {
   // Compute metrics for the requested period
   const metrics = computePeriodMetrics(periodKey, portfolio, currentNAV, navHistory, transactions)
 
+  // v27l: fee math for the selected period (only if we have a valid startNAV)
+  let feeMetrics: any = null
+  if (metrics.available && metrics.startNAV !== null && metrics.startNAV > 0) {
+    const thresholdRate = Number(portfolio.target_return ?? 0.15)
+    feeMetrics = computeFeeMetrics({
+      startNAV:      metrics.startNAV,
+      endNAV:        currentNAV,
+      startDate:     new Date(metrics.startDate),
+      endDate:       new Date(metrics.endDate),
+      transactions:  transactions.map((t: any) => ({
+        trade_date: t.trade_date,
+        action:     t.action,
+        amount:     t.amount,
+      })),
+      thresholdRate,
+      clientShare:   0.70,
+    })
+  }
+
   // v27j: surface availability flags on every period in the summary
   const allPeriodsSummary = PERIODS.map(p => {
     const m = computePeriodMetrics(p.key, portfolio, currentNAV, navHistory, transactions)
@@ -70,6 +94,8 @@ export async function GET(req: NextRequest) {
     currentNAV,
     period:        metrics,
     allPeriods:    allPeriodsSummary,
+    feeMetrics,    // v27l
+    targetReturn:  Number(portfolio.target_return ?? 0.15),  // v27l
     benchmarkNote: 'NGX index data estimated from known annual returns. Live data not available.',
   })
 }

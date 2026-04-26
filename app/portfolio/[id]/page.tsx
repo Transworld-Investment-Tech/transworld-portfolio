@@ -12,6 +12,7 @@ import {
   computeNAV, computeSleeveData, estimatedIncomePA,
   fmt, type Portfolio, type Holding, type SleeveTarget,
 } from '@/lib/portfolio'
+import { fmtSignedNGN } from '@/lib/fee-calc'  // v27l: fee panel
 import { computeMandateHealth, healthToLegacyAlerts } from '@/lib/mandate-health'
 
 // v20c: Sidebar is rendered by app/portfolio/[id]/layout.tsx.
@@ -105,6 +106,7 @@ export default function PortfolioOverviewPage() {
   const [divFreshness, setDivFreshness] = useState<Date | null>(null)
 
   const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('YTD')  // v27j: default tab
+  const [showAudit, setShowAudit] = useState<boolean>(false)  // v27l
   const [analytics, setAnalytics]             = useState<any>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
 
@@ -636,6 +638,11 @@ export default function PortfolioOverviewPage() {
                 !hasEnoughDataForIRR ? <span style={{ color: 'var(--warn)' }}>Need starting NAV &gt; 0 and ≥1 day held</span> :
                 'Insufficient cashflow data for this period'}
             </div>
+            {irrDisplay.hasValue && (
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, fontStyle: 'italic' }}>
+                Excludes dividends paid to client bank account
+              </div>
+            )}
           </div>
           <div>
             <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 10 }}>Period return</div>
@@ -690,6 +697,71 @@ export default function PortfolioOverviewPage() {
           </div>
         </div>
 
+        {/* v27l: IRR audit panel — collapsible cash-flow detail */}
+        {metrics && metrics.startNAV !== null && metrics.startNAV !== undefined && (
+          <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--border-soft)' }}>
+            <button
+              onClick={() => setShowAudit(s => !s)}
+              style={{
+                background: 'transparent', border: 'none', padding: 0,
+                fontSize: 11, color: 'var(--text-2)', cursor: 'pointer',
+                fontFamily: 'inherit', display: 'flex', alignItems: 'center', gap: 6,
+              }}
+            >
+              <span style={{ fontFamily: 'var(--font-mono)', fontSize: 9 }}>{showAudit ? '▾' : '▸'}</span>
+              <span>{showAudit ? 'Hide IRR audit' : 'Show IRR audit'}</span>
+            </button>
+            {showAudit && (
+              <div style={{ marginTop: 12, padding: '12px 14px', background: 'var(--bg-soft)', border: '1px solid var(--border-soft)', borderRadius: 4, fontFamily: 'var(--font-mono)', fontSize: 11, color: 'var(--text-2)', lineHeight: 1.7 }}>
+                <div style={{ fontWeight: 600, color: 'var(--text)', marginBottom: 8, fontFamily: 'var(--font-sans)', fontSize: 12 }}>
+                  IRR audit — {periodLabel}
+                </div>
+                <div style={{ marginBottom: 6, color: 'var(--text-3)', fontFamily: 'var(--font-sans)', fontSize: 10 }}>
+                  Computed against starting NAV of {fmt.ngnM(metrics.startNAV ?? 0)} on {metrics.startDate}.
+                </div>
+                <div style={{ marginBottom: 10, color: 'var(--text-3)', fontFamily: 'var(--font-sans)' }}>
+                  Cash flows used in IRR computation:
+                </div>
+                <div>
+                  <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr 130px', gap: 8 }}>
+                    <span>{metrics.startDate}</span>
+                    <span>Beginning NAV</span>
+                    <span style={{ textAlign: 'right', color: 'var(--neg)' }}>−{fmt.ngnM(metrics.startNAV)}</span>
+                  </div>
+                  {metrics.inflows > 0 && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr 130px', gap: 8 }}>
+                      <span>(period)</span>
+                      <span>Total TRANSFER_IN flows</span>
+                      <span style={{ textAlign: 'right', color: 'var(--neg)' }}>−{fmt.ngnM(metrics.inflows)}</span>
+                    </div>
+                  )}
+                  {metrics.outflows > 0 && (
+                    <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr 130px', gap: 8 }}>
+                      <span>(period)</span>
+                      <span>Total TRANSFER_OUT flows</span>
+                      <span style={{ textAlign: 'right', color: 'var(--pos)' }}>+{fmt.ngnM(metrics.outflows)}</span>
+                    </div>
+                  )}
+                  <div style={{ display: 'grid', gridTemplateColumns: '90px 1fr 130px', gap: 8 }}>
+                    <span>{metrics.endDate}</span>
+                    <span>Ending NAV</span>
+                    <span style={{ textAlign: 'right', color: 'var(--pos)' }}>+{fmt.ngnM(metrics.endNAV)}</span>
+                  </div>
+                </div>
+                <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px dashed var(--border-soft)', fontFamily: 'var(--font-sans)' }}>
+                  <strong style={{ color: 'var(--text)' }}>IRR (annualised): </strong>
+                  <span style={{ color: irrDisplay.hasValue ? ((metrics.irr ?? 0) >= 0 ? 'var(--pos)' : 'var(--neg)') : 'var(--text-3)' }}>
+                    {irrDisplay.value} {irrDisplay.hasValue ? 'p.a.' : ''}
+                  </span>
+                </div>
+                <div style={{ marginTop: 12, color: 'var(--text-3)', fontFamily: 'var(--font-sans)', fontStyle: 'italic', fontSize: 10, lineHeight: 1.5 }}>
+                  Fees (management, demat, other charges) are NOT cash-flow line items — they're already reflected in ending NAV via reduced cash holdings. IRR excludes dividends paid to client bank account, which would further improve the IRR.
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {metrics && (metrics.inflows > 0 || metrics.outflows > 0) && (
           <div style={{ marginTop: 16, paddingTop: 12, borderTop: '1px solid var(--border-soft)', display: 'flex', gap: 24, fontSize: 11, color: 'var(--text-2)' }}>
             <span>Inflows: <strong style={{ color: 'var(--text)' }}>{fmt.ngnM(metrics.inflows)}</strong></span>
@@ -698,6 +770,91 @@ export default function PortfolioOverviewPage() {
           </div>
         )}
       </div>
+
+      {/* v27l: Performance fee calculation panel */}
+      {analytics?.feeMetrics && (
+        <div className="panel" style={{ marginBottom: 20 }}>
+          <div className="panel-header">
+            <div>
+              <div className="panel-title">Performance fee calculation ({periodLabel})</div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+                Threshold: {((analytics?.targetReturn ?? 0.15) * 100).toFixed(1)}% p.a.
+                {' · '}
+                {analytics.feeMetrics.belowTarget
+                  ? <span style={{ color: 'var(--text-3)' }}>Below target — no fee earned this period</span>
+                  : <span style={{ color: 'var(--pos)' }}>Excess return: +{fmt.ngnM(analytics.feeMetrics.excessReturn)}</span>}
+              </div>
+            </div>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 16, paddingBottom: 16, borderBottom: '1px solid var(--border-soft)', marginBottom: 16 }}>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Contributed capital</div>
+              <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, letterSpacing: '-0.01em', color: 'var(--text)', marginBottom: 4 }}>
+                {fmt.ngnM(analytics.feeMetrics.contributedCapital)}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)' }}>Timing-adjusted</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Target value</div>
+              <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, letterSpacing: '-0.01em', color: 'var(--text)', marginBottom: 4 }}>
+                {fmt.ngnM(analytics.feeMetrics.targetValue)}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)' }}>At {((analytics?.targetReturn ?? 0.15) * 100).toFixed(0)}% p.a.</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Actual value</div>
+              <div className="hybrid-serif" style={{ fontSize: 22, fontWeight: 500, letterSpacing: '-0.01em', color: 'var(--text)', marginBottom: 4 }}>
+                {fmt.ngnM(analytics.feeMetrics.actualValue)}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)' }}>Ending NAV</div>
+            </div>
+            <div>
+              <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Excess return</div>
+              <div
+                className="hybrid-serif"
+                style={{
+                  fontSize: 22, fontWeight: 500, letterSpacing: '-0.01em',
+                  color: analytics.feeMetrics.belowTarget ? 'var(--neg)' : 'var(--pos)',
+                  marginBottom: 4,
+                }}
+              >
+                {analytics.feeMetrics.belowTarget ? '−' : '+'}{fmt.ngnM(Math.abs(analytics.feeMetrics.excessReturn))}
+              </div>
+              <div style={{ fontSize: 10, color: 'var(--text-3)' }}>Actual − Target</div>
+            </div>
+          </div>
+          {!analytics.feeMetrics.belowTarget && (
+            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 16, marginBottom: 12 }}>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Client share (70%)</div>
+                <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, letterSpacing: '-0.005em', color: 'var(--pos)' }}>
+                  +{fmt.ngnM(analytics.feeMetrics.clientFee)}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Transworld share (30%)</div>
+                <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, letterSpacing: '-0.005em', color: 'var(--gold)' }}>
+                  {fmt.ngnM(analytics.feeMetrics.transworldFee)}
+                </div>
+              </div>
+              <div>
+                <div style={{ fontSize: 10, letterSpacing: '0.14em', fontWeight: 600, color: 'var(--text-3)', textTransform: 'uppercase', marginBottom: 6 }}>Effective return</div>
+                <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, letterSpacing: '-0.005em', color: 'var(--pos)' }}>
+                  +{(analytics.feeMetrics.effectiveReturnPct * 100).toFixed(1)}%
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)' }}>Net of fee</div>
+              </div>
+            </div>
+          )}
+          <div style={{ marginTop: 12, padding: '10px 12px', background: 'var(--bg-soft)', border: '1px solid var(--border-soft)', borderRadius: 4, fontSize: 10, color: 'var(--text-2)', lineHeight: 1.6 }}>
+            <strong style={{ color: 'var(--text)' }}>Method:</strong>{' '}
+            Timing-adjusted contributed capital uses standard portfolio-finance interpretation
+            (each cash flow contributes amount × years remaining in period). Target value compounds at threshold rate.
+            {' '}<em>Excludes dividends paid to client bank account, which would further improve effective return.</em>
+            {' '}Threshold editable on Portfolio settings.
+          </div>
+        </div>
+      )}
 
       {/* Allocation bars + Composition donut */}
       <div style={{ display: 'grid', gridTemplateColumns: '1.5fr 1fr', gap: 14, marginBottom: 20 }}>

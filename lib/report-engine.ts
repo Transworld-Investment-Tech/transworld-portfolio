@@ -1,7 +1,7 @@
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
 import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
-import { buildCashFlows, solveIRR } from './analytics'
+import { computePeriodMetrics } from './analytics'  // v27l: report consolidated
 import type { FIInstrument } from './fi-context'
 import { buildFIContextBlock } from './fi-context'
 
@@ -104,15 +104,15 @@ function computePerformanceMetrics(portfolio: Portfolio, transactions: any[], cu
     ? `Raw HPR is distorted because \u20a6${(totalInflows/1e6).toFixed(2)}M was added as capital (${inflowRatio.toFixed(1)}\u00d7 the starting NAV of \u20a6${(starting/1e6).toFixed(2)}M). This capital growth inflates the simple ratio. DO NOT cite ${(rawHPR! * 100).toFixed(0)}% as the portfolio return.`
     : ''
 
-  // ITD IRR via Newton-Raphson — accounts for timing and size of all flows
+  // ITD IRR via computePeriodMetrics — v27l consolidated codepath.
+  // Same Newton-Raphson math as before but routed through the single helper
+  // that the portfolio page also uses, so report IRR always matches page IRR.
+  // ITD branch reads portfolio.starting_nav directly so empty navHistory is fine.
   let itdIRR: number | null = null
   if (starting > 0 && portfolio.start_date) {
     try {
-      const cashFlows = buildCashFlows(starting, portfolio.start_date, allTx, currentNAV)
-      const solved    = solveIRR(cashFlows)
-      itdIRR = (solved !== null && isFinite(solved) && solved > -0.9999 && solved < 500)
-        ? solved
-        : null
+      const m = computePeriodMetrics('ITD', portfolio, currentNAV, [], allTx)
+      itdIRR = m.irr
     } catch {
       itdIRR = null
     }
@@ -243,7 +243,7 @@ STARTING POINT:
 
 HEADLINE RETURN METRIC — USE THIS IN YOUR ANALYSIS:
   ITD IRR (p.a.):  ${perf.itdIRR !== null ? ((perf.itdIRR * 100).toFixed(2) + '% per annum') : 'N/A (insufficient cash flow data)'}
-  Definition: Money-Weighted Return (IRR), annualised via Newton-Raphson.
+  Definition: Money-Weighted Return (IRR), annualised via Newton-Raphson. Excludes dividends paid directly to client bank account.
   This accounts for the TIMING and SIZE of every capital flow since inception.
   This is the correct metric to cite when discussing portfolio performance.
 
@@ -264,6 +264,10 @@ RAW HPR — CONTEXT ONLY, DO NOT USE AS PRIMARY RETURN METRIC:
 ${perf.hprIsDistorted ? `  \u26a0\ufe0f  WARNING: ${perf.hprDistortionNote}` : '  This metric is reasonable for this portfolio — capital flows were not large enough to significantly distort it.'}
 
 INSTRUCTION TO AI: When writing this report, always cite the ITD IRR as the portfolio's return.
+When you cite the IRR, ALWAYS append the dividend disclaimer in parentheses immediately after the figure, e.g.:
+  "ITD IRR is 15.2% p.a. (excludes dividends paid to client bank account, which would further improve the IRR)."
+Never quote the IRR without this disclaimer — dividends accrue to the client outside the portfolio boundary
+and the IRR understates the client's full economic return without that context.
 Never present the Raw HPR as the portfolio's performance. If you reference any return percentage,
 it must be the IRR figure above.`
 
@@ -399,7 +403,7 @@ Include any eagle-eye watchlist items approaching a trigger point.
 
 ---
 *Report generated ${today} | Transworld Investment and Securities — Discretionary Account Management*
-*Performance: ITD IRR ${perf.itdIRR !== null ? (perf.itdIRR * 100).toFixed(2) + '% p.a.' : 'N/A'} (Money-Weighted Return, Newton-Raphson). Valuations are analytical estimates.*
+*Performance: ITD IRR ${perf.itdIRR !== null ? (perf.itdIRR * 100).toFixed(2) + '% p.a.' : 'N/A'} (Money-Weighted Return, Newton-Raphson; excludes dividends paid to client bank account). Valuations are analytical estimates.*
 *Watchlist: Transworld NGX Master Watchlist (${watchlist?.length ?? 0} securities). FI Universe: ${(fiUniverse ?? []).length} instruments.*
 *All investment decisions remain at the discretion of the portfolio manager.*`
 
