@@ -48,11 +48,14 @@ const SLEEVE_FILL: Record<string, string> = {
 }
 
 const PERIOD_TABS: { key: string; label: string }[] = [
-  // v27j: period set — fee-calculation-aligned tabs
-  { key: 'YTD', label: 'YTD' },
-  { key: 'LY',  label: 'LY'  },
-  { key: 'L3Y', label: 'L3Y' },
-  { key: 'L5Y', label: 'L5Y' },
+  { key: '1W',  label: '1W'  },
+  { key: '1M',  label: '1M'  },
+  { key: '3M',  label: '3M'  },
+  { key: '6M',  label: '6M'  },
+  { key: '1Y',  label: '1Y'  },
+  { key: '2Y',  label: '2Y'  },
+  { key: '3Y',  label: '3Y'  },
+  { key: '5Y',  label: '5Y'  },
   { key: 'ITD', label: 'ITD' },
 ]
 
@@ -104,7 +107,7 @@ export default function PortfolioOverviewPage() {
   const [divRefreshMsg, setDivRefreshMsg] = useState('')
   const [divFreshness, setDivFreshness] = useState<Date | null>(null)
 
-  const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('YTD')  // v27j: default tab
+  const [analyticsPeriod, setAnalyticsPeriod] = useState<string>('ITD')
   const [analytics, setAnalytics]             = useState<any>(null)
   const [analyticsLoading, setAnalyticsLoading] = useState(false)
 
@@ -579,34 +582,23 @@ export default function PortfolioOverviewPage() {
             </div>
           </div>
           <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-            {/* v27j: each tab gates on allPeriods[t.key].available; unavailable tabs greyed with tooltip */}
             {PERIOD_TABS.map(t => {
               const active = t.key === analyticsPeriod
-              const periodMeta: any = analytics?.allPeriods?.find((p: any) => p.period === t.key)
-              const isAvailable: boolean = periodMeta ? periodMeta.available !== false : true
-              const reason: string | undefined = periodMeta?.unavailableReason
-              const dynamicLabel: string | undefined = periodMeta?.dynamicLabel
-              const tabLabel = dynamicLabel ?? t.label
-              const isDisabled = analyticsLoading || !isAvailable
               return (
                 <button
                   key={t.key}
-                  onClick={() => { if (isAvailable) setAnalyticsPeriod(t.key) }}
-                  disabled={isDisabled}
-                  title={!isAvailable ? reason : undefined}
+                  onClick={() => setAnalyticsPeriod(t.key)}
+                  disabled={analyticsLoading}
                   style={{
                     padding: '5px 10px', fontSize: 11, fontWeight: 600,
                     letterSpacing: '0.04em', fontFamily: 'var(--font-sans)',
                     border: `1px solid ${active ? 'var(--gold)' : 'var(--border-strong)'}`,
                     background: active ? 'var(--gold-soft)' : 'transparent',
-                    color: !isAvailable ? 'var(--text-3)' : (active ? 'var(--gold)' : 'var(--text-2)'),
-                    opacity: !isAvailable ? 0.45 : 1,
-                    borderRadius: 3,
-                    cursor: analyticsLoading ? 'wait' : (!isAvailable ? 'not-allowed' : 'pointer'),
-                    transition: 'all 0.15s',
+                    color: active ? 'var(--gold)' : 'var(--text-2)',
+                    borderRadius: 3, cursor: analyticsLoading ? 'wait' : 'pointer', transition: 'all 0.15s',
                   }}
                 >
-                  {tabLabel}
+                  {t.label}
                 </button>
               )
             })}

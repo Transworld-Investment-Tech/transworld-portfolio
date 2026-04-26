@@ -1,188 +1,40 @@
 // ─── Period-aware Portfolio Analytics ────────────────────────────────────────
 //
-// v27j: Period set overhauled for fee-calculation alignment.
-//
-// New period set (replaces 1W/1M/3M/6M/1Y/2Y/3Y/5Y as the user-facing tabs):
-//   YTD  — Jan 1 of current year → today  (fee tracker for current calendar year)
-//   LY   — Jan 1 → Dec 31 of previous calendar year  (last year's fee result)
-//   L3Y  — trailing 3 years from today
-//   L5Y  — trailing 5 years from today
-//   ITD  — inception → today  (always available, fallback for short histories)
-//
-// Old keys (1W/1M/3M/6M/1Y/2Y/3Y/5Y) are kept in the union for backward
-// compatibility with report engines that may pass them programmatically.
-// They're not surfaced in the page UI. Old behaviour preserved for those.
-//
-// Availability + clamping:
-//   - YTD/LY: marked unavailable when the window pre-dates inception.
-//   - L3Y/L5Y: marked unavailable when full trailing window pre-dates inception
-//     (showing "L3Y" for a 2-month-old portfolio is misleading). Use ITD instead.
-//   - All windows clamp their startDate to inception when partially overlapping
-//     so IRR computes against actual deployed capital (matches DMA proposal's
-//     "timing of funds invested" rule).
-//   - dynamicLabel surfaces a clamped suffix when LY is partial-year (e.g.
-//     "LY (since 1 Mar)" for inception 2026-03-01).
-//
-// KEY PRINCIPLE on IRR (unchanged from v21g):
+// KEY PRINCIPLE on IRR:
 // Newton-Raphson IRR with time measured in YEARS produces an ANNUAL rate
-// by definition — always. NO further annualisation is ever applied.
+// by definition — always. A 3-year IRR of 25% means 25% p.a. compounded.
+// A 3-month IRR of 40% means 40% p.a. (the annual rate that explains the
+// observed 3-month return). NO further annualisation is ever applied to IRR.
+//
+// What we DO show separately:
+//   - simpleReturn: actual period ₦ gain ÷ startNAV (raw, not annualised)
+//   - irr: annual rate from Newton-Raphson (always p.a.)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface CashFlow {
   date: Date
-  amount: number
+  amount: number  // negative = outflow (money deployed), positive = inflow (money returned)
 }
 
-// v27j: extended union. New keys first (UI surface order), old keys preserved.
-export type PeriodKey =
-  | 'YTD' | 'LY' | 'L3Y' | 'L5Y' | 'ITD'
-  | '1W' | '1M' | '3M' | '6M' | '1Y' | '2Y' | '3Y' | '5Y'
-
-export type PeriodKind = 'calendar' | 'trailing' | 'inception'
+export type PeriodKey = '1W' | '1M' | '3M' | '6M' | '1Y' | '2Y' | '3Y' | '5Y' | 'ITD'
 
 export interface PeriodDef {
-  key:   PeriodKey
+  key: PeriodKey
   label: string
-  // v27j: 'days' is preserved for old trailing keys (1W..5Y); for new keys it's
-  // null and the window comes from resolvePeriodWindow() below.
-  days:  number | null
-  kind:  PeriodKind
+  days: number | null  // null = ITD
 }
 
-// v27j: the new fee-calculation-aligned set.
 export const PERIODS: PeriodDef[] = [
-  { key: 'YTD', label: 'YTD',          days: null, kind: 'calendar'  },
-  { key: 'LY',  label: 'Last Year',    days: null, kind: 'calendar'  },
-  { key: 'L3Y', label: 'Last 3 Years', days: 1095, kind: 'trailing'  },
-  { key: 'L5Y', label: 'Last 5 Years', days: 1825, kind: 'trailing'  },
-  { key: 'ITD', label: 'Inception',    days: null, kind: 'inception' },
-
-  // v27j: backward-compat — old short trailing windows kept for report engines
-  // that pass them programmatically. Not surfaced in the page UI.
-  { key: '1W',  label: '1 Week',    days: 7,    kind: 'trailing' },
-  { key: '1M',  label: '1 Month',   days: 30,   kind: 'trailing' },
-  { key: '3M',  label: '3 Months',  days: 91,   kind: 'trailing' },
-  { key: '6M',  label: '6 Months',  days: 182,  kind: 'trailing' },
-  { key: '1Y',  label: '1 Year',    days: 365,  kind: 'trailing' },
-  { key: '2Y',  label: '2 Years',   days: 730,  kind: 'trailing' },
-  { key: '3Y',  label: '3 Years',   days: 1095, kind: 'trailing' },
-  { key: '5Y',  label: '5 Years',   days: 1825, kind: 'trailing' },
+  { key: '1W',  label: '1 Week',    days: 7    },
+  { key: '1M',  label: '1 Month',   days: 30   },
+  { key: '3M',  label: '3 Months',  days: 91   },
+  { key: '6M',  label: '6 Months',  days: 182  },
+  { key: '1Y',  label: '1 Year',    days: 365  },
+  { key: '2Y',  label: '2 Years',   days: 730  },
+  { key: '3Y',  label: '3 Years',   days: 1095 },
+  { key: '5Y',  label: '5 Years',   days: 1825 },
+  { key: 'ITD', label: 'Inception', days: null },
 ]
-
-// v27j: window resolver. Returns the date range for a period given an inception
-// date. Encodes:
-//   - calendar windows for YTD/LY (Jan 1 to today / Jan 1 to Dec 31 of last year)
-//   - trailing windows for L3Y/L5Y/legacy (today minus N days)
-//   - inception window for ITD
-//   - inception clamping (start can't be earlier than inception)
-//   - availability gate (false → tab disabled in UI)
-//   - dynamic label for partial-year LY windows
-//
-// 'now' is parameterised so callers can stabilise time across renders.
-export interface PeriodWindow {
-  startDate:    Date
-  endDate:      Date
-  available:    boolean
-  unavailableReason?: string
-  dynamicLabel?: string  // used when label needs to reflect clamping (e.g., "LY (since 1 Mar)")
-}
-
-const ONE_DAY_MS = 24 * 3600 * 1000
-
-function fmtClampSuffix(d: Date): string {
-  return d.toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })
-}
-
-export function resolvePeriodWindow(
-  pdef:        PeriodDef,
-  inception:   Date,
-  now:         Date = new Date()
-): PeriodWindow {
-  const todayUTC = new Date(now.getTime())
-  todayUTC.setUTCHours(0, 0, 0, 0)
-
-  // ITD — always available if inception is set and not in future
-  if (pdef.kind === 'inception') {
-    if (inception > now) {
-      return {
-        startDate: inception, endDate: now,
-        available: false,
-        unavailableReason: 'Inception is in the future',
-      }
-    }
-    return { startDate: inception, endDate: now, available: true }
-  }
-
-  // YTD: Jan 1 of current year → today
-  if (pdef.key === 'YTD') {
-    const jan1 = new Date(now.getFullYear(), 0, 1)
-    if (inception > now) {
-      return {
-        startDate: inception, endDate: now,
-        available: false,
-        unavailableReason: 'Inception is in the future',
-      }
-    }
-    if (inception >= jan1) {
-      // Inception is mid-year — YTD == ITD. Disable YTD; user reads ITD.
-      return {
-        startDate: inception, endDate: now,
-        available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — YTD == ITD`,
-      }
-    }
-    return { startDate: jan1, endDate: now, available: true }
-  }
-
-  // LY: Jan 1 → Dec 31 of previous calendar year
-  if (pdef.key === 'LY') {
-    const lyJan1   = new Date(now.getFullYear() - 1, 0, 1)
-    const lyDec31  = new Date(now.getFullYear() - 1, 11, 31, 23, 59, 59, 999)
-    if (inception > lyDec31) {
-      return {
-        startDate: lyJan1, endDate: lyDec31,
-        available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — no prior calendar year`,
-      }
-    }
-    if (inception > lyJan1) {
-      // Mid-LY inception: clamp window start to inception, surface in label.
-      return {
-        startDate:    inception,
-        endDate:      lyDec31,
-        available:    true,
-        dynamicLabel: `LY (since ${fmtClampSuffix(inception)})`,
-      }
-    }
-    return { startDate: lyJan1, endDate: lyDec31, available: true }
-  }
-
-  // Trailing windows (L3Y/L5Y and legacy keys): today − N days
-  if (pdef.kind === 'trailing' && pdef.days !== null) {
-    const trailingStart = new Date(now.getTime() - pdef.days * ONE_DAY_MS)
-    // v27j rule: L3Y/L5Y disabled when full trailing window pre-dates inception.
-    // (For legacy keys 1W..5Y, keep the v21g behaviour of clamping silently — those
-    // are programmatic-only and shouldn't reject computation.)
-    const isHeadlinePeriod = pdef.key === 'L3Y' || pdef.key === 'L5Y'
-    if (inception > trailingStart && isHeadlinePeriod) {
-      return {
-        startDate: inception, endDate: now,
-        available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — less than ${pdef.label.toLowerCase()} of history`,
-      }
-    }
-    // Clamp start to inception
-    const start = trailingStart < inception ? inception : trailingStart
-    return { startDate: start, endDate: now, available: true }
-  }
-
-  // Should not reach here
-  return {
-    startDate: inception, endDate: now,
-    available: false,
-    unavailableReason: 'Unknown period kind',
-  }
-}
 
 export interface PeriodMetrics {
   period:      PeriodKey
@@ -194,41 +46,52 @@ export interface PeriodMetrics {
   daysHeld:    number
   yearsHeld:   number
 
-  // v27j: surfaced from resolvePeriodWindow. UI uses these to gate buttons.
-  available:   boolean
-  unavailableReason?: string
-  dynamicLabel?: string
-
+  // IRR — ALWAYS an annual rate (Newton-Raphson with time in years).
+  // For a 3-month period this is still p.a.; for a 5-year period it is still p.a.
+  // Never annualise or de-annualise this value.
   irr:         number | null
+
+  // Simple period return = (endNAV − startNAV + outflows − inflows) / startNAV
+  // This is the raw un-annualised return for the period as a decimal.
+  // e.g. +0.15 = 15% actual gain over the period (could be 3 months or 3 years)
   simplePeriodReturn: number | null
-  absoluteReturn:     number | null
-  twr:               number | null
-  twrAnnualised:     number | null
-  inflows:       number
-  outflows:      number
-  netCashFlows:  number
-  benchmarks:    BenchmarkResult[]
+
+  // Absolute ₦ P&L adjusted for external cash flows
+  absoluteReturn: number | null
+
+  // TWR (approx from NAV log sub-periods) — also expressed as actual period return
+  twr:              number | null
+  twrAnnualised:    number | null   // only computed when daysHeld > 365 for display
+
+  // Cash flow detail
+  inflows:       number   // new money added during period
+  outflows:      number   // withdrawals + fees during period
+  netCashFlows:  number   // inflows − outflows
+
+  // Benchmark returns (period return as decimal + annual rate)
+  benchmarks: BenchmarkResult[]
 }
 
 export interface BenchmarkResult {
-  name:         string
-  shortName:    string
-  type:         'equity' | 'fixedIncome' | 'inflation'
-  periodReturn: number
-  annualRate:   number
-  source:       string
-  note?:        string
+  name:            string
+  shortName:       string
+  type:            'equity' | 'fixedIncome' | 'inflation'
+  periodReturn:    number   // actual period return as decimal (un-annualised)
+  annualRate:      number   // annual equivalent rate
+  source:          string
+  note?:           string
 }
 
 // ─── Newton-Raphson IRR solver ────────────────────────────────────────────────
-// Time is measured in YEARS so the returned rate IS already annual. UNCHANGED.
+// Time is measured in YEARS so the returned rate IS already annual.
 export function solveIRR(cashFlows: CashFlow[], maxIter = 2000, tol = 1e-7): number | null {
   if (cashFlows.length < 2) return null
   const hasNeg = cashFlows.some(cf => cf.amount < 0)
   const hasPos = cashFlows.some(cf => cf.amount > 0)
   if (!hasNeg || !hasPos) return null
 
-  const t0      = cashFlows[0].date.getTime()
+  const t0 = cashFlows[0].date.getTime()
+  // TIME IN YEARS — this is what makes the result an annual rate
   const times   = cashFlows.map(cf => (cf.date.getTime() - t0) / (365.25 * 24 * 3600 * 1000))
   const amounts = cashFlows.map(cf => cf.amount)
 
@@ -268,6 +131,7 @@ function latestRate(data: Record<number, number>, year: number): number {
   return data[match ?? keys[keys.length-1]] ?? 0
 }
 
+// Compound period return from annual rates, day by day across year boundaries
 function compoundPeriodReturn(data: Record<number, number>, from: Date, to: Date): number {
   if (to <= from) return 0
   let compound = 1.0
@@ -283,6 +147,7 @@ function compoundPeriodReturn(data: Record<number, number>, from: Date, to: Date
   return compound - 1
 }
 
+// Annual equivalent of a period return given actual days
 function toAnnualRate(periodReturn: number, days: number): number {
   if (days <= 0) return periodReturn
   return Math.pow(1 + periodReturn, 365.25 / days) - 1
@@ -301,13 +166,16 @@ function buildBenchmarks(from: Date, to: Date, days: number): BenchmarkResult[] 
     return {
       name: b.name, shortName: b.shortName, type: b.type,
       periodReturn,
-      annualRate: toAnnualRate(periodReturn, days),
+      annualRate: days >= 365
+        ? toAnnualRate(periodReturn, days)   // multi-year: convert compound to annual
+        : toAnnualRate(periodReturn, days),  // sub-year: still show annual equivalent for fair comparison
       source: b.source,
       note: b.note,
     }
   })
 }
 
+// ─── Find closest NAV at or before a date ────────────────────────────────────
 function navAtDate(navHistory: any[], target: Date): number | null {
   const entry = [...navHistory]
     .filter(n => new Date(n.nav_date) <= target)
@@ -316,11 +184,6 @@ function navAtDate(navHistory: any[], target: Date): number | null {
 }
 
 // ─── Main: compute all metrics for a period ───────────────────────────────────
-// v27j changes:
-//   - startDate now comes from resolvePeriodWindow (handles calendar/trailing/inception)
-//   - returns available + unavailableReason + dynamicLabel surfaced from resolver
-//   - when available=false, IRR/TWR/benchmarks are skipped (returns null) so the
-//     page doesn't render misleading numbers for disabled tiles
 export function computePeriodMetrics(
   periodKey:   PeriodKey,
   portfolio:   any,
@@ -330,44 +193,24 @@ export function computePeriodMetrics(
 ): PeriodMetrics {
   const now   = new Date()
   const today = now.toISOString().slice(0, 10)
-  const pdef  = PERIODS.find(p => p.key === periodKey) ?? PERIODS.find(p => p.key === 'ITD')!
+  const pdef  = PERIODS.find(p => p.key === periodKey)!
 
-  const inception = new Date(portfolio.start_date)
-  const window    = resolvePeriodWindow(pdef, inception, now)
+  const startDate: Date = periodKey === 'ITD'
+    ? new Date(portfolio.start_date)
+    : (() => { const d = new Date(now); d.setDate(d.getDate() - pdef.days!); return d })()
 
-  const startDate = window.startDate
-  const endDate   = window.endDate
-
-  const daysHeld  = Math.max(0, Math.round((endDate.getTime() - startDate.getTime()) / ONE_DAY_MS))
+  const daysHeld  = Math.round((now.getTime() - startDate.getTime()) / (24 * 3600 * 1000))
   const yearsHeld = daysHeld / 365.25
 
-  // If period is unavailable, return early with nulls — UI uses available flag to gate rendering
-  if (!window.available) {
-    return {
-      period: periodKey, periodLabel: pdef.label,
-      startDate: startDate.toISOString().slice(0, 10), endDate: endDate.toISOString().slice(0, 10),
-      startNAV: null, endNAV: currentNAV, daysHeld, yearsHeld,
-      available: false,
-      unavailableReason: window.unavailableReason,
-      dynamicLabel: window.dynamicLabel,
-      irr: null, simplePeriodReturn: null, absoluteReturn: null,
-      twr: null, twrAnnualised: null,
-      inflows: 0, outflows: 0, netCashFlows: 0,
-      benchmarks: [],
-    }
-  }
-
-  // Start NAV: use NAV log for clamped/historical windows, starting_nav for ITD when start == inception
-  const isStartAtInception =
-    Math.abs(startDate.getTime() - inception.getTime()) < ONE_DAY_MS
-  const startNAV: number | null = isStartAtInception
+  // Start NAV: use NAV log for historical periods, starting_nav for ITD
+  const startNAV: number | null = periodKey === 'ITD'
     ? portfolio.starting_nav
     : navAtDate(navHistory, startDate)
 
   // External cash flows within the period
   const periodTxns = transactions.filter(t => {
     const d = new Date(t.trade_date)
-    return d >= startDate && d <= endDate &&
+    return d >= startDate && d <= now &&
       ['TRANSFER_IN', 'TRANSFER_OUT', 'FEE'].includes(t.action)
   })
 
@@ -379,15 +222,24 @@ export function computePeriodMetrics(
     if (t.action === 'FEE')          outflows += amt
   })
 
+  // Absolute ₦ return: gain after adjusting for external flows
+  // = (End NAV − Start NAV) − net new money added
   const absoluteReturn: number | null = startNAV !== null
     ? (currentNAV - startNAV) - (inflows - outflows)
     : null
 
+  // Simple period return (un-annualised fraction)
   const simplePeriodReturn: number | null = startNAV !== null && startNAV > 0 && absoluteReturn !== null
     ? absoluteReturn / startNAV
     : null
 
-  // ── IRR (Money-Weighted Return, annual rate) ─────────────────────────────
+  // ── IRR (Money-Weighted Return) ──────────────────────────────────────────
+  // Cash flows:
+  //   t=0:          −startNAV    (investor deploys capital)
+  //   intermediate: ±TRANSFER    (TRANSFER_IN = more capital in = negative; OUT = positive)
+  //   t=end:        +currentNAV  (terminal value returned to investor)
+  //
+  // With time in YEARS → result is ANNUAL RATE. Period length is irrelevant.
   let irr: number | null = null
   if (startNAV !== null) {
     const cashFlows: CashFlow[] = [
@@ -397,24 +249,26 @@ export function computePeriodMetrics(
         .map(t => ({
           date:   new Date(t.trade_date),
           amount: t.action === 'TRANSFER_IN'
-            ? -(Math.abs(t.amount ?? 0))
-            : +(Math.abs(t.amount ?? 0)),
+            ? -(Math.abs(t.amount ?? 0))   // more money in = negative (outflow from investor)
+            : +(Math.abs(t.amount ?? 0)),  // money back = positive (inflow to investor)
         })),
-      { date: endDate, amount: +currentNAV },
+      { date: now, amount: +currentNAV },
     ]
     irr = solveIRR(cashFlows)
+    // IRR is already annual — DO NOT annualise further
   }
 
-  // ── TWR ──────────────────────────────────────────────────────────────────
+  // ── TWR (Time-Weighted Return) ───────────────────────────────────────────
+  // Link sub-period returns between NAV log entries
   let twr: number | null = null
   let twrAnnualised: number | null = null
   if (startNAV !== null) {
     const subNAVs = [
       { nav_date: startDate.toISOString().slice(0, 10), nav_value: startNAV },
       ...navHistory
-        .filter(n => { const d = new Date(n.nav_date); return d > startDate && d < endDate })
+        .filter(n => { const d = new Date(n.nav_date); return d > startDate && d < now })
         .sort((a,b) => new Date(a.nav_date).getTime() - new Date(b.nav_date).getTime()),
-      { nav_date: endDate.toISOString().slice(0, 10), nav_value: currentNAV },
+      { nav_date: today, nav_value: currentNAV },
     ]
     if (subNAVs.length >= 2) {
       let compound = 1.0
@@ -422,21 +276,19 @@ export function computePeriodMetrics(
         const prev = subNAVs[i-1].nav_value
         if (prev > 0) compound *= subNAVs[i].nav_value / prev
       }
-      twr = compound - 1
+      twr = compound - 1  // actual period return
       twrAnnualised = daysHeld > 365 ? toAnnualRate(twr, daysHeld) : null
     }
   }
 
-  const benchmarks = buildBenchmarks(startDate, endDate, daysHeld)
+  const benchmarks = buildBenchmarks(startDate, now, daysHeld)
 
   return {
     period: periodKey, periodLabel: pdef.label,
-    startDate: startDate.toISOString().slice(0, 10), endDate: endDate.toISOString().slice(0, 10),
+    startDate: startDate.toISOString().slice(0, 10), endDate: today,
     startNAV, endNAV: currentNAV, daysHeld, yearsHeld,
-    available: true,
-    dynamicLabel: window.dynamicLabel,
-    irr,
-    simplePeriodReturn,
+    irr,                     // ← already annual, always
+    simplePeriodReturn,      // ← actual un-annualised period return
     absoluteReturn,
     twr, twrAnnualised,
     inflows, outflows, netCashFlows: inflows - outflows,

@@ -6,11 +6,6 @@ import {
   buildCashFlows, calculateIRR, BENCHMARKS,
 } from '@/lib/analytics'
 
-// v27j: allPeriodsSummary now surfaces `available`, `unavailableReason`,
-// and `dynamicLabel` so the portfolio page can gate button rendering
-// (disable + tooltip) before the user clicks. Without this, only the
-// currently-selected period's metrics carry availability info.
-
 export async function GET(req: NextRequest) {
   const portfolioId = req.nextUrl.searchParams.get('portfolioId')
   const periodKey   = (req.nextUrl.searchParams.get('period') ?? 'ITD') as PeriodKey
@@ -47,18 +42,16 @@ export async function GET(req: NextRequest) {
   // Compute metrics for the requested period
   const metrics = computePeriodMetrics(periodKey, portfolio, currentNAV, navHistory, transactions)
 
-  // v27j: surface availability flags on every period in the summary
+  // Also compute all periods summary (lightweight — no full IRR, just simple returns)
   const allPeriodsSummary = PERIODS.map(p => {
     const m = computePeriodMetrics(p.key, portfolio, currentNAV, navHistory, transactions)
     return {
-      period:             m.period,
-      periodLabel:        m.periodLabel,
-      daysHeld:           m.daysHeld,
+      period:      m.period,
+      periodLabel: m.periodLabel,
+      daysHeld:    m.daysHeld,
       simplePeriodReturn: m.simplePeriodReturn,
-      irr:                m.irr,
-      available:          m.available,
-      unavailableReason:  m.unavailableReason,
-      dynamicLabel:       m.dynamicLabel,
+      irr:         m.irr,
+      
     }
   })
 
