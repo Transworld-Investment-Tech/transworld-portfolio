@@ -1,33 +1,54 @@
 /**
- * lib/fee-calc.ts — v27k
+ * lib/fee-calc.ts — v27n
  *
- * Pure fee-math helper. Mirrors the DMA proposal worked example on page 3:
+ * Pure fee-math helper. Implements XIRR-style timing-aware target calculation
+ * matching standard portfolio-finance practice.
  *
- *   Total invested over the year (timing-adjusted): ₦17M
- *   Target value at 15%:                            ₦19.225M
- *   Actual total value:                             ₦27.9M
- *   Excess return above target:                     ₦8.675M
- *   Fee split:
- *     Client (70%):     ₦6.07M
- *     Transworld (30%): ₦2.60M
- *   Client final value: ₦25.3M
- *   Effective return:   49%
+ * METHODOLOGY
+ * ───────────
+ * Contributed capital is the FACE-VALUE sum of all flows over the period:
  *
- * Timing-adjusted contributed capital uses the standard portfolio-finance
- * interpretation:
+ *   contributedCapital = startNAV + Σ TRANSFER_IN − Σ TRANSFER_OUT
  *
- *   adjusted_capital = sum over flows of (amount × years_remaining_in_period)
+ * (No time-weighting on contributed capital itself — this represents the actual
+ * net amount of capital the client has put to work, in flat naira terms.)
  *
- * where years_remaining_in_period = (period_end - flow_date) / 365.25.
+ * Target value at end-of-period is computed by growing each flow forward from
+ * its flow date to the period end at the threshold rate:
  *
- * Example: ₦10M deployed at period start + ₦10M deployed at midpoint of a
- * 1-year period → adjusted = (10M × 1.0) + (10M × 0.5) = ₦15M.
+ *   targetValue = Σ flow_i × (1 + r)^(years_remaining_i)
  *
- * Beginning NAV is treated as a flow at period start (full year credit).
- * TRANSFER_IN flows are positive contributions; TRANSFER_OUT flows reduce
- * the contribution base (deployed capital that was withdrawn shouldn't
- * count toward the target). FEEs are NOT counted — they're already
- * reflected in actual ending NAV (Gap 1 lock from the design discussion).
+ * where years_remaining_i = (endDate − flow_date_i) / 365.25.
+ *
+ * This is the standard XIRR-style calculation. Beginning NAV is treated as a
+ * flow at period start (full-period growth). A ₦10M deposit at midyear of a
+ * 1-year, 15% target period contributes ₦10M × 1.15^0.5 ≈ ₦10.72M to the
+ * target. A ₦5M withdrawal at midyear is netted negatively, growing at the
+ * same rate (the firm doesn't owe a return on capital that has been pulled).
+ *
+ * FEE SPLIT
+ * ─────────
+ * Excess return = actualEndingNAV − targetValue (can be negative)
+ * Below target → no fee charged
+ * Above target → 70/30 client/Transworld split (configurable via clientShare)
+ *
+ * EFFECTIVE RETURN
+ * ────────────────
+ * effectiveReturnPct = (clientFinalValue − contributedCapital) / contributedCapital
+ *
+ * This is a PERIOD return (total return over the window), not annualized.
+ * For annualized return, see lib/analytics.ts → computeIRR (Newton-Raphson).
+ *
+ * HISTORICAL CONTEXT
+ * ──────────────────
+ * Prior to v27n (v27k–v27m), this module computed contributedCapital as the
+ * time-weighted sum (Σ amount × years_remaining). That mechanic was wrong:
+ * it inflated contributed capital for any period > 1 year (e.g. DON-C L5Y
+ * showed startNAV × 5 ≈ ₦59.69M instead of face-value ~₦12M) and deflated
+ * it for periods < 1 year (e.g. DON-C YTD at Apr 2026 showed startNAV × 0.32
+ * ≈ ₦8.03M instead of face value ~₦25.49M). v27n reverts contributedCapital
+ * to face-value semantics (standard XIRR) and applies time-weighting only
+ * inside the target calculation, where it belongs.
  */
 
 export interface FeeInput {
@@ -40,28 +61,28 @@ export interface FeeInput {
     action:     string
     amount:     number | null
   }>
-  thresholdRate:  number   // e.g., 0.15 for 15%
+  thresholdRate:  number   // e.g., 0.15 for 15% p.a.
   clientShare?:   number   // default 0.70
 }
 
 export interface FeeOutput {
-  contributedCapital:    number   // timing-adjusted
+  contributedCapital:    number   // face-value sum of flows
   yearsInPeriod:         number
   thresholdRate:         number
-  targetValue:           number
+  targetValue:           number   // Σ flow × (1 + r)^years_remaining
   actualValue:           number   // = endNAV
-  excessReturn:          number   // can be negative
+  excessReturn:          number   // actualValue − targetValue (can be negative)
   belowTarget:           boolean
   clientFee:             number   // 0 if below target
   transworldFee:         number   // 0 if below target
   clientFinalValue:      number   // actualValue − transworldFee
   effectiveReturnPct:    number   // (clientFinalValue − contributedCapital) / contributedCapital
   flows: Array<{
-    date:           string
-    label:          string
-    amount:         number   // signed: + for contribution, − for withdrawal
-    yearsRemaining: number
-    contributionWeight: number   // amount × yearsRemaining
+    date:                string
+    label:               string
+    amount:              number   // signed: + for contribution, − for withdrawal
+    yearsRemaining:      number
+    futureValueAtTarget: number   // amount × (1 + thresholdRate)^yearsRemaining
   }>
 }
 
@@ -82,18 +103,18 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
 
   const flows: FeeOutput['flows'] = []
 
-  // 1. Beginning NAV — counts as a contribution at period start (full credit)
+  // 1. Beginning NAV — treated as a flow at period start (full-period growth)
   if (startNAV > 0) {
     flows.push({
-      date:           startDate.toISOString().slice(0, 10),
-      label:          'Beginning NAV',
-      amount:         startNAV,
-      yearsRemaining: yearsInPeriod,
-      contributionWeight: startNAV * yearsInPeriod,
+      date:                startDate.toISOString().slice(0, 10),
+      label:               'Beginning NAV',
+      amount:              startNAV,
+      yearsRemaining:      yearsInPeriod,
+      futureValueAtTarget: startNAV * Math.pow(1 + thresholdRate, yearsInPeriod),
     })
   }
 
-  // 2. TRANSFER_IN / TRANSFER_OUT during the period
+  // 2. TRANSFER_IN / TRANSFER_OUT during the period — time-weighted growth from flow date
   for (const t of transactions) {
     if (t.action !== 'TRANSFER_IN' && t.action !== 'TRANSFER_OUT') continue
     const flowDate = new Date(t.trade_date)
@@ -107,24 +128,19 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
     )
     const signed = t.action === 'TRANSFER_IN' ? +amt : -amt
     flows.push({
-      date:           t.trade_date,
-      label:          t.action === 'TRANSFER_IN' ? 'Capital top-up' : 'Capital withdrawal',
-      amount:         signed,
+      date:                t.trade_date,
+      label:               t.action === 'TRANSFER_IN' ? 'Capital top-up' : 'Capital withdrawal',
+      amount:              signed,
       yearsRemaining,
-      contributionWeight: signed * yearsRemaining,
+      futureValueAtTarget: signed * Math.pow(1 + thresholdRate, yearsRemaining),
     })
   }
 
-  // 3. Timing-adjusted contributed capital
-  const contributedCapital = flows.reduce((s, f) => s + f.contributionWeight, 0)
+  // 3. Face-value contributed capital (XIRR semantics — flat naira sum, no time-weighting)
+  const contributedCapital = flows.reduce((s, f) => s + f.amount, 0)
 
-  // 4. Target value at threshold
-  // Per DMA proposal worked example:
-  //   ₦17M × (1 + 0.15)^1 ≈ ₦19.55M (proposal rounds to ₦19.225M which suggests
-  //   simple multiplication ₦17M × 1.13 — but standard portfolio finance is
-  //   compound). Using compounded form which is the standard convention; if
-  //   the firm wants simple ₦17M × (1 + 0.15 × yrs), can be swapped here.
-  const targetValue = contributedCapital * Math.pow(1 + thresholdRate, yearsInPeriod)
+  // 4. Target value = Σ flow_i × (1 + r)^years_remaining_i
+  const targetValue = flows.reduce((s, f) => s + f.futureValueAtTarget, 0)
 
   const actualValue   = endNAV
   const excessReturn  = actualValue - targetValue
@@ -155,7 +171,7 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
 }
 
 /**
- * For UI display: formats a contribution-weight number with sign.
+ * For UI display: formats a signed naira number with sign.
  */
 export function fmtSignedNGN(n: number): string {
   const sign = n < 0 ? '−' : '+'
