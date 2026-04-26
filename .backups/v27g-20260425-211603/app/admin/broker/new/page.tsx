@@ -1,14 +1,28 @@
 /**
- * app/admin/broker/new/page.tsx — v27g
+ * app/admin/broker/new/page.tsx — v21c
  *
- * v27g: Added optional canonical positions file picker. The CSCS Asset
- * Position extract (CSV or XLSX) is uploaded alongside CN + statements
- * and surfaced post-commit by the variance panel for one-click
- * reconciliation.
+ * Upload form for broker PDFs. The missing UX piece: until v21c, the
+ * /api/broker/upload endpoint could only be hit via curl. This page
+ * gives users a real form that POSTs multipart/form-data and redirects
+ * to the session detail page on success.
  *
- * v21c baseline preserved otherwise: portfolio dropdown, CN required,
- * statements optional 0..N, uploaded_by free text, spinner during
- * parse, redirect to session detail on success.
+ * Scope (deliberately minimal — Scope A in the v21c planning):
+ *   - Pick an existing portfolio from a dropdown (excludes archived)
+ *   - Attach 1 contract notes PDF (required)
+ *   - Attach 0..N statement PDFs (optional but monthly flow uses 1-N)
+ *   - Optional uploaded_by (defaults to "okezie")
+ *   - During upload: spinner + clear "this takes up to 5 minutes" copy
+ *   - On success: redirect to /admin/broker/[session_id]
+ *   - On error: inline alert with server message, form re-enables
+ *
+ * Does NOT do:
+ *   - New-client onboarding (use /admin/clients/new + /admin/portfolios/new first)
+ *   - Dry-run preview (server parses during upload — preview is on detail page)
+ *   - Progress streaming (spinner only; real progress needs SSE, v21c-2 candidate)
+ *   - Retry UI for parse_failed files (delete session, re-upload)
+ *
+ * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
+ * render its own (pitfall #38).
  */
 
 'use client'
@@ -35,7 +49,6 @@ export default function BrokerUploadPage() {
   const [portfolioId, setPortfolioId] = useState<string>('')
   const [contractNotesFile, setContractNotesFile] = useState<File | null>(null)
   const [statementFiles, setStatementFiles] = useState<File[]>([])
-  const [canonicalFile, setCanonicalFile] = useState<File | null>(null)   // v27g
   const [uploadedBy, setUploadedBy] = useState<string>('okezie')
 
   const [submitting, setSubmitting] = useState<boolean>(false)
@@ -43,9 +56,8 @@ export default function BrokerUploadPage() {
   const [serverError, setServerError] = useState<string | null>(null)
   const [serverWarnings, setServerWarnings] = useState<string[]>([])
 
-  const cnInputRef        = useRef<HTMLInputElement>(null)
-  const stmtInputRef      = useRef<HTMLInputElement>(null)
-  const canonicalInputRef = useRef<HTMLInputElement>(null)   // v27g
+  const cnInputRef = useRef<HTMLInputElement>(null)
+  const stmtInputRef = useRef<HTMLInputElement>(null)
 
   // ─── Load active portfolios ──────────────────────────────────
   useEffect(() => {
@@ -115,11 +127,6 @@ export default function BrokerUploadPage() {
     setStatementFiles(files)
   }
 
-  function onCanonicalChange(e: React.ChangeEvent<HTMLInputElement>) {   // v27g
-    const f = e.target.files?.[0] || null
-    setCanonicalFile(f)
-  }
-
   function clearContractNotes() {
     setContractNotesFile(null)
     if (cnInputRef.current) cnInputRef.current.value = ''
@@ -128,11 +135,6 @@ export default function BrokerUploadPage() {
   function clearStatements() {
     setStatementFiles([])
     if (stmtInputRef.current) stmtInputRef.current.value = ''
-  }
-
-  function clearCanonical() {   // v27g
-    setCanonicalFile(null)
-    if (canonicalInputRef.current) canonicalInputRef.current.value = ''
   }
 
   const canSubmit =
@@ -154,13 +156,13 @@ export default function BrokerUploadPage() {
       for (const f of statementFiles) {
         fd.append('statements', f)
       }
-      if (canonicalFile) {
-        fd.append('canonical_positions', canonicalFile)   // v27g
-      }
       if (uploadedBy.trim()) {
         fd.append('uploaded_by', uploadedBy.trim())
       }
 
+      // NOTE: do NOT set Content-Type header — the browser sets its own
+      // multipart boundary automatically when you pass a FormData body.
+      // Setting Content-Type manually breaks the upload.
       const res = await fetch('/api/broker/upload', {
         method: 'POST',
         body: fd,
@@ -185,11 +187,13 @@ export default function BrokerUploadPage() {
 
       const sessionId = data.upload_session_id as string | undefined
 
+      // Non-fatal errors are surfaced even on success
       if (Array.isArray(data.errors) && data.errors.length > 0) {
         setServerWarnings(data.errors)
       }
 
       if (!sessionId) {
+        // Shouldn't happen after the v21c route patch, but guard anyway
         setSubmitting(false)
         setServerError(
           'Upload completed but no session_id was returned. Check /admin/broker.'
@@ -197,6 +201,7 @@ export default function BrokerUploadPage() {
         return
       }
 
+      // Redirect to the detail page where the existing UX takes over
       router.push(`/admin/broker/${sessionId}`)
     } catch (err: any) {
       setSubmitting(false)
@@ -437,68 +442,6 @@ export default function BrokerUploadPage() {
           </div>
         </div>
 
-        {/* Canonical positions — v27g */}
-        <div style={{ marginBottom: 20 }}>
-          <label
-            style={{
-              display: 'block',
-              fontSize: 11,
-              fontWeight: 600,
-              letterSpacing: '0.14em',
-              textTransform: 'uppercase',
-              color: 'var(--text-3)',
-              marginBottom: 8,
-            }}
-          >
-            Canonical positions
-            <span style={{ marginLeft: 8, fontSize: 9, fontWeight: 400, color: 'var(--gold)', letterSpacing: '0.1em' }}>
-              CSCS extract — optional
-            </span>
-          </label>
-          <div
-            style={{
-              display: 'flex',
-              alignItems: 'center',
-              gap: 10,
-              flexWrap: 'wrap',
-            }}
-          >
-            <input
-              ref={canonicalInputRef}
-              type="file"
-              accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-              onChange={onCanonicalChange}
-              disabled={submitting}
-              style={{ fontSize: 12 }}
-            />
-            {canonicalFile && (
-              <button
-                type="button"
-                className="btn-h"
-                onClick={clearCanonical}
-                disabled={submitting}
-                style={{ fontSize: 11, padding: '4px 10px' }}
-              >
-                Clear
-              </button>
-            )}
-          </div>
-          {canonicalFile && (
-            <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 6 }}>
-              <strong>{canonicalFile.name}</strong>
-              <span style={{ color: 'var(--text-3)', marginLeft: 8 }}>
-                {(canonicalFile.size / 1024).toFixed(0)} KB
-              </span>
-            </div>
-          )}
-          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
-            Optional. Single CSV or XLSX from the brokerage's CSCS Asset
-            Position extract. After commit, the staging UI will surface a
-            variance panel comparing canonical units to portfolio holdings —
-            one click writes the reconciliation transfers.
-          </div>
-        </div>
-
         {/* Uploaded by */}
         <div style={{ marginBottom: 24 }}>
           <label
@@ -569,7 +512,7 @@ export default function BrokerUploadPage() {
         </div>
         <ol style={{ margin: 0, paddingLeft: 20, fontSize: 13, lineHeight: 1.7 }}>
           <li>
-            Each file is uploaded to private storage and parsed in place — no
+            Each PDF is uploaded to private storage and parsed in place — no
             files touch your machine after this page.
           </li>
           <li>
@@ -579,15 +522,6 @@ export default function BrokerUploadPage() {
           <li>
             You land on the session detail page. Review every staged row,
             toggle any you want to exclude, then commit to the portfolio.
-          </li>
-          <li>
-            On commit, holdings are rebuilt and NAV history is automatically
-            reconstructed from transactions.
-          </li>
-          <li>
-            If you attached a CSCS canonical positions file, a variance panel
-            appears post-commit showing per-ticker differences. One click
-            writes the reconciliation transfers and refreshes NAV.
           </li>
           <li>
             If anything is off, rollback unwinds the whole commit. Staged rows

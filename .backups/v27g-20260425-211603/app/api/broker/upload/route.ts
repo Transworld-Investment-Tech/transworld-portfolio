@@ -1,24 +1,17 @@
 /**
- * app/api/broker/upload/route.ts — v27g
+ * app/api/broker/upload/route.ts — v21l
  *
- * v27g change: Accept optional `canonical_positions` form field (CSV or
- * XLSX) alongside the existing CN PDF + statements PDFs. The canonical
- * file is the brokerage's CSCS Asset Position extract — a per-portfolio
- * snapshot of currently-held units used post-commit by the variance
- * panel to surface what the broker pipeline missed (recovery shares,
- * cash positions, ticker renames, inception transfers).
+ * v21c-hotfix-3 baseline + v21l DB-driven alias map.
  *
- * Canonical handling:
- *   - Stored to the same `broker-files` storage bucket
- *   - Recorded as broker_files with file_kind = 'canonical_positions'
- *   - Parsed via lib/cscs-parser.ts; account_holder + cscs_number stamped
- *   - NOT entered into staging/reconcile pipeline (no trades to extract)
- *   - Surfaced post-commit by the variance panel on the staging UI
+ * v21l change: Replace hardcoded NGX_TICKER_ALIASES lookup with
+ * getAliasMap(db) which loads the ticker_aliases DB table and merges
+ * it on top of the hardcoded fallback. The alias map is loaded once
+ * at the start of the POST handler and passed through buildStagedRows
+ * so any alias added via /admin/aliases takes effect on the next upload
+ * without a code deploy. The hardcoded map remains active as a permanent
+ * fallback if the DB is unavailable.
  *
- * v21l baseline preserved otherwise. The uploadPdf helper is generalized
- * to uploadFile with a contentType param so canonical (text/csv or
- * application/vnd.openxmlformats-officedocument.spreadsheetml.sheet) flows
- * through the same upload logic without duplicating the storage code.
+ * All other behaviour is unchanged from v21c-hotfix-3.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -34,7 +27,6 @@ import {
   type StatementRow,
 } from '@/lib/broker-parser'
 import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
-import { parseCSCSFile } from '@/lib/cscs-parser'
 
 export const runtime = 'nodejs'
 export const maxDuration = 300
@@ -55,11 +47,9 @@ function admin(): SupabaseClient {
 }
 
 // ─── Types for internal bookkeeping ──────────────────────────────
-type FileKind = 'contract_notes' | 'statement' | 'canonical_positions'
-
 interface UploadedFile {
   broker_file_id: string
-  kind: FileKind
+  kind: 'contract_notes' | 'statement'
   filename: string
   storage_path: string
   parse_status: string
@@ -77,6 +67,7 @@ export async function POST(req: NextRequest) {
   }
 
   // v21l: Load alias map once at the top of the handler.
+  // getAliasMap merges DB entries on top of hardcoded NGX_TICKER_ALIASES.
   const aliasMap = await getAliasMap(supabase)
 
   // ── Parse form ───────────────────────────────────────────
@@ -90,11 +81,10 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const portfolio_id   = form.get('portfolio_id')
-  const uploaded_by    = form.get('uploaded_by')
-  const cnField        = form.get('contract_notes')
-  const stFields       = form.getAll('statements')
-  const canonicalField = form.get('canonical_positions')   // v27g
+  const portfolio_id = form.get('portfolio_id')
+  const uploaded_by  = form.get('uploaded_by')
+  const cnField      = form.get('contract_notes')
+  const stFields     = form.getAll('statements')
 
   if (typeof portfolio_id !== 'string' || !portfolio_id) {
     return NextResponse.json({ error: 'portfolio_id is required' }, { status: 400 })
@@ -122,22 +112,21 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const errors: string[]              = []
+  const errors: string[]         = []
   const uploadedFiles: UploadedFile[] = []
-  const timestamp                     = Date.now()
-  const uploadSessionId               = randomUUID()
+  const timestamp       = Date.now()
+  const uploadSessionId = randomUUID()
 
   // ── Upload + parse contract notes ────────────────────────
   let parsedCN: ParsedContractNotes | null = null
   let cnBrokerFileId: string | null = null
 
   {
-    const up = await uploadFile(
+    const up = await uploadPdf(
       supabase,
       portfolio_id,
       cnField,
       'contract_notes',
-      'application/pdf',
       timestamp,
       typeof uploaded_by === 'string' ? uploaded_by : null,
       uploadSessionId
@@ -200,12 +189,11 @@ export async function POST(req: NextRequest) {
   const statementBrokerFileIds: string[]      = []
 
   for (const file of statementFiles) {
-    const up = await uploadFile(
+    const up = await uploadPdf(
       supabase,
       portfolio_id,
       file,
       'statement',
-      'application/pdf',
       timestamp,
       typeof uploaded_by === 'string' ? uploaded_by : null,
       uploadSessionId
@@ -270,86 +258,7 @@ export async function POST(req: NextRequest) {
     uploadedFiles.push(status as UploadedFile)
   }
 
-  // ── v27g: Upload + parse canonical positions (optional) ─────────
-  if (canonicalField instanceof File) {
-    const lower = canonicalField.name.toLowerCase()
-    const isXlsx = lower.endsWith('.xlsx')
-    const isCsv  = lower.endsWith('.csv')
-
-    if (!isXlsx && !isCsv) {
-      errors.push(`canonical_positions: unsupported extension for ${canonicalField.name} — must be .csv or .xlsx`)
-    } else {
-      const contentType = isXlsx
-        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        : 'text/csv'
-
-      const up = await uploadFile(
-        supabase,
-        portfolio_id,
-        canonicalField,
-        'canonical_positions',
-        contentType,
-        timestamp,
-        typeof uploaded_by === 'string' ? uploaded_by : null,
-        uploadSessionId
-      )
-
-      if (up.error) {
-        errors.push(`canonical_positions upload: ${up.error}`)
-      } else {
-        const status: Partial<UploadedFile> = {
-          broker_file_id: up.broker_file_id,
-          kind:           'canonical_positions',
-          filename:       canonicalField.name,
-          storage_path:   up.storage_path,
-          parse_status:   'pending',
-        }
-
-        try {
-          const buf    = Buffer.from(await canonicalField.arrayBuffer())
-          const parsed = parseCSCSFile(buf, canonicalField.name, aliasMap)
-
-          const parse_status = parsed.errors.length > 0 || parsed.rows.length === 0
-            ? 'parse_failed'
-            : 'parsed'
-
-          await supabase
-            .from('broker_files')
-            .update({
-              parsed_at:      new Date().toISOString(),
-              parse_status,
-              parse_error:    parsed.errors.length ? parsed.errors.join('; ') : null,
-              account_holder: parsed.accountName || null,
-              cscs_number:    parsed.cscsNumber  || null,
-              updated_at:     new Date().toISOString(),
-            })
-            .eq('id', up.broker_file_id)
-
-          status.parse_status = parse_status
-          if (parsed.errors.length) {
-            status.parse_error = parsed.errors.join('; ')
-            errors.push(`canonical_positions parse: ${status.parse_error}`)
-          }
-        } catch (err: any) {
-          await supabase
-            .from('broker_files')
-            .update({
-              parse_status: 'parse_failed',
-              parse_error:  err.message,
-              updated_at:   new Date().toISOString(),
-            })
-            .eq('id', up.broker_file_id)
-          status.parse_status = 'parse_failed'
-          status.parse_error  = err.message
-          errors.push(`canonical_positions parse: ${err.message}`)
-        }
-
-        uploadedFiles.push(status as UploadedFile)
-      }
-    }
-  }
-
-  // ── Reconcile + stage (CN + statements only — canonical excluded) ─
+  // ── Reconcile + stage ────────────────────────────────────
   if (!parsedCN || !cnBrokerFileId) {
     return NextResponse.json(
       {
@@ -367,6 +276,7 @@ export async function POST(req: NextRequest) {
 
   const reconciliation = reconcile(parsedCN, parsedStatements)
 
+  // v21l: pass aliasMap into buildStagedRows
   const stagedRows = buildStagedRows(
     parsedCN,
     parsedStatements,
@@ -411,11 +321,10 @@ export async function GET() {
     endpoint: '/api/broker/upload',
     method: 'POST multipart/form-data',
     fields: {
-      portfolio_id:        'UUID of target portfolio (required)',
-      contract_notes:      'single PDF (required)',
-      statements:          '0..N PDFs',
-      canonical_positions: 'optional single CSV or XLSX (CSCS Asset Position extract) [v27g]',
-      uploaded_by:         'optional text identifier',
+      portfolio_id:   'UUID of target portfolio (required)',
+      contract_notes: 'single PDF (required)',
+      statements:     '0..N PDFs',
+      uploaded_by:    'optional text identifier',
     },
     returns: 'broker_files (array), staged_count, reconciliation_summary, upload_session_id, errors',
   })
@@ -423,6 +332,9 @@ export async function GET() {
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
+// v21l: alias resolution through the merged map (DB + hardcoded).
+// Previously called with hardcoded NGX_TICKER_ALIASES; now uses the
+// dynamic map loaded at handler start.
 function aliasTicker(
   t: string | null | undefined,
   aliasMap: Record<string, string>
@@ -430,14 +342,11 @@ function aliasTicker(
   return applyAlias(t, aliasMap)
 }
 
-// v27g: generalised from uploadPdf — contentType is now a parameter so
-// canonical_positions (csv/xlsx) flows through the same code path as PDFs.
-async function uploadFile(
+async function uploadPdf(
   supabase: SupabaseClient,
   portfolio_id: string,
   file: File,
-  kind: FileKind,
-  contentType: string,
+  kind: 'contract_notes' | 'statement',
   timestamp: number,
   uploaded_by: string | null,
   upload_session_id: string
@@ -448,7 +357,7 @@ async function uploadFile(
   const up = await supabase.storage
     .from('broker-files')
     .upload(storage_path, bytes, {
-      contentType,
+      contentType: 'application/pdf',
       upsert: false,
     })
   if (up.error) {
@@ -506,6 +415,8 @@ function extractReference(narration: string): string | null {
   return `${m[1].toUpperCase()} ${m[2]}`
 }
 
+// v21l: aliasMap parameter added so DB aliases flow through to every
+// instrument_id written to staged_transactions.
 function buildStagedRows(
   cn: ParsedContractNotes,
   statements: ParsedStatement[],
@@ -517,6 +428,7 @@ function buildStagedRows(
 ): any[] {
   const rows: any[] = []
 
+  // ── One staged row per CN row (trade) ──────────────────────
   for (const match of rec.trade_matches) {
     const cnRow: ContractNoteRow = cn.rows[match.cn_row_index]
 
@@ -564,6 +476,7 @@ function buildStagedRows(
     })
   }
 
+  // ── One staged row per cash event ──────────────────────────
   for (const ev of rec.cash_events) {
     const brokerFileId = statementBrokerFileIds[ev.statement_index] ?? cnBrokerFileId
     const sRow: StatementRow | undefined =
@@ -594,6 +507,7 @@ function buildStagedRows(
     rows.push(row)
   }
 
+  // ── Orphan statement trades ──────────────────────────────
   for (const orphan of rec.orphan_statement_trades) {
     const sRow = statements[orphan.statement_index]?.rows[orphan.row_index]
     if (!sRow) continue

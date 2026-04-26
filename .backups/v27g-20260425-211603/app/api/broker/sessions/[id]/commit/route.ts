@@ -1,23 +1,16 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v27g
+ * app/api/broker/sessions/[id]/commit/route.ts — v21l
  *
- * v27g change: Added step 12 auto-fire NAV reconstruction.
+ * v21g-hotfix-1 baseline + v21l DB-driven alias map.
  *
- * After the v21d holdings rebuild (step 10) and v21g-hotfix-1 metadata
- * backfill (step 11) succeed, we call lib/nav-reconstruct's
- * reconstructPortfolioNav helper for the just-committed portfolio.
- * Closes the second half of pitfall #86 — until v27g, every broker
- * rebuild required a manual click of "Reconstruct selected" on
- * /admin/import-prices Step 2 to populate nav_log. Now it fires
- * automatically on commit.
+ * v21l change: Replace inline NGX_TICKER_ALIASES lookup in aliasTicker()
+ * with getAliasMap(db) + applyAlias(). The merged alias map (DB + hardcoded)
+ * is loaded once at handler start and used for the defensive second pass on
+ * every instrument_id being committed to transactions. Behaviour is
+ * identical to v21g-hotfix-1 for the existing hardcoded aliases; new DB
+ * aliases now also take effect on commit without a code deploy.
  *
- * Best-effort like step 9 and step 11 — wrapped in try/catch so a
- * reconstruction failure doesn't undo the commit. Result is surfaced
- * in the response under nav_reconstruction key alongside
- * holdings_rebuild and metadata_backfill.
- *
- * v21l baseline preserved: alias map loaded once, applied defensively
- * to instrument_id on every committed row.
+ * All other behaviour unchanged from v21g-hotfix-1.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -25,7 +18,6 @@ import { createClient, SupabaseClient } from '@supabase/supabase-js'
 import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
 import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 import { inferPortfolioStart } from '@/lib/portfolio-metadata'
-import { reconstructPortfolioNav } from '@/lib/nav-reconstruct'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -65,11 +57,9 @@ export async function POST(
     const aliasMap = await getAliasMap(db)
 
     // 1. Fetch all broker_files in session.
-    // v27g: exclude canonical_positions from commit pipeline — those are
-    // metadata-only files used post-commit by the variance panel.
     const { data: files, error: filesErr } = await db
       .from('broker_files')
-      .select('id, portfolio_id, parse_status, cscs_number, file_kind')
+      .select('id, portfolio_id, parse_status, cscs_number')
       .eq('upload_session_id', session_id)
 
     if (filesErr) {
@@ -79,31 +69,19 @@ export async function POST(
       return NextResponse.json({ error: 'No files in session' }, { status: 404 })
     }
 
-    // v27g: filter canonical_positions out of the commit logic. They go
-    // through their own apply-reconciliation flow post-commit and have no
-    // staged_transactions to insert.
-    const tradeFiles = files.filter(f => f.file_kind !== 'canonical_positions')
-
-    // 2. Refuse if any trade file is already committed.
-    const alreadyCommitted = tradeFiles.filter((f) => f.parse_status === 'committed')
+    // 2. Refuse if any file is already committed.
+    const alreadyCommitted = files.filter((f) => f.parse_status === 'committed')
     if (alreadyCommitted.length > 0) {
       return NextResponse.json(
         {
-          error: `Session already committed (${alreadyCommitted.length} of ${tradeFiles.length} file${tradeFiles.length === 1 ? '' : 's'}). Rollback first to re-commit.`,
+          error: `Session already committed (${alreadyCommitted.length} of ${files.length} file${files.length === 1 ? '' : 's'}). Rollback first to re-commit.`,
         },
         { status: 409 }
       )
     }
 
-    if (tradeFiles.length === 0) {
-      return NextResponse.json(
-        { error: 'No trade files in session — only canonical_positions present.' },
-        { status: 400 }
-      )
-    }
-
-    const portfolio_id = tradeFiles[0].portfolio_id
-    const fileIds      = tradeFiles.map((f) => f.id)
+    const portfolio_id = files[0].portfolio_id
+    const fileIds      = files.map((f) => f.id)
 
     // 3. Fetch staged rows to commit (include_in_commit=true).
     const { data: staged, error: stagedErr } = await db
@@ -141,6 +119,8 @@ export async function POST(
 
     // 5. Build transactions rows.
     // v21l: defensive alias pass uses the merged aliasMap (DB + hardcoded).
+    // Covers pre-hotfix staged rows written with raw broker tickers AND any
+    // new aliases added via the admin UI after those rows were staged.
     const txRows = toCommit.map((s: any) => {
       const fees = sumNonNull([
         s.fee_commission, s.fee_vat, s.fee_contract_stamp,
@@ -229,16 +209,13 @@ export async function POST(
     }
 
     // 8. Transition broker_files.parse_status → 'committed'.
-    // v27g: also flip canonical_positions files in the same session to
-    // 'committed' so the staging UI knows to render the variance panel.
-    const allFileIds = files.map(f => f.id)
     const { error: updErr } = await db
       .from('broker_files')
       .update({
         parse_status: 'committed',
         updated_at:   new Date().toISOString(),
       })
-      .in('id', allFileIds)
+      .in('id', fileIds)
 
     if (updErr) {
       return NextResponse.json(
@@ -354,37 +331,6 @@ export async function POST(
       }
     }
 
-    // 12. v27g: Auto-fire NAV reconstruction (closes pitfall #86).
-    // Best-effort like steps 9 and 11 — surfaces result but doesn't fail
-    // the commit if reconstruction errors. ~5 seconds for a portfolio-scoped
-    // run; well under the 60s maxDuration.
-    let navReconstruction: {
-      attempted:          boolean
-      navEntriesAdded:    number
-      datesProcessed:     number
-      instrumentsTracked: number
-      error?:             string
-    } = {
-      attempted: false,
-      navEntriesAdded: 0,
-      datesProcessed: 0,
-      instrumentsTracked: 0,
-    }
-
-    try {
-      navReconstruction.attempted = true
-      const r = await reconstructPortfolioNav(db, portfolio_id)
-      navReconstruction = {
-        attempted:          true,
-        navEntriesAdded:    r.navEntriesAdded,
-        datesProcessed:     r.datesProcessed,
-        instrumentsTracked: r.instrumentsTracked,
-        error:              r.error,
-      }
-    } catch (e: any) {
-      navReconstruction.error = `unexpected error: ${e.message || 'unknown'}`
-    }
-
     return NextResponse.json({
       ok: true,
       committed,
@@ -397,7 +343,6 @@ export async function POST(
         errors:               holdingsRebuild.errors,
       },
       metadata_backfill: metadataBackfill,
-      nav_reconstruction: navReconstruction,
       elapsed_ms: Date.now() - started,
     })
   } catch (err: any) {

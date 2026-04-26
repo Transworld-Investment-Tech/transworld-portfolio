@@ -1,27 +1,29 @@
 /**
- * app/admin/broker/[sessionId]/page.tsx — v27g
+ * app/admin/broker/[sessionId]/page.tsx — v21b-3b-hotfix-1
  *
- * v27g additions:
- *   - FileRow.kind union extended to include 'canonical_positions'
- *   - SessionDetail extended with optional `canonical` section
- *   - CSCSVariancePanel rendered post-commit when canonical is present
- *   - CANON pill added to file kind cell in the Files panel
+ * v21b-3b-hotfix-1: richer error rendering for commit failures that
+ * include a `missing_instruments` array — renders the ticker list
+ * inline so users know exactly what to add to the instruments
+ * master before retrying.
  *
- * v21b-3b-hotfix-1 baseline preserved: include-in-commit checkboxes,
- * Commit/Rollback ConfirmButtons, structured missing-instruments error,
- * unbalanced-audit banner.
+ * Earlier v21b-3b features preserved:
+ *   - include-in-commit checkboxes with optimistic PATCH
+ *   - Commit + Rollback with 4-second inline confirm
+ *   - Disables Commit when session is committed or parse failed
+ *   - Disables Rollback unless session is committed
+ *   - Unbalanced-audit banner
  *
  * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
  * render its own (pitfall #38).
+ *
+ * Next.js 15: params is a Promise — client components unwrap via
+ * React.use() on the passed-in promise.
  */
 
 'use client'
 
 import { use, useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
-import CSCSVariancePanel from '@/components/admin/CSCSVariancePanel'
-import type { ParsedCSCS } from '@/lib/cscs-parser'
-import type { VarianceResult } from '@/lib/variance-engine'
 
 type StagedRow = {
   id: string
@@ -56,7 +58,7 @@ type StagedRow = {
 
 type FileRow = {
   id: string
-  kind: 'contract_notes' | 'statement' | 'canonical_positions'   // v27g
+  kind: 'contract_notes' | 'statement'
   filename: string
   storage_path: string
   size_bytes: number | null
@@ -75,17 +77,6 @@ type FileRow = {
   uploaded_by: string | null
   created_at: string
   parsed_at: string | null
-}
-
-// v27g: canonical section returned by GET when session is committed and
-// canonical_positions file is present + parsed.
-type CanonicalSection = {
-  brokerFileId: string
-  filename: string
-  parsed: ParsedCSCS | null
-  variance: VarianceResult | null
-  latestMarketPriceDate: string | null
-  error?: string
 }
 
 type SessionDetail = {
@@ -110,7 +101,6 @@ type SessionDetail = {
     by_action: Record<string, number>
     all_balanced: boolean
   }
-  canonical?: CanonicalSection | null   // v27g
 }
 
 const RECON_KIND_ORDER = [
@@ -374,6 +364,9 @@ export default function BrokerSessionDetailPage(props: {
       })
       const j = await res.json()
       if (!res.ok) {
+        // Structured missing-instruments response from the commit
+        // route's pre-check — render as a sticky error (no auto-dismiss)
+        // so the user has time to copy the list.
         if (Array.isArray(j.missing_instruments) && j.missing_instruments.length > 0) {
           setNotice({
             kind: 'error',
@@ -381,6 +374,7 @@ export default function BrokerSessionDetailPage(props: {
             missingInstruments: j.missing_instruments,
             hint: j.hint,
           })
+          // No timeout — user dismisses by clicking X or by retrying
           return
         }
         setNotice({ kind: 'error', text: j.error || `HTTP ${res.status}` })
@@ -391,10 +385,6 @@ export default function BrokerSessionDetailPage(props: {
         kind: 'ok',
         text: `Committed ${j.committed} transaction${j.committed === 1 ? '' : 's'}${
           j.skipped > 0 ? ` · ${j.skipped} skipped` : ''
-        }${
-          j.nav_reconstruction?.navEntriesAdded > 0
-            ? ` · ${j.nav_reconstruction.navEntriesAdded} NAV entries added`
-            : ''
         }`,
       })
       await load()
@@ -467,23 +457,19 @@ export default function BrokerSessionDetailPage(props: {
   )
 
   const sessionStatus = data.session.status
-  // v27g: parse-failed check excludes canonical_positions — a failed canonical
-  // parse should not block commit of CN+statements.
-  const anyTradeParseFailed = data.files.some(
-    (f) => f.kind !== 'canonical_positions' && f.parse_status === 'parse_failed'
-  )
+  const anyParseFailed = data.files.some((f) => f.parse_status === 'parse_failed')
   const isCommitted = sessionStatus === 'committed'
   const canCommit =
     !isCommitted &&
-    !anyTradeParseFailed &&
+    !anyParseFailed &&
     data.summary.staged_count > 0 &&
     data.staged.some((s) => s.include_in_commit)
   const canRollback = isCommitted
 
   const commitDisabledHint = isCommitted
     ? 'Already committed — rollback first to re-commit'
-    : anyTradeParseFailed
-      ? 'At least one trade file failed to parse — fix or exclude before committing'
+    : anyParseFailed
+      ? 'At least one file failed to parse — fix or exclude before committing'
       : data.summary.staged_count === 0
         ? 'No staged rows to commit'
         : !data.staged.some((s) => s.include_in_commit)
@@ -495,15 +481,6 @@ export default function BrokerSessionDetailPage(props: {
     : undefined
 
   const includedCount = data.staged.filter((s) => s.include_in_commit).length
-
-  // v27g: detect canonical reconciliation availability
-  const canonicalSection = data.canonical
-  const showVariancePanel =
-    isCommitted &&
-    canonicalSection &&
-    canonicalSection.parsed &&
-    canonicalSection.variance &&
-    !canonicalSection.error
 
   return (
     <div className="hybrid-page">
@@ -578,6 +555,7 @@ export default function BrokerSessionDetailPage(props: {
         >
           <div>{notice.text}</div>
 
+          {/* Missing instruments — render as a pill list */}
           {notice.kind === 'error' && notice.missingInstruments && notice.missingInstruments.length > 0 && (
             <div style={{ marginTop: 10 }}>
               <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 6, color: 'var(--text-2)' }}>
@@ -640,8 +618,6 @@ export default function BrokerSessionDetailPage(props: {
           <div className="h-kpi-sub">
             {data.files.filter((f) => f.kind === 'contract_notes').length} CN ·{' '}
             {data.files.filter((f) => f.kind === 'statement').length} statement
-            {data.files.filter((f) => f.kind === 'canonical_positions').length > 0 &&
-              ` · ${data.files.filter((f) => f.kind === 'canonical_positions').length} canon`}
           </div>
         </div>
         <div className="h-kpi">
@@ -675,7 +651,7 @@ export default function BrokerSessionDetailPage(props: {
           <div className="h-kpi-sub">
             {isCommitted
               ? 'Transactions live'
-              : anyTradeParseFailed
+              : anyParseFailed
                 ? 'Parse errors — review'
                 : 'Preview only'}
           </div>
@@ -689,13 +665,6 @@ export default function BrokerSessionDetailPage(props: {
           closing balance does not match its asserted closing balance. Review
           the Files panel below before committing — discrepancies often
           indicate a missing statement or unmapped cash event.
-        </div>
-      )}
-
-      {/* v27g: canonical present but errored */}
-      {isCommitted && canonicalSection && canonicalSection.error && (
-        <div className="alert-h alert-h-warn" style={{ marginBottom: 20 }}>
-          <strong>Canonical reconciliation unavailable.</strong> {canonicalSection.error}
         </div>
       )}
 
@@ -726,21 +695,8 @@ export default function BrokerSessionDetailPage(props: {
                 <td>
                   {f.kind === 'contract_notes' ? (
                     <span className="pill pill-hold">CN</span>
-                  ) : f.kind === 'statement' ? (
-                    <span className="pill pill-buy">STMT</span>
-                  ) : f.kind === 'canonical_positions' ? (
-                    <span
-                      className="pill"
-                      style={{
-                        background: 'rgba(166,124,42,0.15)',
-                        color: 'var(--gold)',
-                        borderColor: 'rgba(166,124,42,0.35)',
-                      }}
-                    >
-                      CANON
-                    </span>
                   ) : (
-                    <span className="pill">{f.kind}</span>
+                    <span className="pill pill-buy">STMT</span>
                   )}
                 </td>
                 <td>
@@ -808,17 +764,6 @@ export default function BrokerSessionDetailPage(props: {
           </tbody>
         </table>
       </div>
-
-      {/* v27g: CSCS variance panel — post-commit only, when canonical present + parsed */}
-      {showVariancePanel && (
-        <CSCSVariancePanel
-          sessionId={sessionId}
-          canonical={canonicalSection!.parsed!}
-          variance={canonicalSection!.variance!}
-          latestMarketPriceDate={canonicalSection!.latestMarketPriceDate}
-          onApplied={load}
-        />
-      )}
 
       {/* Staged transactions */}
       <div className="panel">

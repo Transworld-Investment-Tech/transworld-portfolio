@@ -153,10 +153,27 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // ─── v27g: nav_log seed removed ─────────────────────────────────
-    // Was writing a placeholder row at portfolio creation (₦0 for transaction-built
-    // portfolios). NAV reconstruction (auto-fired post broker-commit, or manual via
-    // /admin/import-prices Step 2) handles seeding from transactions.
+    // ─── Insert initial nav_log row ─────────────────────────────────
+    // nav_log has NO unique constraint on (portfolio_id, nav_date), so plain INSERT.
+    // Never use ON CONFLICT here — see pitfall #3.
+    // v19d: nav_value may be 0 for transaction-built portfolios.
+    const initialNote =
+      starting_nav === 0
+        ? 'Initial NAV at portfolio inception — to be built from transactions'
+        : 'Initial NAV at portfolio inception'
+    const { error: navErr } = await (db.from('nav_log') as any).insert({
+      portfolio_id: portfolio.id,
+      nav_date: start_date,
+      nav_value: starting_nav,
+      notes: initialNote,
+    })
+    if (navErr) {
+      // Non-fatal — portfolio works without it, but IRR baseline won't be seeded.
+      return NextResponse.json({
+        portfolio,
+        warning: `Portfolio created but initial NAV log insert failed: ${navErr.message}`,
+      })
+    }
 
     return NextResponse.json({ portfolio })
   } catch (e) {
