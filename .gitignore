@@ -37,3 +37,5 @@ Thumbs.db
 .vercel
 .backups/
 tsconfig.tsbuildinfo
+.backups/
+tsconfig.tsbuildinfo
