@@ -10,11 +10,15 @@ import { computeFeeMetrics } from '@/lib/fee-calc'
 // v27j: allPeriodsSummary surfaces `available`, `unavailableReason`, and
 // `dynamicLabel` so the portfolio page can gate button rendering.
 //
-// v27l: route now also computes feeMetrics server-side using
-// computeFeeMetrics from lib/fee-calc.ts. Returned alongside `period` in the
-// response. Page uses this to render the fee calculation panel without an
-// extra DB round-trip. Fee math reads portfolio.target_return (default 0.15
-// per the v27k schema migration).
+// v27l: route also computes feeMetrics server-side using computeFeeMetrics.
+// Returned alongside `period` in the response. Page uses this to render the
+// fee calculation panel without an extra DB round-trip.
+//
+// v27m: feeMetrics endNAV now reads from metrics.endNAV (period-end NAV)
+// instead of currentNAV. Symmetric with the IRR/absoluteReturn/TWR fix in
+// computePeriodMetrics — for LY (endDate=2025-12-31), this is the historical
+// NAV at year-end, not today's NAV. Closes the "Last Year fee panel shows
+// today's NAV as Actual Value" bug.
 
 export async function GET(req: NextRequest) {
   const portfolioId = req.nextUrl.searchParams.get('portfolioId')
@@ -49,16 +53,18 @@ export async function GET(req: NextRequest) {
 
   const currentNAV = computeNAV(holdings)
 
-  // Compute metrics for the requested period
   const metrics = computePeriodMetrics(periodKey, portfolio, currentNAV, navHistory, transactions)
 
-  // v27l: fee math for the selected period (only if we have a valid startNAV)
+  // v27m: feeMetrics now uses metrics.endNAV (period-end) instead of currentNAV.
+  // For closed periods like LY, metrics.endNAV is the historical NAV at endDate
+  // rather than today's value, so the fee panel reflects the period's actual
+  // ending value rather than current portfolio value.
   let feeMetrics: any = null
   if (metrics.available && metrics.startNAV !== null && metrics.startNAV > 0) {
     const thresholdRate = Number(portfolio.target_return ?? 0.15)
     feeMetrics = computeFeeMetrics({
       startNAV:      metrics.startNAV,
-      endNAV:        currentNAV,
+      endNAV:        metrics.endNAV,    // v27m: was currentNAV
       startDate:     new Date(metrics.startDate),
       endDate:       new Date(metrics.endDate),
       transactions:  transactions.map((t: any) => ({
@@ -71,7 +77,6 @@ export async function GET(req: NextRequest) {
     })
   }
 
-  // v27j: surface availability flags on every period in the summary
   const allPeriodsSummary = PERIODS.map(p => {
     const m = computePeriodMetrics(p.key, portfolio, currentNAV, navHistory, transactions)
     return {
@@ -94,8 +99,8 @@ export async function GET(req: NextRequest) {
     currentNAV,
     period:        metrics,
     allPeriods:    allPeriodsSummary,
-    feeMetrics,    // v27l
-    targetReturn:  Number(portfolio.target_return ?? 0.15),  // v27l
+    feeMetrics,
+    targetReturn:  Number(portfolio.target_return ?? 0.15),
     benchmarkNote: 'NGX index data estimated from known annual returns. Live data not available.',
   })
 }

@@ -1,6 +1,10 @@
 // ─── Period-aware Portfolio Analytics ────────────────────────────────────────
 //
 // v27j: Period set overhauled for fee-calculation alignment.
+// v27m: endNAV symmetry fix — for closed historical periods (LY), the period's
+//       ending value is the NAV as of endDate, not today's currentNAV. Without
+//       this fix, LY's cash-flow series ended with today's NAV (e.g., ₦55.30M)
+//       instead of NAV at 2025-12-31 (e.g., ₦25.49M), inflating LY IRR by ~50x.
 //
 // New period set (replaces 1W/1M/3M/6M/1Y/2Y/3Y/5Y as the user-facing tabs):
 //   YTD  — Jan 1 of current year → today  (fee tracker for current calendar year)
@@ -13,19 +17,16 @@
 // compatibility with report engines that may pass them programmatically.
 // They're not surfaced in the page UI. Old behaviour preserved for those.
 //
-// Availability + clamping:
-//   - YTD/LY: marked unavailable when the window pre-dates inception.
-//   - L3Y/L5Y: marked unavailable when full trailing window pre-dates inception
-//     (showing "L3Y" for a 2-month-old portfolio is misleading). Use ITD instead.
-//   - All windows clamp their startDate to inception when partially overlapping
-//     so IRR computes against actual deployed capital (matches DMA proposal's
-//     "timing of funds invested" rule).
-//   - dynamicLabel surfaces a clamped suffix when LY is partial-year (e.g.
-//     "LY (since 1 Mar)" for inception 2026-03-01).
-//
 // KEY PRINCIPLE on IRR (unchanged from v21g):
 // Newton-Raphson IRR with time measured in YEARS produces an ANNUAL rate
 // by definition — always. NO further annualisation is ever applied.
+//
+// KEY PRINCIPLE on endNAV (v27m):
+// The ending value of a period is the NAV at endDate, NOT necessarily currentNAV.
+// For periods ending today (endDate ≈ now), endNAV = currentNAV by definition.
+// For closed historical periods (endDate < now, i.e., LY), endNAV is read from
+// nav_log via navAtDate(navHistory, endDate). Falls back to currentNAV only if
+// no nav_log row exists at-or-before endDate.
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface CashFlow {
@@ -33,7 +34,6 @@ export interface CashFlow {
   amount: number
 }
 
-// v27j: extended union. New keys first (UI surface order), old keys preserved.
 export type PeriodKey =
   | 'YTD' | 'LY' | 'L3Y' | 'L5Y' | 'ITD'
   | '1W' | '1M' | '3M' | '6M' | '1Y' | '2Y' | '3Y' | '5Y'
@@ -43,22 +43,16 @@ export type PeriodKind = 'calendar' | 'trailing' | 'inception'
 export interface PeriodDef {
   key:   PeriodKey
   label: string
-  // v27j: 'days' is preserved for old trailing keys (1W..5Y); for new keys it's
-  // null and the window comes from resolvePeriodWindow() below.
   days:  number | null
   kind:  PeriodKind
 }
 
-// v27j: the new fee-calculation-aligned set.
 export const PERIODS: PeriodDef[] = [
   { key: 'YTD', label: 'YTD',          days: null, kind: 'calendar'  },
   { key: 'LY',  label: 'Last Year',    days: null, kind: 'calendar'  },
   { key: 'L3Y', label: 'Last 3 Years', days: 1095, kind: 'trailing'  },
   { key: 'L5Y', label: 'Last 5 Years', days: 1825, kind: 'trailing'  },
   { key: 'ITD', label: 'Inception',    days: null, kind: 'inception' },
-
-  // v27j: backward-compat — old short trailing windows kept for report engines
-  // that pass them programmatically. Not surfaced in the page UI.
   { key: '1W',  label: '1 Week',    days: 7,    kind: 'trailing' },
   { key: '1M',  label: '1 Month',   days: 30,   kind: 'trailing' },
   { key: '3M',  label: '3 Months',  days: 91,   kind: 'trailing' },
@@ -69,22 +63,12 @@ export const PERIODS: PeriodDef[] = [
   { key: '5Y',  label: '5 Years',   days: 1825, kind: 'trailing' },
 ]
 
-// v27j: window resolver. Returns the date range for a period given an inception
-// date. Encodes:
-//   - calendar windows for YTD/LY (Jan 1 to today / Jan 1 to Dec 31 of last year)
-//   - trailing windows for L3Y/L5Y/legacy (today minus N days)
-//   - inception window for ITD
-//   - inception clamping (start can't be earlier than inception)
-//   - availability gate (false → tab disabled in UI)
-//   - dynamic label for partial-year LY windows
-//
-// 'now' is parameterised so callers can stabilise time across renders.
 export interface PeriodWindow {
   startDate:    Date
   endDate:      Date
   available:    boolean
   unavailableReason?: string
-  dynamicLabel?: string  // used when label needs to reflect clamping (e.g., "LY (since 1 Mar)")
+  dynamicLabel?: string
 }
 
 const ONE_DAY_MS = 24 * 3600 * 1000
@@ -101,7 +85,6 @@ export function resolvePeriodWindow(
   const todayUTC = new Date(now.getTime())
   todayUTC.setUTCHours(0, 0, 0, 0)
 
-  // ITD — always available if inception is set and not in future
   if (pdef.kind === 'inception') {
     if (inception > now) {
       return {
@@ -113,7 +96,6 @@ export function resolvePeriodWindow(
     return { startDate: inception, endDate: now, available: true }
   }
 
-  // YTD: Jan 1 of current year → today
   if (pdef.key === 'YTD') {
     const jan1 = new Date(now.getFullYear(), 0, 1)
     if (inception > now) {
@@ -124,17 +106,15 @@ export function resolvePeriodWindow(
       }
     }
     if (inception >= jan1) {
-      // Inception is mid-year — YTD == ITD. Disable YTD; user reads ITD.
       return {
         startDate: inception, endDate: now,
         available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — YTD == ITD`,
+        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} \u2014 YTD == ITD`,
       }
     }
     return { startDate: jan1, endDate: now, available: true }
   }
 
-  // LY: Jan 1 → Dec 31 of previous calendar year
   if (pdef.key === 'LY') {
     const lyJan1   = new Date(now.getFullYear() - 1, 0, 1)
     const lyDec31  = new Date(now.getFullYear() - 1, 11, 31, 23, 59, 59, 999)
@@ -142,11 +122,10 @@ export function resolvePeriodWindow(
       return {
         startDate: lyJan1, endDate: lyDec31,
         available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — no prior calendar year`,
+        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} \u2014 no prior calendar year`,
       }
     }
     if (inception > lyJan1) {
-      // Mid-LY inception: clamp window start to inception, surface in label.
       return {
         startDate:    inception,
         endDate:      lyDec31,
@@ -157,26 +136,20 @@ export function resolvePeriodWindow(
     return { startDate: lyJan1, endDate: lyDec31, available: true }
   }
 
-  // Trailing windows (L3Y/L5Y and legacy keys): today − N days
   if (pdef.kind === 'trailing' && pdef.days !== null) {
     const trailingStart = new Date(now.getTime() - pdef.days * ONE_DAY_MS)
-    // v27j rule: L3Y/L5Y disabled when full trailing window pre-dates inception.
-    // (For legacy keys 1W..5Y, keep the v21g behaviour of clamping silently — those
-    // are programmatic-only and shouldn't reject computation.)
     const isHeadlinePeriod = pdef.key === 'L3Y' || pdef.key === 'L5Y'
     if (inception > trailingStart && isHeadlinePeriod) {
       return {
         startDate: inception, endDate: now,
         available: false,
-        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} — less than ${pdef.label.toLowerCase()} of history`,
+        unavailableReason: `Inception ${fmtClampSuffix(inception)} ${inception.getFullYear()} \u2014 less than ${pdef.label.toLowerCase()} of history`,
       }
     }
-    // Clamp start to inception
     const start = trailingStart < inception ? inception : trailingStart
     return { startDate: start, endDate: now, available: true }
   }
 
-  // Should not reach here
   return {
     startDate: inception, endDate: now,
     available: false,
@@ -190,15 +163,12 @@ export interface PeriodMetrics {
   startDate:   string
   endDate:     string
   startNAV:    number | null
-  endNAV:      number
+  endNAV:      number    // v27m: now correctly reflects period-end NAV, not always currentNAV
   daysHeld:    number
   yearsHeld:   number
-
-  // v27j: surfaced from resolvePeriodWindow. UI uses these to gate buttons.
   available:   boolean
   unavailableReason?: string
   dynamicLabel?: string
-
   irr:         number | null
   simplePeriodReturn: number | null
   absoluteReturn:     number | null
@@ -220,8 +190,6 @@ export interface BenchmarkResult {
   note?:        string
 }
 
-// ─── Newton-Raphson IRR solver ────────────────────────────────────────────────
-// Time is measured in YEARS so the returned rate IS already annual. UNCHANGED.
 export function solveIRR(cashFlows: CashFlow[], maxIter = 2000, tol = 1e-7): number | null {
   if (cashFlows.length < 2) return null
   const hasNeg = cashFlows.some(cf => cf.amount < 0)
@@ -255,7 +223,6 @@ export function solveIRR(cashFlows: CashFlow[], maxIter = 2000, tol = 1e-7): num
   return null
 }
 
-// ─── Benchmark data (annual returns by calendar year) ────────────────────────
 const NGX_ASI_ANNUAL:    Record<number, number> = { 2019:0.115, 2020:0.503, 2021:0.060, 2022:-0.199, 2023:0.459, 2024:0.377, 2025:0.265 }
 const NGX_30_ANNUAL:     Record<number, number> = { 2019:0.095, 2020:0.521, 2021:0.048, 2022:-0.142, 2023:0.442, 2024:0.391, 2025:0.248 }
 const INFLATION_ANNUAL:  Record<number, number> = { 2019:0.115, 2020:0.133, 2021:0.170, 2022:0.186,  2023:0.245, 2024:0.325, 2025:0.235 }
@@ -315,12 +282,13 @@ function navAtDate(navHistory: any[], target: Date): number | null {
   return entry?.nav_value ?? null
 }
 
-// ─── Main: compute all metrics for a period ───────────────────────────────────
-// v27j changes:
-//   - startDate now comes from resolvePeriodWindow (handles calendar/trailing/inception)
-//   - returns available + unavailableReason + dynamicLabel surfaced from resolver
-//   - when available=false, IRR/TWR/benchmarks are skipped (returns null) so the
-//     page doesn't render misleading numbers for disabled tiles
+// ─── Main: compute all metrics for a period ────────────────────────────────
+// v27m: introduces endNAV symmetric to startNAV.
+//   - When endDate is today (within 1 day): endNAV = currentNAV
+//   - Otherwise (closed historical period like LY): endNAV = navAtDate(navHistory, endDate),
+//     fallback to currentNAV if no nav_log row exists at-or-before endDate.
+// Used in: IRR cash flow series final entry, absoluteReturn, TWR final sub-NAV,
+// and the returned PeriodMetrics.endNAV field.
 export function computePeriodMetrics(
   periodKey:   PeriodKey,
   portfolio:   any,
@@ -329,7 +297,6 @@ export function computePeriodMetrics(
   transactions: any[],
 ): PeriodMetrics {
   const now   = new Date()
-  const today = now.toISOString().slice(0, 10)
   const pdef  = PERIODS.find(p => p.key === periodKey) ?? PERIODS.find(p => p.key === 'ITD')!
 
   const inception = new Date(portfolio.start_date)
@@ -341,12 +308,19 @@ export function computePeriodMetrics(
   const daysHeld  = Math.max(0, Math.round((endDate.getTime() - startDate.getTime()) / ONE_DAY_MS))
   const yearsHeld = daysHeld / 365.25
 
-  // If period is unavailable, return early with nulls — UI uses available flag to gate rendering
+  // v27m: endNAV symmetry. If endDate is at-or-after today, the period ends "now" and
+  // currentNAV is correct. If endDate is in the past (LY: 2025-12-31), use the historical
+  // NAV at that date from nav_log. Fall back to currentNAV only if nav_log has no row.
+  const isEndAtToday = endDate.getTime() >= now.getTime() - ONE_DAY_MS
+  const endNAV: number = isEndAtToday
+    ? currentNAV
+    : (navAtDate(navHistory, endDate) ?? currentNAV)
+
   if (!window.available) {
     return {
       period: periodKey, periodLabel: pdef.label,
       startDate: startDate.toISOString().slice(0, 10), endDate: endDate.toISOString().slice(0, 10),
-      startNAV: null, endNAV: currentNAV, daysHeld, yearsHeld,
+      startNAV: null, endNAV, daysHeld, yearsHeld,
       available: false,
       unavailableReason: window.unavailableReason,
       dynamicLabel: window.dynamicLabel,
@@ -357,14 +331,12 @@ export function computePeriodMetrics(
     }
   }
 
-  // Start NAV: use NAV log for clamped/historical windows, starting_nav for ITD when start == inception
   const isStartAtInception =
     Math.abs(startDate.getTime() - inception.getTime()) < ONE_DAY_MS
   const startNAV: number | null = isStartAtInception
     ? portfolio.starting_nav
     : navAtDate(navHistory, startDate)
 
-  // External cash flows within the period
   const periodTxns = transactions.filter(t => {
     const d = new Date(t.trade_date)
     return d >= startDate && d <= endDate &&
@@ -379,15 +351,19 @@ export function computePeriodMetrics(
     if (t.action === 'FEE')          outflows += amt
   })
 
+  // v27m: absoluteReturn uses endNAV (period-end), not currentNAV
   const absoluteReturn: number | null = startNAV !== null
-    ? (currentNAV - startNAV) - (inflows - outflows)
+    ? (endNAV - startNAV) - (inflows - outflows)
     : null
 
   const simplePeriodReturn: number | null = startNAV !== null && startNAV > 0 && absoluteReturn !== null
     ? absoluteReturn / startNAV
     : null
 
-  // ── IRR (Money-Weighted Return, annual rate) ─────────────────────────────
+  // ── IRR ─────────────────────────────────────────────────────────────────
+  // v27m: cash flow series ends with endNAV (period-end), not currentNAV.
+  // For YTD/L3Y/L5Y/ITD where endDate=today, endNAV=currentNAV by definition.
+  // For LY where endDate=2025-12-31, endNAV is the historical NAV at that date.
   let irr: number | null = null
   if (startNAV !== null) {
     const cashFlows: CashFlow[] = [
@@ -400,12 +376,13 @@ export function computePeriodMetrics(
             ? -(Math.abs(t.amount ?? 0))
             : +(Math.abs(t.amount ?? 0)),
         })),
-      { date: endDate, amount: +currentNAV },
+      { date: endDate, amount: +endNAV },
     ]
     irr = solveIRR(cashFlows)
   }
 
-  // ── TWR ──────────────────────────────────────────────────────────────────
+  // ── TWR ─────────────────────────────────────────────────────────────────
+  // v27m: final sub-NAV uses endNAV, not currentNAV.
   let twr: number | null = null
   let twrAnnualised: number | null = null
   if (startNAV !== null) {
@@ -414,7 +391,7 @@ export function computePeriodMetrics(
       ...navHistory
         .filter(n => { const d = new Date(n.nav_date); return d > startDate && d < endDate })
         .sort((a,b) => new Date(a.nav_date).getTime() - new Date(b.nav_date).getTime()),
-      { nav_date: endDate.toISOString().slice(0, 10), nav_value: currentNAV },
+      { nav_date: endDate.toISOString().slice(0, 10), nav_value: endNAV },
     ]
     if (subNAVs.length >= 2) {
       let compound = 1.0
@@ -432,7 +409,7 @@ export function computePeriodMetrics(
   return {
     period: periodKey, periodLabel: pdef.label,
     startDate: startDate.toISOString().slice(0, 10), endDate: endDate.toISOString().slice(0, 10),
-    startNAV, endNAV: currentNAV, daysHeld, yearsHeld,
+    startNAV, endNAV, daysHeld, yearsHeld,
     available: true,
     dynamicLabel: window.dynamicLabel,
     irr,
@@ -444,7 +421,7 @@ export function computePeriodMetrics(
   }
 }
 
-// ─── Backward-compat exports ─────────────────────────────────────────────────
+// ─── Backward-compat exports ───────────────────────────────────────────────
 export function calculateIRR(cashFlows: CashFlow[]): number | null { return solveIRR(cashFlows) }
 export function buildCashFlows(startingNav: number, startDate: string, transactions: any[], currentNAV: number): CashFlow[] {
   const flows: CashFlow[] = [{ date: new Date(startDate), amount: -startingNav }]
