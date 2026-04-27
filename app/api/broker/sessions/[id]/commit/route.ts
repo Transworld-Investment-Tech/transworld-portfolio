@@ -1,7 +1,21 @@
 /**
- * app/api/broker/sessions/[id]/commit/route.ts — v27h
+ * app/api/broker/sessions/[id]/commit/route.ts — v27o
  *
- * v27h change: Step 11 always re-infers portfolio start metadata.
+ * v27o change: Step 7.5 — recovery-transfer synthesis.
+ *
+ * After staged transactions are inserted into the transactions table
+ * (step 7) but before broker_files status flips to 'committed' (step 8),
+ * we run synthesizeRecoveryTransfers to detect orphan SELLs (i.e.,
+ * shares sold without a prior corresponding BUY — by definition,
+ * in-kind shares the client transferred in at recovery). These get
+ * dated at portfolio.start_date (with fallback to earliest transaction
+ * date) and tagged with external_ref for idempotency.
+ *
+ * Best-effort like steps 9/11/12 — wrapped in try/catch so a synthesis
+ * failure doesn't undo the commit. Result surfaced in the response
+ * under recovery_synthesis key.
+ *
+ * v27h preserved: Step 11 always re-infers portfolio start metadata.
  *
  * The v21g-hotfix-1 isStale gate (only-infer-when-starting_nav-is-zero)
  * has been removed. Earliest transaction date IS inception by definition,
@@ -11,16 +25,12 @@
  * canonical reconciliation transfers written) gets its starting_nav
  * and start_date anchored to actual transaction history every time.
  *
- * v27g change preserved: Step 12 auto-fires NAV reconstruction. After
- * the v21d holdings rebuild (step 10) and metadata backfill (step 11),
+ * v27g preserved: Step 12 auto-fires NAV reconstruction. After the
+ * v21d holdings rebuild (step 10) and metadata backfill (step 11),
  * we call lib/nav-reconstruct's reconstructPortfolioNav helper for the
  * just-committed portfolio. Closes the second half of pitfall #86.
  *
- * Best-effort like step 9 — wrapped in try/catch so a reconstruction
- * failure doesn't undo the commit. Result surfaced in the response under
- * nav_reconstruction key alongside holdings_rebuild and metadata_backfill.
- *
- * v21l baseline preserved: alias map loaded once, applied defensively
+ * v21l preserved: alias map loaded once, applied defensively
  * to instrument_id on every committed row.
  */
 
@@ -30,6 +40,7 @@ import { getAliasMap, applyAlias } from '@/lib/ticker-aliases'
 import { rebuildPortfolioHoldings } from '@/lib/holdings-rebuild'
 import { inferPortfolioStart } from '@/lib/portfolio-metadata'
 import { reconstructPortfolioNav } from '@/lib/nav-reconstruct'
+import { synthesizeRecoveryTransfers, type SynthesisResult } from '@/lib/recovery-synth'
 
 export const runtime = 'nodejs'
 export const maxDuration = 60
@@ -232,6 +243,49 @@ export async function POST(
       committed = inserted?.length || 0
     }
 
+    // 7.5. v27o: Synthesize recovery transfers for in-kind shares.
+    //
+    // Recovery-account clients walk through the door already holding shares
+    // in their CSCS account. The broker-import flow records subsequent
+    // BUY/SELL/FEE activity from contract notes — but NOT the in-kind value
+    // those starting shares represent. Without this step, contributedCapital
+    // is radically understated and IRR correspondingly inflated.
+    //
+    // Algorithm (FIFO walk per instrument, in lib/recovery-synth.ts):
+    //   - Any SELL whose cumulative same-instrument SELL qty exceeds the
+    //     cumulative BUY qty at that point indicates an in-kind transfer
+    //     (NGX prohibits short-selling; the excess MUST have been brought in)
+    //   - Each orphan SELL portion → one synthetic TRANSFER_IN row dated
+    //     at portfolio.start_date (with fallback to earliest transaction
+    //     date if start_date is NULL — common for fresh portfolios that
+    //     haven't run inferPortfolioStart yet)
+    //   - Idempotent via external_ref = 'synthetic-recovery-v1-<portfolio_id>'
+    //
+    // Best-effort like steps 9/11/12 — surfaces result but doesn't fail the
+    // commit if synthesis errors. The downstream steps (10 holdings rebuild,
+    // 11 metadata backfill, 12 NAV reconstruction) will pick up the synthetic
+    // rows automatically since they're now in the transactions table.
+    let recoverySynth: SynthesisResult = {
+      attempted:          false,
+      applied:            false,
+      inserted:           0,
+      totalAmount:        0,
+      startDate:          null,
+      externalRef:        '',
+      alreadySynthesized: false,
+      reason:             'not yet evaluated',
+    }
+    try {
+      recoverySynth = await synthesizeRecoveryTransfers(db, portfolio_id)
+    } catch (e: any) {
+      recoverySynth = {
+        ...recoverySynth,
+        attempted: true,
+        reason:    `unexpected error: ${e.message || 'unknown'}`,
+        error:     e.message,
+      }
+    }
+
     // 8. Transition broker_files.parse_status → 'committed'.
     // v27g: also flip canonical_positions files in the same session to
     // 'committed' so the staging UI knows to render the variance panel.
@@ -404,6 +458,7 @@ export async function POST(
         errors:               holdingsRebuild.errors,
       },
       metadata_backfill: metadataBackfill,
+      recovery_synthesis: recoverySynth,
       nav_reconstruction: navReconstruction,
       elapsed_ms: Date.now() - started,
     })
