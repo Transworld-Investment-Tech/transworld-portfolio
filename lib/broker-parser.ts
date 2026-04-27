@@ -536,11 +536,12 @@ export async function parseStatementPdf(
   const diff = round2(computed_closing - printed_closing)
   const passes = Math.abs(diff) < 0.01
 
-  if (!passes) {
-    errors.push(
-      `Balance audit failed: computed ${computed_closing.toFixed(2)} vs printed ${printed_closing.toFixed(2)} (diff ${diff.toFixed(2)})`
-    )
-  }
+  // v27p: audit imbalance is no longer pushed to parse_errors[].
+  // The structured audit.passes field carries this signal; conflating
+  // it with extraction errors caused the v27g commit-gate bug where
+  // a single unbalanced statement blocked 380+ clean rows.
+  // The upload route now classifies !audit.passes as 'audit_warning'
+  // (non-blocking) rather than 'parse_failed' (blocking).
   if (rows.length === 0) errors.push('No ledger rows parsed')
 
   return {

@@ -1,20 +1,26 @@
 /**
- * components/admin/CSCSVariancePanel.tsx — v27g
+ * components/admin/CSCSVariancePanel.tsx — v27p
  *
- * Post-commit variance panel rendered on the staging UI when a session
- * contains a parsed canonical_positions file. Shows per-ticker variance
- * between CSCS canonical positions and current portfolio holdings, with
- * checkboxes for selecting which transfers to apply.
+ * v27p change: per-row date picker for held-orphan transfers.
  *
- * Buckets:
- *   - cscs_only / top_up_needed → checked by default (auto-apply safe)
- *   - portfolio_only / portfolio_overshoot → unchecked by default (review)
- *   - match / cash_out_of_scope → no action (no checkbox, no apply)
+ * For each actionable row, operator picks a transfer date from a
+ * <select> populated with that ticker's available market_prices dates
+ * (passed in via VarianceRow.availablePriceDates from the variance
+ * engine). Server re-resolves the price from market_prices for the
+ * chosen (ticker, date) pair on apply — the panel's amount column is
+ * a UI estimate only.
  *
- * On Apply: POSTs to /api/broker/sessions/[id]/apply-reconciliation
- * with the selected rows. The route writes TRANSFER_IN/OUT transactions
- * dated to MAX(market_prices.price_date), rebuilds holdings, and
- * reconstructs NAV. Parent then re-fetches via onApplied callback.
+ * Smart default: VarianceRow.suggestedTransferDate is preselected.
+ *   - cscs_only         → portfolio.start_date (held orphan default)
+ *   - top_up_needed     → latest priced date
+ *   - portfolio_only    → latest priced date
+ *   - portfolio_overshoot → latest priced date
+ *
+ * If a row has no available price dates (rare — would mean the ticker
+ * has zero entries in market_prices), the row is non-actionable and the
+ * checkbox is disabled.
+ *
+ * v27g baseline preserved otherwise (filters, KPI summary, ConfirmButton).
  */
 
 'use client'
@@ -31,7 +37,8 @@ interface Props {
   sessionId: string
   canonical: ParsedCSCS
   variance: VarianceResult
-  latestMarketPriceDate: string | null
+  latestMarketPriceDate: string | null     // backward-compat fallback for display only
+  portfolioStartDate: string | null        // v27p
   onApplied: () => void
 }
 
@@ -82,7 +89,7 @@ function fmtDate(iso: string | null): string {
   })
 }
 
-// ─── Inline ConfirmButton (4-second pattern, same as staging page) ──
+// ─── Inline ConfirmButton ─────────────────────────────────────
 type ConfirmState = 'idle' | 'confirming' | 'running'
 
 function ConfirmButton({
@@ -152,6 +159,7 @@ export default function CSCSVariancePanel({
   canonical,
   variance,
   latestMarketPriceDate,
+  portfolioStartDate,
   onApplied,
 }: Props) {
   const [filter, setFilter] = useState<VarianceBucket | 'actionable' | 'all'>('actionable')
@@ -162,19 +170,34 @@ export default function CSCSVariancePanel({
     }
     return m
   })
+  // v27p: per-row date selection. Initialized from suggestedTransferDate.
+  const [transferDates, setTransferDates] = useState<Record<string, string>>(() => {
+    const m: Record<string, string> = {}
+    for (const r of variance.rows) {
+      if (r.suggestedTransferDate) m[r.ticker] = r.suggestedTransferDate
+    }
+    return m
+  })
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
 
-  // Reset selection if variance changes (e.g., after a successful apply + reload)
+  // Reset selection + dates if variance changes
   useEffect(() => {
-    const m: Record<string, boolean> = {}
+    const sel: Record<string, boolean> = {}
+    const dts: Record<string, string>  = {}
     for (const r of variance.rows) {
-      m[r.ticker] = r.autoApply
+      sel[r.ticker] = r.autoApply
+      if (r.suggestedTransferDate) dts[r.ticker] = r.suggestedTransferDate
     }
-    setSelected(m)
+    setSelected(sel)
+    setTransferDates(dts)
   }, [variance])
 
   function toggle(ticker: string) {
     setSelected(prev => ({ ...prev, [ticker]: !prev[ticker] }))
+  }
+
+  function setDate(ticker: string, date: string) {
+    setTransferDates(prev => ({ ...prev, [ticker]: date }))
   }
 
   const filteredRows = useMemo(() => {
@@ -189,23 +212,37 @@ export default function CSCSVariancePanel({
     r => r.proposedAction !== null && selected[r.ticker]
   )
 
-  const canApply = selectedRows.length > 0 && latestMarketPriceDate !== null
+  // v27p: validate every selected row has both a ticker AND a chosen date
+  const selectedRowsWithDates = selectedRows.filter(r => transferDates[r.ticker])
+  const selectedRowsMissingDate = selectedRows.filter(r => !transferDates[r.ticker])
+
+  // v27p: rows where the ticker has zero priced dates can never be applied
+  const unpriceableSelected = selectedRows.filter(r => r.availablePriceDates.length === 0)
+
+  const canApply =
+    selectedRows.length > 0 &&
+    selectedRowsMissingDate.length === 0 &&
+    unpriceableSelected.length === 0
+
   const applyDisabledHint =
     selectedRows.length === 0
       ? 'Select at least one row to apply'
-      : !latestMarketPriceDate
-        ? 'No market_prices rows found — cannot date transfers'
-        : undefined
+      : unpriceableSelected.length > 0
+        ? `${unpriceableSelected.length} selected row${unpriceableSelected.length === 1 ? '' : 's'} have no market price history — cannot apply`
+        : selectedRowsMissingDate.length > 0
+          ? `${selectedRowsMissingDate.length} selected row${selectedRowsMissingDate.length === 1 ? '' : 's'} need a transfer date`
+          : undefined
 
   async function handleApply() {
     setNotice(null)
     try {
-      const transfers = selectedRows.map(r => ({
-        ticker:   r.ticker,
-        action:   r.proposedAction,
-        quantity: Math.abs(r.unitDelta),
-        price:    r.proposedPrice,
-        reason:   r.bucket,
+      // v27p: include transferDate per row
+      const transfers = selectedRowsWithDates.map(r => ({
+        ticker:       r.ticker,
+        action:       r.proposedAction,
+        quantity:     Math.abs(r.unitDelta),
+        transferDate: transferDates[r.ticker],
+        reason:       r.bucket,
       }))
       const res = await fetch(
         `/api/broker/sessions/${sessionId}/apply-reconciliation`,
@@ -217,12 +254,24 @@ export default function CSCSVariancePanel({
       )
       const j = await res.json()
       if (!res.ok) {
+        // v27p: surface per-row missing-price errors structurally
+        if (Array.isArray(j.missing_price_dates) && j.missing_price_dates.length > 0) {
+          const detail = j.missing_price_dates
+            .slice(0, 3)
+            .map((p: any) => `${p.ticker}@${p.date}`)
+            .join(', ')
+          setNotice({
+            kind: 'error',
+            text: `${j.error} ${detail}${j.missing_price_dates.length > 3 ? '…' : ''}`,
+          })
+          return
+        }
         setNotice({ kind: 'error', text: j.error || `HTTP ${res.status}` })
         return
       }
       setNotice({
         kind: 'ok',
-        text: `Applied ${j.transferred ?? transfers.length} transfer${(j.transferred ?? transfers.length) === 1 ? '' : 's'} dated ${j.date_used ?? latestMarketPriceDate}` +
+        text: `Applied ${j.transferred ?? transfers.length} transfer${(j.transferred ?? transfers.length) === 1 ? '' : 's'}` +
               (j.nav_reconstruction?.navEntriesAdded > 0
                 ? ` · ${j.nav_reconstruction.navEntriesAdded} NAV entries added`
                 : ''),
@@ -246,6 +295,7 @@ export default function CSCSVariancePanel({
             {canonical.accountName || canonical.houseName || 'CSCS account'}
             {canonical.cscsNumber && ` · ${canonical.cscsNumber}`}
             {canonical.balanceDate && ` · canonical as of ${fmtDate(canonical.balanceDate)}`}
+            {portfolioStartDate && ` · portfolio start ${fmtDate(portfolioStartDate)}`}
           </div>
         </div>
         <div className="panel-meta">
@@ -256,7 +306,6 @@ export default function CSCSVariancePanel({
         </div>
       </div>
 
-      {/* Notice */}
       {notice && (
         <div
           className={notice.kind === 'ok' ? 'alert-h alert-h-info' : 'alert-h alert-h-critical'}
@@ -315,11 +364,11 @@ export default function CSCSVariancePanel({
           <div className="h-kpi-sub">out of scope</div>
         </div>
         <div className="h-kpi">
-          <div className="h-kpi-label">Transfer date</div>
+          <div className="h-kpi-label">Date picker</div>
           <div className="h-kpi-value" style={{ fontSize: 14 }}>
-            {fmtDate(latestMarketPriceDate)}
+            per row
           </div>
-          <div className="h-kpi-sub">latest market price</div>
+          <div className="h-kpi-sub">priced dates only</div>
         </div>
       </div>
 
@@ -394,6 +443,7 @@ export default function CSCSVariancePanel({
                 <th className="num">Portfolio</th>
                 <th className="num">Δ units</th>
                 <th>Action</th>
+                <th>Transfer date</th>
                 <th className="num">Price</th>
                 <th className="num">Amount</th>
                 <th>Note</th>
@@ -401,18 +451,27 @@ export default function CSCSVariancePanel({
             </thead>
             <tbody>
               {filteredRows.map((r: VarianceRow) => {
-                const isActionable = r.proposedAction !== null
-                const isSelected   = selected[r.ticker] || false
-                const transferAmount = Math.abs(r.unitDelta) * r.proposedPrice
+                const isActionable    = r.proposedAction !== null
+                const isSelected      = selected[r.ticker] || false
+                const chosenDate      = transferDates[r.ticker] || ''
+                const chosenPrice     = chosenDate
+                  ? (r.availablePriceDates.includes(chosenDate)
+                      ? // amount-preview only — server is authoritative
+                        r.proposedPrice
+                      : 0)
+                  : r.proposedPrice
+                const transferAmount  = Math.abs(r.unitDelta) * chosenPrice
+                const hasPricedDates  = r.availablePriceDates.length > 0
+                const cantApply       = isActionable && !hasPricedDates
                 return (
                   <tr
                     key={r.ticker}
                     style={{
-                      opacity: isActionable ? 1 : 0.55,
+                      opacity: isActionable ? (cantApply ? 0.6 : 1) : 0.55,
                     }}
                   >
                     <td style={{ textAlign: 'center' }}>
-                      {isActionable ? (
+                      {isActionable && hasPricedDates ? (
                         <input
                           type="checkbox"
                           checked={isSelected}
@@ -428,7 +487,12 @@ export default function CSCSVariancePanel({
                           }
                         />
                       ) : (
-                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>
+                        <span
+                          style={{ fontSize: 10, color: 'var(--text-3)' }}
+                          title={cantApply ? 'No market_prices history for this ticker' : undefined}
+                        >
+                          —
+                        </span>
                       )}
                     </td>
                     <td>
@@ -468,8 +532,35 @@ export default function CSCSVariancePanel({
                         <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>
                       )}
                     </td>
+                    {/* v27p: per-row date picker */}
+                    <td>
+                      {isActionable && hasPricedDates ? (
+                        <select
+                          className="select-h"
+                          value={chosenDate}
+                          onChange={(e) => setDate(r.ticker, e.target.value)}
+                          style={{
+                            fontSize: 11,
+                            padding: '2px 6px',
+                            minWidth: 130,
+                            fontFamily: 'monospace',
+                          }}
+                          title={`${r.availablePriceDates.length} priced dates available for ${r.ticker}`}
+                        >
+                          {r.availablePriceDates.map(d => (
+                            <option key={d} value={d}>{d}</option>
+                          ))}
+                        </select>
+                      ) : isActionable ? (
+                        <span style={{ fontSize: 11, color: 'var(--neg)' }} title="No market_prices entries for this ticker">
+                          no priced dates
+                        </span>
+                      ) : (
+                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>
+                      )}
+                    </td>
                     <td className="num num-serif">
-                      {r.proposedPrice > 0 ? fmtNum(r.proposedPrice, 2) : '—'}
+                      {chosenPrice > 0 ? fmtNum(chosenPrice, 2) : '—'}
                     </td>
                     <td className="num num-serif">
                       {isActionable && transferAmount > 0
@@ -480,7 +571,7 @@ export default function CSCSVariancePanel({
                       style={{
                         fontSize: 11,
                         color: 'var(--text-2)',
-                        maxWidth: 280,
+                        maxWidth: 240,
                         overflow: 'hidden',
                         textOverflow: 'ellipsis',
                         whiteSpace: 'nowrap',
@@ -518,7 +609,7 @@ export default function CSCSVariancePanel({
         />
         <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
           {selectedRows.length > 0
-            ? `Will write ${selectedRows.length} TRANSFER_IN/OUT row${selectedRows.length === 1 ? '' : 's'} dated ${fmtDate(latestMarketPriceDate)}, then rebuild holdings and reconstruct NAV.`
+            ? `Will write ${selectedRows.length} TRANSFER row${selectedRows.length === 1 ? '' : 's'}, each dated per the picker above. Server resolves price from market_prices for the chosen (ticker, date). Then rebuild holdings and reconstruct NAV.`
             : 'No rows selected. Tick at least one row above to apply.'}
         </div>
       </div>

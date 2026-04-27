@@ -1,18 +1,23 @@
 /**
- * app/admin/broker/[sessionId]/page.tsx — v27g
+ * app/admin/broker/[sessionId]/page.tsx — v27p
  *
- * v27g additions:
- *   - FileRow.kind union extended to include 'canonical_positions'
- *   - SessionDetail extended with optional `canonical` section
- *   - CSCSVariancePanel rendered post-commit when canonical is present
- *   - CANON pill added to file kind cell in the Files panel
+ * v27p change: commit gate releases on parse_warning and audit_warning.
  *
- * v21b-3b-hotfix-1 baseline preserved: include-in-commit checkboxes,
- * Commit/Rollback ConfirmButtons, structured missing-instruments error,
- * unbalanced-audit banner.
+ * The previous gate (v27g) was strict on parse_failed and treated it as
+ * a binary block. v27p separates three concerns:
  *
- * Inherits Sidebar from app/admin/layout.tsx — this page does NOT
- * render its own (pitfall #38).
+ *   - parse_failed   → blocks commit (truly no usable rows)
+ *   - parse_warning  → banner only, commit enabled (header metadata
+ *                       missing but rows extracted; e.g. CN with no CSCS
+ *                       number but 290+ trades)
+ *   - audit_warning  → banner only, commit enabled (statement closing
+ *                       balance off; operator can deselect affected
+ *                       rows and commit the rest)
+ *
+ * The CSCSVariancePanel now also receives portfolioStartDate to power
+ * the smart-default for cscs_only (held-orphan) date pickers.
+ *
+ * Inherits Sidebar from app/admin/layout.tsx (pitfall #38).
  */
 
 'use client'
@@ -56,7 +61,7 @@ type StagedRow = {
 
 type FileRow = {
   id: string
-  kind: 'contract_notes' | 'statement' | 'canonical_positions'   // v27g
+  kind: 'contract_notes' | 'statement' | 'canonical_positions'
   filename: string
   storage_path: string
   size_bytes: number | null
@@ -77,14 +82,13 @@ type FileRow = {
   parsed_at: string | null
 }
 
-// v27g: canonical section returned by GET when session is committed and
-// canonical_positions file is present + parsed.
 type CanonicalSection = {
   brokerFileId: string
   filename: string
   parsed: ParsedCSCS | null
   variance: VarianceResult | null
   latestMarketPriceDate: string | null
+  portfolioStartDate: string | null
   error?: string
 }
 
@@ -110,7 +114,7 @@ type SessionDetail = {
     by_action: Record<string, number>
     all_balanced: boolean
   }
-  canonical?: CanonicalSection | null   // v27g
+  canonical?: CanonicalSection | null
 }
 
 const RECON_KIND_ORDER = [
@@ -151,20 +155,13 @@ function reconKindPillClass(kind: string): string {
 
 function actionPillClass(action: string): string {
   switch (action) {
-    case 'BUY':
-      return 'pill pill-buy'
-    case 'SELL':
-      return 'pill pill-sell'
-    case 'FEE':
-      return 'pill pill-warn'
-    case 'TRANSFER_IN':
-      return 'pill pill-ok'
-    case 'TRANSFER_OUT':
-      return 'pill pill-breach'
-    case 'INCOME':
-      return 'pill pill-ok'
-    default:
-      return 'pill'
+    case 'BUY':           return 'pill pill-buy'
+    case 'SELL':          return 'pill pill-sell'
+    case 'FEE':           return 'pill pill-warn'
+    case 'TRANSFER_IN':   return 'pill pill-ok'
+    case 'TRANSFER_OUT':  return 'pill pill-breach'
+    case 'INCOME':        return 'pill pill-ok'
+    default:              return 'pill'
   }
 }
 
@@ -298,7 +295,6 @@ function ConfirmButton({
   )
 }
 
-// ─── Notice type — supports structured missing-instruments payload ──
 type Notice =
   | { kind: 'ok'; text: string }
   | { kind: 'error'; text: string; missingInstruments?: string[]; hint?: string }
@@ -395,10 +391,14 @@ export default function BrokerSessionDetailPage(props: {
           j.nav_reconstruction?.navEntriesAdded > 0
             ? ` · ${j.nav_reconstruction.navEntriesAdded} NAV entries added`
             : ''
+        }${
+          j.recovery_synthesis?.applied && j.recovery_synthesis?.inserted > 0
+            ? ` · ${j.recovery_synthesis.inserted} recovery synth row${j.recovery_synthesis.inserted === 1 ? '' : 's'} (₦${j.recovery_synthesis.totalAmount?.toLocaleString?.() ?? '?'})`
+            : ''
         }`,
       })
       await load()
-      setTimeout(() => setNotice(null), 6000)
+      setTimeout(() => setNotice(null), 10000)
     } catch (err: any) {
       setNotice({ kind: 'error', text: err.message || 'Network error' })
       setTimeout(() => setNotice(null), 8000)
@@ -467,11 +467,21 @@ export default function BrokerSessionDetailPage(props: {
   )
 
   const sessionStatus = data.session.status
-  // v27g: parse-failed check excludes canonical_positions — a failed canonical
-  // parse should not block commit of CN+statements.
+
+  // v27p: gate strict on 'parse_failed' only. parse_warning and audit_warning
+  // are non-blocking (banners only).
   const anyTradeParseFailed = data.files.some(
     (f) => f.kind !== 'canonical_positions' && f.parse_status === 'parse_failed'
   )
+
+  // v27p: surface parse_warning and audit_warning files for banner display
+  const tradeFilesWithWarnings = data.files.filter(
+    (f) => f.kind !== 'canonical_positions' &&
+           (f.parse_status === 'parse_warning' || f.parse_status === 'audit_warning')
+  )
+  const auditWarningFiles = tradeFilesWithWarnings.filter(f => f.parse_status === 'audit_warning')
+  const parseWarningFiles = tradeFilesWithWarnings.filter(f => f.parse_status === 'parse_warning')
+
   const isCommitted = sessionStatus === 'committed'
   const canCommit =
     !isCommitted &&
@@ -483,7 +493,7 @@ export default function BrokerSessionDetailPage(props: {
   const commitDisabledHint = isCommitted
     ? 'Already committed — rollback first to re-commit'
     : anyTradeParseFailed
-      ? 'At least one trade file failed to parse — fix or exclude before committing'
+      ? 'At least one trade file failed to parse with no usable rows — fix the upload before committing'
       : data.summary.staged_count === 0
         ? 'No staged rows to commit'
         : !data.staged.some((s) => s.include_in_commit)
@@ -496,7 +506,6 @@ export default function BrokerSessionDetailPage(props: {
 
   const includedCount = data.staged.filter((s) => s.include_in_commit).length
 
-  // v27g: detect canonical reconciliation availability
   const canonicalSection = data.canonical
   const showVariancePanel =
     isCommitted &&
@@ -677,22 +686,49 @@ export default function BrokerSessionDetailPage(props: {
               ? 'Transactions live'
               : anyTradeParseFailed
                 ? 'Parse errors — review'
-                : 'Preview only'}
+                : tradeFilesWithWarnings.length > 0
+                  ? 'Warnings — review and commit'
+                  : 'Preview only'}
           </div>
         </div>
       </div>
 
-      {/* Unbalanced audit warning */}
-      {auditedStatements.length > 0 && !data.summary.all_balanced && (
+      {/* v27p: audit_warning banner — non-blocking */}
+      {!isCommitted && auditWarningFiles.length > 0 && (
         <div className="alert-h alert-h-warn" style={{ marginBottom: 20 }}>
-          <strong>Audit unbalanced.</strong> At least one statement's computed
-          closing balance does not match its asserted closing balance. Review
-          the Files panel below before committing — discrepancies often
-          indicate a missing statement or unmapped cash event.
+          <strong>Statement audit imbalance.</strong>{' '}
+          {auditWarningFiles.length === 1
+            ? `${auditWarningFiles[0].filename}'s computed closing balance does not match its asserted closing balance.`
+            : `${auditWarningFiles.length} statement files have computed closing balances that do not match their asserted closing balance.`
+          }{' '}
+          Trade rows extracted successfully — commit is enabled. Review the affected file(s) below; if the diff
+          is from missing transactions you can deselect the closest related staged rows, commit the rest,
+          and add corrections later.
         </div>
       )}
 
-      {/* v27g: canonical present but errored */}
+      {/* v27p: parse_warning banner — informational */}
+      {!isCommitted && parseWarningFiles.length > 0 && (
+        <div className="alert-h alert-h-info" style={{ marginBottom: 20 }}>
+          <strong>Header metadata incomplete.</strong>{' '}
+          {parseWarningFiles.length === 1
+            ? `${parseWarningFiles[0].filename}: ${parseWarningFiles[0].parse_error}`
+            : `${parseWarningFiles.length} files have weak header extraction (account holder or CSCS number missing).`
+          }{' '}
+          Trade rows extracted normally — this is informational only and does not block commit.
+        </div>
+      )}
+
+      {/* legacy unbalanced warning kept for compat with audit_passes=false but parse_status=parsed */}
+      {auditedStatements.length > 0 && !data.summary.all_balanced && auditWarningFiles.length === 0 && (
+        <div className="alert-h alert-h-warn" style={{ marginBottom: 20 }}>
+          <strong>Audit unbalanced.</strong> At least one statement's computed
+          closing balance does not match its asserted closing balance. Review
+          the Files panel below before committing.
+        </div>
+      )}
+
+      {/* canonical present but errored */}
       {isCommitted && canonicalSection && canonicalSection.error && (
         <div className="alert-h alert-h-warn" style={{ marginBottom: 20 }}>
           <strong>Canonical reconciliation unavailable.</strong> {canonicalSection.error}
@@ -785,6 +821,22 @@ export default function BrokerSessionDetailPage(props: {
                   {f.parse_status === 'parsed' && (
                     <span className="pill pill-ok">Parsed</span>
                   )}
+                  {f.parse_status === 'parse_warning' && (
+                    <span
+                      className="pill pill-warn"
+                      title={f.parse_error || 'parse warning'}
+                    >
+                      Warning
+                    </span>
+                  )}
+                  {f.parse_status === 'audit_warning' && (
+                    <span
+                      className="pill pill-warn"
+                      title={f.parse_error || 'audit imbalance'}
+                    >
+                      Audit warn
+                    </span>
+                  )}
                   {f.parse_status === 'parse_failed' && (
                     <span
                       className="pill pill-breach"
@@ -809,13 +861,14 @@ export default function BrokerSessionDetailPage(props: {
         </table>
       </div>
 
-      {/* v27g: CSCS variance panel — post-commit only, when canonical present + parsed */}
+      {/* CSCS variance panel — post-commit only */}
       {showVariancePanel && (
         <CSCSVariancePanel
           sessionId={sessionId}
           canonical={canonicalSection!.parsed!}
           variance={canonicalSection!.variance!}
           latestMarketPriceDate={canonicalSection!.latestMarketPriceDate}
+          portfolioStartDate={canonicalSection!.portfolioStartDate}
           onApplied={load}
         />
       )}

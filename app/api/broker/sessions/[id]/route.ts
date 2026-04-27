@@ -1,23 +1,23 @@
 /**
- * app/api/broker/sessions/[id]/route.ts — v27g
+ * app/api/broker/sessions/[id]/route.ts — v27p
  *
- * v27g: Extended response with `canonical` key. When the session contains
- * a canonical_positions file AND the session is committed, the GET handler:
- *   1. Downloads the canonical CSV/XLSX from storage
- *   2. Parses via lib/cscs-parser
- *   3. Loads current portfolio holdings
- *   4. Loads latest market_prices for the relevant tickers
- *   5. Computes variance via lib/variance-engine
- *   6. Loads MAX(market_prices.price_date) for transfer-dating in the apply UI
- *   7. Returns parsed metadata + variance result under `canonical` key
+ * v27p change: variance engine now needs full per-ticker price history
+ * (not just latest price) to power the date picker, plus
+ * portfolio.start_date as the smart-default anchor for cscs_only rows.
  *
- * If the canonical file's parse_status is 'parse_failed' or the session is
- * still pre-commit, the canonical key is omitted from the response (the
- * staging UI just shows the file in the files panel without the variance
- * panel). Errors in variance computation are returned as a `canonical.error`
- * string rather than failing the whole GET — this is a best-effort enhancement.
+ *   1. Download canonical from storage
+ *   2. Parse via lib/cscs-parser
+ *   3. Load current portfolio holdings
+ *   4. Load full market_prices history for relevant tickers (NEW: history,
+ *      not just latest)
+ *   5. Load portfolio.start_date (NEW)
+ *   6. Compute variance via lib/variance-engine (NEW signature)
+ *   7. Returns parsed metadata + variance result + portfolio start date
  *
- * v21b-3b baseline preserved otherwise.
+ * v27g baseline preserved otherwise. The latestMarketPriceDate field
+ * is kept in the response shape for backward-compat with the panel —
+ * v27p uses suggestedTransferDate per row instead, but legacy code
+ * paths (e.g. apply-reconciliation default) may still reference it.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -28,6 +28,7 @@ import {
   computeVariance,
   type CanonicalPosition,
   type PortfolioPosition,
+  type PriceEntry,
   type VarianceResult,
 } from '@/lib/variance-engine'
 
@@ -47,13 +48,13 @@ function admin(): SupabaseClient {
   })
 }
 
-// v27g: canonical section shape for the response
 interface CanonicalSection {
   brokerFileId:           string
   filename:               string
   parsed:                 ParsedCSCS | null
   variance:               VarianceResult | null
   latestMarketPriceDate:  string | null
+  portfolioStartDate:     string | null   // v27p
   error?:                 string
 }
 
@@ -119,7 +120,6 @@ export async function GET(
       return new Date(f.created_at) < new Date(min) ? f.created_at : min
     }, firstFile.created_at)
 
-    // v27g: only include trade files in fileIds for staged_transactions query
     const tradeFiles = files.filter(f => f.file_kind !== 'canonical_positions')
     const fileIds = tradeFiles.map((f) => f.id)
 
@@ -195,9 +195,9 @@ export async function GET(
       parsed_at: f.parsed_at,
     }))
 
-    // Derive session-level status from trade files' parse_status set
-    // (canonical_positions is excluded from status derivation since it doesn't
-    // gate commit and tracks alongside the trade lifecycle).
+    // v27p: status derivation accepts the new parse_warning + audit_warning
+    // values. Both are non-failure states. parse_failed remains the only
+    // value that should block commit.
     const parseStatusSet = new Set(tradeFiles.map((f) => f.parse_status))
     let session_status: 'parsed' | 'committed' | 'rolled_back' | 'parse_failed' | 'mixed'
     if (parseStatusSet.size === 1) {
@@ -206,12 +206,18 @@ export async function GET(
       else if (only === 'committed') session_status = 'committed'
       else if (only === 'rolled_back') session_status = 'rolled_back'
       else if (only === 'parse_failed') session_status = 'parse_failed'
+      else if (only === 'parse_warning' || only === 'audit_warning') session_status = 'parsed'
       else session_status = 'mixed'
     } else {
-      session_status = 'mixed'
+      // Mixed set — if it's only the non-failure variants, treat as parsed.
+      const allNonFailure = Array.from(parseStatusSet).every(s =>
+        s === 'parsed' || s === 'parse_warning' || s === 'audit_warning'
+      )
+      if (allNonFailure) session_status = 'parsed'
+      else session_status = 'mixed'
     }
 
-    // ── v27g: build canonical section if applicable ─────────────────
+    // ── v27p: build canonical section ───────────────────────────────
     let canonical: CanonicalSection | null = null
 
     const canonicalFile = files.find(
@@ -225,10 +231,10 @@ export async function GET(
         parsed:       null,
         variance:     null,
         latestMarketPriceDate: null,
+        portfolioStartDate:    null,
       }
 
       try {
-        // 1. Download canonical from storage
         const { data: blob, error: dlErr } = await db.storage
           .from('broker-files')
           .download(canonicalFile.storage_path)
@@ -237,8 +243,6 @@ export async function GET(
           canonical.error = `download: ${dlErr?.message || 'no blob returned'}`
         } else {
           const buf = Buffer.from(await blob.arrayBuffer())
-
-          // 2. Parse
           const aliasMap = await getAliasMap(db)
           const parsed = parseCSCSFile(buf, canonicalFile.original_filename, aliasMap)
           canonical.parsed = parsed
@@ -248,7 +252,7 @@ export async function GET(
               ? parsed.errors.join('; ')
               : 'no rows in canonical file'
           } else {
-            // 3. Load current portfolio holdings
+            // Load current portfolio holdings
             const { data: holdings, error: hErr } = await db
               .from('holdings')
               .select('instrument_id, quantity')
@@ -264,34 +268,45 @@ export async function GET(
                 quantity:      Number(h.quantity ?? 0),
               }))
 
-              // 4. Load latest market prices for relevant tickers
+              // v27p: load portfolio.start_date for smart-default anchor
+              const { data: portfolioRow } = await db
+                .from('portfolios')
+                .select('start_date')
+                .eq('id', portfolioId)
+                .single()
+              const portfolioStartDate: string | null = portfolioRow?.start_date ?? null
+              canonical.portfolioStartDate = portfolioStartDate
+
+              // v27p: load full price history per ticker (not just latest)
               const allTickers = new Set<string>()
               for (const r of parsed.rows) allTickers.add(r.symbol)
               for (const p of portfolioPositions) allTickers.add(p.instrument_id)
-              allTickers.delete('CASH_NGN')   // no market price needed
+              allTickers.delete('CASH_NGN')
 
               const tickerList = Array.from(allTickers)
 
-              let priceMap: Record<string, number> = {}
+              const pricesByTicker: Record<string, PriceEntry[]> = {}
               if (tickerList.length > 0) {
                 const { data: prices, error: pErr } = await db
                   .from('market_prices')
                   .select('instrument_id, price, price_date')
                   .in('instrument_id', tickerList)
-                  .order('price_date', { ascending: false })
+                  .order('price_date', { ascending: true })
                   .limit(50000)
 
                 if (!pErr && prices) {
-                  // Latest price per instrument
                   for (const p of prices) {
-                    if (!(p.instrument_id in priceMap)) {
-                      priceMap[p.instrument_id] = Number(p.price ?? 0)
-                    }
+                    const id = p.instrument_id as string
+                    if (!pricesByTicker[id]) pricesByTicker[id] = []
+                    pricesByTicker[id].push({
+                      date:  p.price_date as string,
+                      price: Number(p.price ?? 0),
+                    })
                   }
                 }
               }
 
-              // 5. Compute variance
+              // v27p: compute variance with new signature
               const canonicalPositions: CanonicalPosition[] = parsed.rows.map(r => ({
                 ticker:       r.symbol,
                 units:        r.units,
@@ -302,10 +317,12 @@ export async function GET(
               canonical.variance = computeVariance(
                 canonicalPositions,
                 portfolioPositions,
-                priceMap
+                pricesByTicker,
+                portfolioStartDate
               )
 
-              // 6. Latest market price date for transfer dating (pitfall #87)
+              // Backward-compat: latestMarketPriceDate (used by legacy paths
+              // and as fallback in panel display when a row has no priced dates).
               const { data: maxDateRows } = await db
                 .from('market_prices')
                 .select('price_date')

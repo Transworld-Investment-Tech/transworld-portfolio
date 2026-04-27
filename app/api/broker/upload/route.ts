@@ -1,24 +1,24 @@
 /**
- * app/api/broker/upload/route.ts — v27g
+ * app/api/broker/upload/route.ts — v27p
  *
- * v27g change: Accept optional `canonical_positions` form field (CSV or
- * XLSX) alongside the existing CN PDF + statements PDFs. The canonical
- * file is the brokerage's CSCS Asset Position extract — a per-portfolio
- * snapshot of currently-held units used post-commit by the variance
- * panel to surface what the broker pipeline missed (recovery shares,
- * cash positions, ticker renames, inception transfers).
+ * v27p change: status decision logic separates three concerns that v27g
+ * conflated under 'parse_failed':
  *
- * Canonical handling:
- *   - Stored to the same `broker-files` storage bucket
- *   - Recorded as broker_files with file_kind = 'canonical_positions'
- *   - Parsed via lib/cscs-parser.ts; account_holder + cscs_number stamped
- *   - NOT entered into staging/reconcile pipeline (no trades to extract)
- *   - Surfaced post-commit by the variance panel on the staging UI
+ *   - 'parsed'        — extraction succeeded, audit passed (or no audit)
+ *   - 'parse_warning' — extraction succeeded, header metadata missing
+ *                       (e.g. CN with no CSCS number but 290+ trade rows)
+ *   - 'audit_warning' — extraction succeeded, audit imbalance present
+ *                       (e.g. statement closing balance off by ₦56k)
+ *   - 'parse_failed'  — extraction genuinely failed, no usable rows
  *
- * v21l baseline preserved otherwise. The uploadPdf helper is generalized
- * to uploadFile with a contentType param so canonical (text/csv or
- * application/vnd.openxmlformats-officedocument.spreadsheetml.sheet) flows
- * through the same upload logic without duplicating the storage code.
+ * Only 'parse_failed' blocks commit. The two _warning states surface as
+ * banners in the staging UI but do not gate the button. Operator can
+ * deselect affected rows and commit the rest.
+ *
+ * The schema CHECK constraint was extended in the v27p SQL migration
+ * (separate from this code ship) to permit the two new values.
+ *
+ * v27g baseline preserved otherwise.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -39,14 +39,12 @@ import { parseCSCSFile } from '@/lib/cscs-parser'
 export const runtime = 'nodejs'
 export const maxDuration = 300
 
-// ─── Supabase admin client ───────────────────────────────────────
 function admin(): SupabaseClient {
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL
   const key = process.env.SUPABASE_SERVICE_ROLE_KEY
   if (!url || !key) {
     throw new Error(
-      'Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars — ' +
-      'set them in Vercel project settings.'
+      'Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY env vars'
     )
   }
   return createClient(url, key, {
@@ -54,7 +52,6 @@ function admin(): SupabaseClient {
   })
 }
 
-// ─── Types for internal bookkeeping ──────────────────────────────
 type FileKind = 'contract_notes' | 'statement' | 'canonical_positions'
 
 interface UploadedFile {
@@ -66,7 +63,30 @@ interface UploadedFile {
   parse_error?: string
 }
 
-// ─── POST handler ────────────────────────────────────────────────
+// v27p: classify CN status. Extraction succeeded if rows.length > 0.
+// Errors that don't reflect extraction failure (missing header metadata)
+// downgrade to parse_warning rather than parse_failed.
+function classifyCnStatus(parsed: ParsedContractNotes): string {
+  if (parsed.rows.length === 0) return 'parse_failed'
+  if (parsed.parse_errors.length === 0) return 'parsed'
+  return 'parse_warning'
+}
+
+// v27p: classify statement status. Audit imbalance gets its own state;
+// no-rows is a hard failure; otherwise parsed.
+function classifyStatementStatus(parsed: ParsedStatement): string {
+  if (parsed.rows.length === 0) return 'parse_failed'
+  if (!parsed.audit.passes) return 'audit_warning'
+  if (parsed.parse_errors.length > 0) return 'parse_warning'
+  return 'parsed'
+}
+
+// v27p: classify canonical status. Same shape as v27g — strict.
+function classifyCanonicalStatus(parsed: { rows: any[]; errors: string[] }): string {
+  if (parsed.errors.length > 0 || parsed.rows.length === 0) return 'parse_failed'
+  return 'parsed'
+}
+
 export async function POST(req: NextRequest) {
   const started = Date.now()
   let supabase: SupabaseClient
@@ -76,10 +96,8 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: err.message }, { status: 500 })
   }
 
-  // v21l: Load alias map once at the top of the handler.
   const aliasMap = await getAliasMap(supabase)
 
-  // ── Parse form ───────────────────────────────────────────
   let form: FormData
   try {
     form = await req.formData()
@@ -94,7 +112,7 @@ export async function POST(req: NextRequest) {
   const uploaded_by    = form.get('uploaded_by')
   const cnField        = form.get('contract_notes')
   const stFields       = form.getAll('statements')
-  const canonicalField = form.get('canonical_positions')   // v27g
+  const canonicalField = form.get('canonical_positions')
 
   if (typeof portfolio_id !== 'string' || !portfolio_id) {
     return NextResponse.json({ error: 'portfolio_id is required' }, { status: 400 })
@@ -109,7 +127,6 @@ export async function POST(req: NextRequest) {
     (f): f is File => f instanceof File
   )
 
-  // ── Verify portfolio exists ──────────────────────────────
   const { data: portfolio, error: pErr } = await supabase
     .from('portfolios')
     .select('id, name, label, status')
@@ -158,7 +175,9 @@ export async function POST(req: NextRequest) {
         const buf  = Buffer.from(await cnField.arrayBuffer())
         parsedCN   = await parseContractNotesPdf(buf)
 
-        const parse_status = parsedCN.parse_errors.length ? 'parse_failed' : 'parsed'
+        // v27p: three-way classification
+        const parse_status = classifyCnStatus(parsedCN)
+
         await supabase
           .from('broker_files')
           .update({
@@ -174,7 +193,11 @@ export async function POST(req: NextRequest) {
         status.parse_status = parse_status
         if (parsedCN.parse_errors.length) {
           status.parse_error = parsedCN.parse_errors.join('; ')
-          errors.push(`contract_notes parse: ${status.parse_error}`)
+          // Only push to errors[] (which surfaces as upload-warnings) if it's
+          // a hard failure or a notable warning. Header-metadata-only is silent.
+          if (parse_status === 'parse_failed') {
+            errors.push(`contract_notes parse: ${status.parse_error}`)
+          }
         }
       } catch (err: any) {
         await supabase
@@ -229,7 +252,9 @@ export async function POST(req: NextRequest) {
       parsedStatements.push(parsed)
       statementBrokerFileIds.push(up.broker_file_id)
 
-      const parse_status = parsed.audit.passes ? 'parsed' : 'parse_failed'
+      // v27p: three-way classification
+      const parse_status = classifyStatementStatus(parsed)
+
       await supabase
         .from('broker_files')
         .update({
@@ -251,7 +276,9 @@ export async function POST(req: NextRequest) {
       status.parse_status = parse_status
       if (parsed.parse_errors.length) {
         status.parse_error = parsed.parse_errors.join('; ')
-        errors.push(`${file.name}: ${status.parse_error}`)
+        if (parse_status === 'parse_failed') {
+          errors.push(`${file.name}: ${status.parse_error}`)
+        }
       }
     } catch (err: any) {
       await supabase
@@ -270,7 +297,7 @@ export async function POST(req: NextRequest) {
     uploadedFiles.push(status as UploadedFile)
   }
 
-  // ── v27g: Upload + parse canonical positions (optional) ─────────
+  // ── Upload + parse canonical positions (optional) ─────────
   if (canonicalField instanceof File) {
     const lower = canonicalField.name.toLowerCase()
     const isXlsx = lower.endsWith('.xlsx')
@@ -309,9 +336,8 @@ export async function POST(req: NextRequest) {
           const buf    = Buffer.from(await canonicalField.arrayBuffer())
           const parsed = parseCSCSFile(buf, canonicalField.name, aliasMap)
 
-          const parse_status = parsed.errors.length > 0 || parsed.rows.length === 0
-            ? 'parse_failed'
-            : 'parsed'
+          // v27p: explicit classifier for canonical (still binary semantics)
+          const parse_status = classifyCanonicalStatus(parsed)
 
           await supabase
             .from('broker_files')
@@ -349,7 +375,7 @@ export async function POST(req: NextRequest) {
     }
   }
 
-  // ── Reconcile + stage (CN + statements only — canonical excluded) ─
+  // ── Reconcile + stage (CN + statements only) ─────────────
   if (!parsedCN || !cnBrokerFileId) {
     return NextResponse.json(
       {
@@ -405,7 +431,6 @@ export async function POST(req: NextRequest) {
   )
 }
 
-// ─── GET: usage doc ──────────────────────────────────────────────
 export async function GET() {
   return NextResponse.json({
     endpoint: '/api/broker/upload',
@@ -414,7 +439,7 @@ export async function GET() {
       portfolio_id:        'UUID of target portfolio (required)',
       contract_notes:      'single PDF (required)',
       statements:          '0..N PDFs',
-      canonical_positions: 'optional single CSV or XLSX (CSCS Asset Position extract) [v27g]',
+      canonical_positions: 'optional single CSV or XLSX (CSCS Asset Position extract)',
       uploaded_by:         'optional text identifier',
     },
     returns: 'broker_files (array), staged_count, reconciliation_summary, upload_session_id, errors',
@@ -430,8 +455,6 @@ function aliasTicker(
   return applyAlias(t, aliasMap)
 }
 
-// v27g: generalised from uploadPdf — contentType is now a parameter so
-// canonical_positions (csv/xlsx) flows through the same code path as PDFs.
 async function uploadFile(
   supabase: SupabaseClient,
   portfolio_id: string,

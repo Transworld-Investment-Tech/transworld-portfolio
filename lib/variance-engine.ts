@@ -1,27 +1,36 @@
 /**
- * lib/variance-engine.ts — v27g
+ * lib/variance-engine.ts — v27p
  *
- * Pure variance engine. Compares CSCS canonical positions to current
- * portfolio holdings and classifies each ticker into one of six buckets
- * with a suggested reconciliation action.
+ * v27p change: per-row date picker support for held-orphan transfers.
  *
- * Buckets:
- *   match              — units agree within tolerance; no action
- *   cscs_only          — canonical has it, portfolio doesn't → TRANSFER_IN (auto)
- *   top_up_needed      — both have it, canonical has more → TRANSFER_IN delta (auto)
- *   portfolio_only     — portfolio has it, canonical doesn't → TRANSFER_OUT (review)
- *   portfolio_overshoot— both have it, portfolio has more → TRANSFER_OUT delta (review)
- *   cash_out_of_scope  — CASH_NGN; CSCS does not track cash; ignore
+ * Adds two new VarianceRow fields:
+ *   - suggestedTransferDate: smart default picked by bucket
+ *   - availablePriceDates:   the dates this ticker has a market_prices row
  *
- * The "auto" buckets are checked-by-default in the apply UI. The "review"
- * buckets are unchecked-by-default — operator must opt in. CASH is info-only.
+ * Smart-default rules (suggestedTransferDate):
+ *   - cscs_only         → portfolio.start_date (operator can override)
+ *                         Falls back to latest priced date if start_date
+ *                         predates the ticker's first market_price.
+ *   - top_up_needed     → latest priced date for this ticker
+ *   - portfolio_only    → latest priced date for this ticker
+ *   - portfolio_overshoot → latest priced date for this ticker
  *
- * Pricing convention (matches Reconciliation Playbook with the Unit Cost
- * branch collapsed because the actual CSCS export carries CLOSINGPRICE
- * but no Unit Cost):
- *   - TRANSFER_IN: canonical CLOSINGPRICE if > 0, else latest market price
- *   - TRANSFER_OUT: latest market price (operator can refine for delisted
- *     in v27h once Delisted_shares.xlsx ingestion ships)
+ * The pricesByTicker map is the full price history per ticker, sorted
+ * ascending. The panel uses this to constrain the date picker via
+ * <datalist> — operator only sees dates where the ticker actually has
+ * a price, eliminating the "I picked 2018-06-15 but FBNH has no price
+ * that day" class of bug.
+ *
+ * v27p also collapses the "TRANSFER_IN price = canonical CLOSINGPRICE"
+ * branch — with a per-row date picker, the price is always derived
+ * server-side from market_prices for the chosen date. The proposedPrice
+ * field stays for backward compatibility with the panel's amount preview,
+ * but the apply route now ignores it and re-resolves price by date lookup.
+ *
+ * Pricing convention (v27p):
+ *   proposedPrice = market_prices.price for (ticker, suggestedTransferDate)
+ *                   if available, else canonical CLOSINGPRICE, else 0.
+ *   This is just a UI-side amount estimate — the server is authoritative.
  */
 
 export type VarianceBucket =
@@ -42,10 +51,14 @@ export interface VarianceRow {
   portfolioUnits: number
   unitDelta: number          // canonical - portfolio
   canonicalPrice: number
-  proposedPrice: number      // price for the suggested transfer
+  proposedPrice: number      // amount preview only — server re-resolves
   symbolName: string
-  autoApply: boolean         // checked-by-default in the apply UI
-  note: string               // explanation for review buckets
+  autoApply: boolean
+  note: string
+
+  // v27p: per-row date picker support
+  suggestedTransferDate: string | null   // ISO YYYY-MM-DD or null if no priced dates
+  availablePriceDates:   string[]        // sorted ascending; subset of market_prices.price_date for this ticker
 }
 
 export interface CanonicalPosition {
@@ -76,30 +89,62 @@ export interface VarianceResult {
   summary: VarianceSummary
 }
 
-const UNITS_TOLERANCE = 0.01
-
-function transferInPrice(
-  canonicalPrice: number,
-  marketPrice: number
-): number {
-  if (canonicalPrice > 0) return canonicalPrice
-  if (marketPrice > 0) return marketPrice
-  return 0
+// v27p: extended price history input
+export interface PriceEntry {
+  date:  string   // ISO YYYY-MM-DD
+  price: number
 }
 
-function transferOutPrice(
-  canonicalPrice: number,
-  marketPrice: number
-): number {
-  if (marketPrice > 0) return marketPrice
-  if (canonicalPrice > 0) return canonicalPrice
+const UNITS_TOLERANCE = 0.01
+
+/**
+ * Pick smart default transfer date for a row.
+ * Returns null if the ticker has no priced dates at all.
+ */
+function pickSuggestedDate(
+  bucket: VarianceBucket,
+  priceHistory: PriceEntry[],
+  portfolioStartDate: string | null
+): string | null {
+  if (priceHistory.length === 0) return null
+
+  const latest = priceHistory[priceHistory.length - 1].date
+
+  if (bucket === 'cscs_only') {
+    // Held orphan — likely arrived at portfolio inception.
+    if (portfolioStartDate) {
+      // If portfolio.start_date predates this ticker's first priced date,
+      // fall back to the earliest priced date (we can't price an instrument
+      // before market_prices has data for it).
+      const earliest = priceHistory[0].date
+      if (portfolioStartDate < earliest) return earliest
+
+      // Find the priced date closest to portfolioStartDate (prefer on-or-after).
+      // Operator can change in the picker.
+      for (const p of priceHistory) {
+        if (p.date >= portfolioStartDate) return p.date
+      }
+      return latest
+    }
+    return latest
+  }
+
+  // top_up_needed / portfolio_only / portfolio_overshoot → latest priced date
+  return latest
+}
+
+function priceAt(history: PriceEntry[], date: string): number {
+  for (const p of history) {
+    if (p.date === date) return p.price
+  }
   return 0
 }
 
 export function computeVariance(
   canonical: CanonicalPosition[],
   portfolio: PortfolioPosition[],
-  latestMarketPrices: Record<string, number>
+  pricesByTicker: Record<string, PriceEntry[]>,
+  portfolioStartDate: string | null
 ): VarianceResult {
   const portfolioMap = new Map<string, number>()
   for (const p of portfolio) {
@@ -112,65 +157,65 @@ export function computeVariance(
   // Walk canonical first.
   for (const c of canonical) {
     seen.add(c.ticker)
-    const portUnits = portfolioMap.get(c.ticker) ?? 0
-    const delta = c.units - portUnits
-    const marketPrice = latestMarketPrices[c.ticker] ?? 0
+    const portUnits   = portfolioMap.get(c.ticker) ?? 0
+    const delta       = c.units - portUnits
+    const history     = pricesByTicker[c.ticker] ?? []
+    const datesList   = history.map(p => p.date)
 
     if (Math.abs(delta) < UNITS_TOLERANCE) {
       rows.push({
-        ticker: c.ticker,
-        bucket: 'match',
-        proposedAction: null,
-        canonicalUnits: c.units,
-        portfolioUnits: portUnits,
-        unitDelta: 0,
-        canonicalPrice: c.closingPrice,
-        proposedPrice: 0,
-        symbolName: c.symbolName,
-        autoApply: false,
-        note: '',
+        ticker: c.ticker, bucket: 'match', proposedAction: null,
+        canonicalUnits: c.units, portfolioUnits: portUnits, unitDelta: 0,
+        canonicalPrice: c.closingPrice, proposedPrice: 0,
+        symbolName: c.symbolName, autoApply: false, note: '',
+        suggestedTransferDate: null, availablePriceDates: datesList,
       })
-    } else if (portUnits === 0) {
+      continue
+    }
+
+    const suggested = pickSuggestedDate(
+      delta > 0 && portUnits === 0 ? 'cscs_only'
+        : delta > 0                ? 'top_up_needed'
+                                   : 'portfolio_overshoot',
+      history,
+      portfolioStartDate
+    )
+    const suggestedPrice = suggested
+      ? priceAt(history, suggested)
+      : (c.closingPrice > 0 ? c.closingPrice : 0)
+
+    if (portUnits === 0) {
       rows.push({
-        ticker: c.ticker,
-        bucket: 'cscs_only',
-        proposedAction: 'TRANSFER_IN',
-        canonicalUnits: c.units,
-        portfolioUnits: 0,
-        unitDelta: delta,
+        ticker: c.ticker, bucket: 'cscs_only', proposedAction: 'TRANSFER_IN',
+        canonicalUnits: c.units, portfolioUnits: 0, unitDelta: delta,
         canonicalPrice: c.closingPrice,
-        proposedPrice: transferInPrice(c.closingPrice, marketPrice),
-        symbolName: c.symbolName,
-        autoApply: true,
+        proposedPrice: suggestedPrice > 0 ? suggestedPrice : c.closingPrice,
+        symbolName: c.symbolName, autoApply: true,
         note: 'CSCS holds this position; portfolio history does not show it. Likely inception transfer or recovery shares.',
+        suggestedTransferDate: suggested,
+        availablePriceDates:   datesList,
       })
     } else if (delta > 0) {
       rows.push({
-        ticker: c.ticker,
-        bucket: 'top_up_needed',
-        proposedAction: 'TRANSFER_IN',
-        canonicalUnits: c.units,
-        portfolioUnits: portUnits,
-        unitDelta: delta,
+        ticker: c.ticker, bucket: 'top_up_needed', proposedAction: 'TRANSFER_IN',
+        canonicalUnits: c.units, portfolioUnits: portUnits, unitDelta: delta,
         canonicalPrice: c.closingPrice,
-        proposedPrice: transferInPrice(c.closingPrice, marketPrice),
-        symbolName: c.symbolName,
-        autoApply: true,
+        proposedPrice: suggestedPrice > 0 ? suggestedPrice : c.closingPrice,
+        symbolName: c.symbolName, autoApply: true,
         note: `Canonical has ${delta.toLocaleString()} more units than portfolio.`,
+        suggestedTransferDate: suggested,
+        availablePriceDates:   datesList,
       })
     } else {
       rows.push({
-        ticker: c.ticker,
-        bucket: 'portfolio_overshoot',
-        proposedAction: 'TRANSFER_OUT',
-        canonicalUnits: c.units,
-        portfolioUnits: portUnits,
-        unitDelta: delta,
+        ticker: c.ticker, bucket: 'portfolio_overshoot', proposedAction: 'TRANSFER_OUT',
+        canonicalUnits: c.units, portfolioUnits: portUnits, unitDelta: delta,
         canonicalPrice: c.closingPrice,
-        proposedPrice: transferOutPrice(c.closingPrice, marketPrice),
-        symbolName: c.symbolName,
-        autoApply: false,
+        proposedPrice: suggestedPrice > 0 ? suggestedPrice : c.closingPrice,
+        symbolName: c.symbolName, autoApply: false,
         note: `Portfolio has ${Math.abs(delta).toLocaleString()} more units than canonical. Review — likely a unit typo or unrecorded SELL.`,
+        suggestedTransferDate: suggested,
+        availablePriceDates:   datesList,
       })
     }
   }
@@ -181,38 +226,33 @@ export function computeVariance(
 
     if (ticker === 'CASH_NGN') {
       rows.push({
-        ticker,
-        bucket: 'cash_out_of_scope',
-        proposedAction: null,
-        canonicalUnits: 0,
-        portfolioUnits: units,
-        unitDelta: -units,
-        canonicalPrice: 0,
-        proposedPrice: 0,
-        symbolName: 'Cash (NGN)',
-        autoApply: false,
+        ticker, bucket: 'cash_out_of_scope', proposedAction: null,
+        canonicalUnits: 0, portfolioUnits: units, unitDelta: -units,
+        canonicalPrice: 0, proposedPrice: 0,
+        symbolName: 'Cash (NGN)', autoApply: false,
         note: 'CSCS does not track operational cash — variance here is expected and should be ignored.',
+        suggestedTransferDate: null, availablePriceDates: [],
       })
       continue
     }
 
-    const marketPrice = latestMarketPrices[ticker] ?? 0
+    const history   = pricesByTicker[ticker] ?? []
+    const datesList = history.map(p => p.date)
+    const suggested = pickSuggestedDate('portfolio_only', history, portfolioStartDate)
+    const suggestedPrice = suggested ? priceAt(history, suggested) : 0
+
     rows.push({
-      ticker,
-      bucket: 'portfolio_only',
-      proposedAction: 'TRANSFER_OUT',
-      canonicalUnits: 0,
-      portfolioUnits: units,
-      unitDelta: -units,
-      canonicalPrice: 0,
-      proposedPrice: transferOutPrice(0, marketPrice),
-      symbolName: '',
-      autoApply: false,
+      ticker, bucket: 'portfolio_only', proposedAction: 'TRANSFER_OUT',
+      canonicalUnits: 0, portfolioUnits: units, unitDelta: -units,
+      canonicalPrice: 0, proposedPrice: suggestedPrice,
+      symbolName: '', autoApply: false,
       note: 'Portfolio holds shares not in canonical. Could be delisted (TRANSFER_OUT at delisting price) or sold elsewhere (offset trade). Review before applying.',
+      suggestedTransferDate: suggested,
+      availablePriceDates:   datesList,
     })
   }
 
-  // Sort: review rows first (need attention), then auto-apply, then matches, then cash.
+  // Sort: review rows first, then auto-apply, then matches, then cash.
   const order: Record<VarianceBucket, number> = {
     portfolio_only: 0,
     portfolio_overshoot: 1,

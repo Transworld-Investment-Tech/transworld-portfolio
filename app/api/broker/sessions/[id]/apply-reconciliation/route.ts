@@ -1,50 +1,25 @@
 /**
- * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27h
+ * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27p
  *
- * v27h change: Added step 8 — re-infer portfolio start metadata after
- * reconciliation transfers are written. Without this, portfolios whose
- * only history is a canonical apply (DON-C-style: created with
- * starting_nav=0, populated only via this route) stayed at starting_nav=0
- * forever even after reconciliation gave them ~₦55M of holdings.
+ * v27p changes:
+ *   1. Per-row transferDate is now REQUIRED in the request body. Operator
+ *      picked a date in the variance panel; server uses that date.
+ *   2. Server re-resolves price by exact (ticker, transferDate) lookup
+ *      against market_prices. The price field in the request body is
+ *      ignored — server is authoritative. If no price exists for the
+ *      (ticker, date) pair, the row fails with a structured error.
+ *   3. Sign convention: TRANSFER_IN and TRANSFER_OUT both write POSITIVE
+ *      amount values, matching lib/recovery-synth.ts and DON-C's
+ *      pre-v27o existing real TRANSFER_IN row. fee-calc.ts and
+ *      analytics.ts use Math.abs() so existing data isn't broken.
+ *      v27g's negative-for-TRANSFER_IN convention was inconsistent
+ *      with every other writer in the codebase — fixed.
  *
- * v27g baseline: Applies CSCS variance reconciliation as TRANSFER_IN/OUT
- * transactions. Called by the variance panel post-commit when an operator
- * picks rows to apply.
+ * Idempotency unchanged: the v27g "selected rows can't reappear after
+ * apply" property holds because variance recomputes against rebuilt
+ * holdings post-apply.
  *
- * Body shape:
- *   {
- *     transfers: [
- *       {
- *         ticker:   string,
- *         action:   'TRANSFER_IN' | 'TRANSFER_OUT',
- *         quantity: number,
- *         price:    number,
- *         reason:   'cscs_only' | 'top_up_needed' |
- *                   'portfolio_only' | 'portfolio_overshoot'
- *       },
- *       ...
- *     ]
- *   }
- *
- * Algorithm:
- *   1. Validate session has a committed canonical_positions broker_file
- *   2. Resolve portfolio_id from that broker_file
- *   3. Resolve transfer date = MAX(market_prices.price_date) [pitfall #87]
- *   4. Validate every ticker exists in instruments master
- *   5. Build transactions rows with notes pattern:
- *      "Reconciliation TRANSFER (session=<id>, ticker=<T>, reason=<bucket>)"
- *   6. Insert
- *   7. rebuildPortfolioHoldings(db, portfolio_id)
- *   8. reconstructPortfolioNav(db, portfolio_id)
- *   9. Return summary
- *
- * Idempotency: not enforced server-side. The client uses the
- * ConfirmButton 4-second pattern for accidental-click protection. After
- * Apply, the parent page reloads and the variance recomputes against
- * updated holdings — already-applied tickers will show as 'match' and
- * won't appear in the actionable filter, so accidental re-apply is
- * structurally hard (operator would have to deliberately reselect a
- * matched row from the 'all' filter).
+ * v27h preserved: step 8 metadata re-inference.
  */
 
 import { NextRequest, NextResponse } from 'next/server'
@@ -69,12 +44,16 @@ function admin(): SupabaseClient {
 }
 
 interface TransferInput {
-  ticker:   string
-  action:   'TRANSFER_IN' | 'TRANSFER_OUT'
-  quantity: number
-  price:    number
-  reason:   string
+  ticker:       string
+  action:       'TRANSFER_IN' | 'TRANSFER_OUT'
+  quantity:     number
+  transferDate: string   // v27p: required, ISO YYYY-MM-DD
+  reason:       string
+  // price field deliberately ignored; server resolves authoritatively
+  price?:       number
 }
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
 
 export async function POST(
   req: NextRequest,
@@ -105,7 +84,7 @@ export async function POST(
       )
     }
 
-    // Basic shape validation
+    // v27p: shape validation now requires transferDate per row
     for (let i = 0; i < transfers.length; i++) {
       const t = transfers[i]
       if (typeof t.ticker !== 'string' || !t.ticker) {
@@ -123,9 +102,9 @@ export async function POST(
           { status: 400 }
         )
       }
-      if (typeof t.price !== 'number' || !Number.isFinite(t.price) || t.price < 0) {
+      if (typeof t.transferDate !== 'string' || !ISO_DATE_RE.test(t.transferDate)) {
         return NextResponse.json(
-          { error: `transfer[${i}] (${t.ticker}): price must be a non-negative number` },
+          { error: `transfer[${i}] (${t.ticker}): transferDate is required and must be ISO YYYY-MM-DD` },
           { status: 400 }
         )
       }
@@ -162,28 +141,7 @@ export async function POST(
 
     const portfolio_id = canonicalFile.portfolio_id as string
 
-    // 2. Resolve transfer date = MAX(market_prices.price_date)  — pitfall #87
-    const { data: maxDateRows, error: maxDateErr } = await db
-      .from('market_prices')
-      .select('price_date')
-      .order('price_date', { ascending: false })
-      .limit(1)
-
-    if (maxDateErr) {
-      return NextResponse.json(
-        { error: `market_prices max date query: ${maxDateErr.message}` },
-        { status: 500 }
-      )
-    }
-    if (!maxDateRows || maxDateRows.length === 0) {
-      return NextResponse.json(
-        { error: 'market_prices is empty — cannot date reconciliation transfers. Import prices first.' },
-        { status: 400 }
-      )
-    }
-    const transferDate = (maxDateRows[0] as any).price_date as string
-
-    // 3. Validate all tickers exist in instruments master
+    // 2. Validate all tickers exist in instruments master
     const distinctTickers = Array.from(new Set(transfers.map(t => t.ticker)))
     const { data: foundInstr, error: instrErr } = await db
       .from('instruments')
@@ -209,19 +167,69 @@ export async function POST(
       )
     }
 
-    // 4. Build transactions rows with traceable notes pattern
-    const txRows = transfers.map(t => ({
-      portfolio_id,
-      trade_date:     transferDate,
-      action:         t.action,
-      instrument_id:  t.ticker,
-      quantity:       t.quantity,
-      price:          t.price,
-      gross_value:    t.quantity * t.price,
-      amount:         t.action === 'TRANSFER_IN' ? -(t.quantity * t.price) : (t.quantity * t.price),
-      notes:          `Reconciliation TRANSFER (session=${session_id}, ticker=${t.ticker}, reason=${t.reason})`,
-      source_file_id: canonicalFile.id,
-    }))
+    // 3. v27p: Resolve price for every (ticker, transferDate) pair via
+    // exact match against market_prices. Build a lookup table in a single
+    // query, then walk transfers.
+    const distinctPairs = Array.from(new Set(transfers.map(t => `${t.ticker}|${t.transferDate}`)))
+    const distinctDates = Array.from(new Set(transfers.map(t => t.transferDate)))
+
+    const { data: priceRows, error: priceErr } = await db
+      .from('market_prices')
+      .select('instrument_id, price_date, price')
+      .in('instrument_id', distinctTickers)
+      .in('price_date', distinctDates)
+      .limit(50000)
+
+    if (priceErr) {
+      return NextResponse.json(
+        { error: `market_prices lookup: ${priceErr.message}` },
+        { status: 500 }
+      )
+    }
+
+    const priceMap: Record<string, number> = {}
+    for (const p of priceRows ?? []) {
+      const key = `${p.instrument_id}|${p.price_date}`
+      priceMap[key] = Number(p.price ?? 0)
+    }
+
+    // Validate every pair found a price
+    const missingPairs: Array<{ ticker: string; date: string }> = []
+    for (const pair of distinctPairs) {
+      if (priceMap[pair] === undefined || priceMap[pair] === null) {
+        const [ticker, date] = pair.split('|')
+        missingPairs.push({ ticker, date })
+      }
+    }
+    if (missingPairs.length > 0) {
+      return NextResponse.json(
+        {
+          error: `Apply blocked: ${missingPairs.length} (ticker, date) pair${missingPairs.length === 1 ? '' : 's'} have no market_prices row.`,
+          missing_price_dates: missingPairs,
+          hint: 'Pick a different date for these rows in the variance panel — only dates with a market price are valid.',
+        },
+        { status: 400 }
+      )
+    }
+
+    // 4. v27p: Build transactions rows. POSITIVE amount for both directions.
+    const txRows = transfers.map(t => {
+      const key   = `${t.ticker}|${t.transferDate}`
+      const price = priceMap[key]
+      const grossValue = Math.abs(t.quantity * price)
+      return {
+        portfolio_id,
+        trade_date:     t.transferDate,
+        action:         t.action,
+        instrument_id:  t.ticker,
+        quantity:       t.quantity,
+        price,
+        gross_value:    grossValue,
+        amount:         grossValue,   // v27p: POSITIVE for both IN and OUT
+        notes:          `Reconciliation TRANSFER (session=${session_id}, ticker=${t.ticker}, reason=${t.reason}, date=${t.transferDate})`,
+        source_file_id: canonicalFile.id,
+      }
+    })
 
     // 5. Insert
     const { data: inserted, error: insErr } = await db
@@ -259,16 +267,7 @@ export async function POST(
       navReconstruction.error = `unexpected: ${e.message || 'unknown'}`
     }
 
-    // 8. v27h: Re-infer portfolio start metadata after reconciliation.
-    //
-    // Reconciliation transfers may shift the earliest transaction date
-    // (e.g., on a portfolio whose only history is the canonical apply,
-    // earliest is the apply date itself; on a portfolio with prior CN
-    // history, earliest stays at the original first trade). Either way,
-    // running inferPortfolioStart now ensures starting_nav reflects
-    // current transaction reality. Without this step, DON-C-style
-    // portfolios (created with starting_nav=0, populated only via
-    // apply-reconciliation) stay at 0 forever.
+    // 8. v27h preserved: re-infer portfolio start metadata
     let metadataBackfill: {
       attempted: boolean
       applied: boolean
@@ -338,7 +337,6 @@ export async function POST(
     return NextResponse.json({
       ok:           true,
       transferred,
-      date_used:    transferDate,
       portfolio_id,
       holdings_rebuild: {
         upserted:              holdingsRebuild.upserted,
