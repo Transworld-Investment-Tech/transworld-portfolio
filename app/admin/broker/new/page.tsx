@@ -1,14 +1,31 @@
 /**
- * app/admin/broker/new/page.tsx — v27g
+ * app/admin/broker/new/page.tsx — v27q-fix1
  *
- * v27g: Added optional canonical positions file picker. The CSCS Asset
- * Position extract (CSV or XLSX) is uploaded alongside CN + statements
- * and surfaced post-commit by the variance panel for one-click
- * reconciliation.
+ * v27q rolled back at apply-time due to an over-broad negative sanity
+ * grep that false-matched on legitimate JSDoc comment references to the
+ * old "serverWarnings" name. Payload is identical; v27q-fix1 ships the
+ * tightened grep patterns in apply-update.sh so the apply succeeds.
  *
- * v21c baseline preserved otherwise: portfolio dropdown, CN required,
- * statements optional 0..N, uploaded_by free text, spinner during
- * parse, redirect to session detail on success.
+ * v27q intent (preserved): Pitfall #106 Part B — surface upload-stage
+ * errors[] prominently instead of silently redirecting on partial-success.
+ *
+ * Background: the upload route returns 200 + errors[] for partial-success
+ * states (e.g. one statement timing out while CN + others succeed). The
+ * v27g implementation redirected to the session detail page on any 200,
+ * pushing errors[] into a non-prominent serverWarnings banner that the
+ * operator could miss. When the v27p Storage bucket misconfiguration
+ * silently rejected the canonical CSV upload, the operator had no way
+ * to see that the file hadn't landed.
+ *
+ * v27q change: if the response contains a non-empty errors[] array, do
+ * NOT redirect. Show a sticky red error block at the top of the page
+ * with a bold heading and an explicit "Continue to session anyway"
+ * button. Operator chooses whether to proceed (statement timeout — they
+ * can refresh later) or retry (canonical missing — they need to redo).
+ *
+ * Everything else preserved from v27g: portfolio dropdown, CN required,
+ * statements optional 0..N, canonical positions optional 0..1,
+ * uploaded_by free text, spinner during parse.
  */
 
 'use client'
@@ -35,17 +52,22 @@ export default function BrokerUploadPage() {
   const [portfolioId, setPortfolioId] = useState<string>('')
   const [contractNotesFile, setContractNotesFile] = useState<File | null>(null)
   const [statementFiles, setStatementFiles] = useState<File[]>([])
-  const [canonicalFile, setCanonicalFile] = useState<File | null>(null)   // v27g
+  const [canonicalFile, setCanonicalFile] = useState<File | null>(null)
   const [uploadedBy, setUploadedBy] = useState<string>('okezie')
 
   const [submitting, setSubmitting] = useState<boolean>(false)
   const [elapsedSec, setElapsedSec] = useState<number>(0)
   const [serverError, setServerError] = useState<string | null>(null)
-  const [serverWarnings, setServerWarnings] = useState<string[]>([])
+
+  // v27q-fix1: replaces the prior serverWarnings approach.
+  // When the response has a non-empty errors[] array we BLOCK redirect,
+  // show this prominently, and require operator decision.
+  const [uploadErrors, setUploadErrors] = useState<string[]>([])
+  const [pendingSessionId, setPendingSessionId] = useState<string | null>(null)
 
   const cnInputRef        = useRef<HTMLInputElement>(null)
   const stmtInputRef      = useRef<HTMLInputElement>(null)
-  const canonicalInputRef = useRef<HTMLInputElement>(null)   // v27g
+  const canonicalInputRef = useRef<HTMLInputElement>(null)
 
   // ─── Load active portfolios ──────────────────────────────────
   useEffect(() => {
@@ -115,7 +137,7 @@ export default function BrokerUploadPage() {
     setStatementFiles(files)
   }
 
-  function onCanonicalChange(e: React.ChangeEvent<HTMLInputElement>) {   // v27g
+  function onCanonicalChange(e: React.ChangeEvent<HTMLInputElement>) {
     const f = e.target.files?.[0] || null
     setCanonicalFile(f)
   }
@@ -130,7 +152,7 @@ export default function BrokerUploadPage() {
     if (stmtInputRef.current) stmtInputRef.current.value = ''
   }
 
-  function clearCanonical() {   // v27g
+  function clearCanonical() {
     setCanonicalFile(null)
     if (canonicalInputRef.current) canonicalInputRef.current.value = ''
   }
@@ -144,7 +166,8 @@ export default function BrokerUploadPage() {
     if (!canSubmit) return
 
     setServerError(null)
-    setServerWarnings([])
+    setUploadErrors([])
+    setPendingSessionId(null)
     setSubmitting(true)
 
     try {
@@ -155,7 +178,7 @@ export default function BrokerUploadPage() {
         fd.append('statements', f)
       }
       if (canonicalFile) {
-        fd.append('canonical_positions', canonicalFile)   // v27g
+        fd.append('canonical_positions', canonicalFile)
       }
       if (uploadedBy.trim()) {
         fd.append('uploaded_by', uploadedBy.trim())
@@ -184,10 +207,7 @@ export default function BrokerUploadPage() {
       }
 
       const sessionId = data.upload_session_id as string | undefined
-
-      if (Array.isArray(data.errors) && data.errors.length > 0) {
-        setServerWarnings(data.errors)
-      }
+      const errs      = Array.isArray(data.errors) ? (data.errors as string[]) : []
 
       if (!sessionId) {
         setSubmitting(false)
@@ -197,11 +217,33 @@ export default function BrokerUploadPage() {
         return
       }
 
+      // v27q: any non-empty errors[] blocks the redirect.
+      // Operator sees the errors prominently and chooses whether to proceed.
+      if (errs.length > 0) {
+        setSubmitting(false)
+        setUploadErrors(errs)
+        setPendingSessionId(sessionId)
+        return
+      }
+
+      // Clean success — redirect.
       router.push(`/admin/broker/${sessionId}`)
     } catch (err: any) {
       setSubmitting(false)
       setServerError(err?.message || 'Network error during upload')
     }
+  }
+
+  function continueToSessionAnyway() {
+    if (pendingSessionId) {
+      router.push(`/admin/broker/${pendingSessionId}`)
+    }
+  }
+
+  function dismissErrorsAndStartOver() {
+    setUploadErrors([])
+    setPendingSessionId(null)
+    setServerError(null)
   }
 
   // ─── Render ──────────────────────────────────────────────────
@@ -231,16 +273,76 @@ export default function BrokerUploadPage() {
         </div>
       )}
 
-      {serverWarnings.length > 0 && (
-        <div className="alert-h alert-h-warn" style={{ marginBottom: 16 }}>
-          <strong>Upload completed with warnings:</strong>
-          <ul style={{ margin: '6px 0 0 18px', padding: 0 }}>
-            {serverWarnings.map((w, i) => (
-              <li key={i} style={{ fontSize: 12, marginTop: 2 }}>
-                {w}
+      {/* v27q: prominent partial-success banner. Operator must read + decide. */}
+      {uploadErrors.length > 0 && (
+        <div
+          className="alert-h alert-h-critical"
+          style={{
+            marginBottom: 16,
+            padding: '16px 20px',
+            border: '2px solid var(--neg, #c0392b)',
+            background: 'rgba(192, 57, 43, 0.08)',
+            borderRadius: 4,
+          }}
+        >
+          <div style={{ fontSize: 14, fontWeight: 700, marginBottom: 8 }}>
+            Upload completed with errors — review before continuing
+          </div>
+          <div style={{ fontSize: 12, marginBottom: 10, color: 'var(--text-2)' }}>
+            The session was created, but one or more files failed to upload or
+            parse. The errors are below. Common causes: a CSV file rejected by
+            Storage policy (canonical positions), a Vercel function timeout
+            (large statement PDF), or a parser failure on a malformed file.
+          </div>
+          <ul
+            style={{
+              margin: '0 0 12px 18px',
+              padding: 0,
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}
+          >
+            {uploadErrors.map((w, i) => (
+              <li key={i} style={{ marginBottom: 4 }}>
+                <code
+                  style={{
+                    background: 'rgba(0,0,0,0.05)',
+                    padding: '1px 6px',
+                    borderRadius: 2,
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                  }}
+                >
+                  {w}
+                </code>
               </li>
             ))}
           </ul>
+          <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+            <button
+              type="button"
+              className="btn-h btn-h-primary"
+              onClick={continueToSessionAnyway}
+              style={{ fontSize: 12 }}
+            >
+              Continue to session anyway
+            </button>
+            <button
+              type="button"
+              className="btn-h"
+              onClick={dismissErrorsAndStartOver}
+              style={{ fontSize: 12 }}
+            >
+              Dismiss and re-upload
+            </button>
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 10 }}>
+            Tip: if you see “mime type … is not supported”, the Storage bucket
+            policy is rejecting that file format. Check{' '}
+            <code>storage.buckets.allowed_mime_types</code> for{' '}
+            <code>broker-files</code>. If you see “Gateway Timeout”, retry that
+            specific file in a new session.
+          </div>
         </div>
       )}
 
@@ -248,9 +350,7 @@ export default function BrokerUploadPage() {
         <div className="panel-header">
           <div className="panel-title">New upload session</div>
           <div className="panel-meta">
-            {submitting
-              ? `Uploading and parsing… ${elapsedSec}s`
-              : 'Pick a portfolio, attach PDFs, upload'}
+            Pick a portfolio, attach PDFs, upload
           </div>
         </div>
 
@@ -270,45 +370,19 @@ export default function BrokerUploadPage() {
             Portfolio
           </label>
           <select
-            className="select-h"
-            style={{ width: '100%', maxWidth: 520 }}
+            className="input-h"
             value={portfolioId}
             onChange={(e) => setPortfolioId(e.target.value)}
             disabled={submitting || portfolios === null}
+            style={{ minWidth: 320 }}
           >
-            <option value="">
-              {portfolios === null
-                ? 'Loading portfolios…'
-                : portfolios.length === 0
-                ? 'No active portfolios found'
-                : 'Select a portfolio…'}
-            </option>
-            {portfolios?.map((p) => (
+            <option value="">— Select a portfolio —</option>
+            {(portfolios || []).map((p) => (
               <option key={p.id} value={p.id}>
-                {p.client_name} · {p.name}
-                {p.client_code ? ` (${p.client_code})` : ''}
+                {p.client_name} · {p.name} ({p.client_code})
               </option>
             ))}
           </select>
-          {portfolios !== null && portfolios.length === 0 && !portfoliosError && (
-            <div style={{ fontSize: 12, color: 'var(--text-3)', marginTop: 8 }}>
-              No active portfolios yet.{' '}
-              <Link
-                href="/admin/clients/new"
-                style={{ color: 'var(--gold)', textDecoration: 'underline' }}
-              >
-                Create a client
-              </Link>{' '}
-              first, then{' '}
-              <Link
-                href="/admin/portfolios/new"
-                style={{ color: 'var(--gold)', textDecoration: 'underline' }}
-              >
-                open a portfolio
-              </Link>
-              .
-            </div>
-          )}
         </div>
 
         {/* Contract notes */}
@@ -337,7 +411,7 @@ export default function BrokerUploadPage() {
             <input
               ref={cnInputRef}
               type="file"
-              accept="application/pdf,.pdf"
+              accept=".pdf,application/pdf"
               onChange={onContractNotesChange}
               disabled={submitting}
               style={{ fontSize: 12 }}
@@ -393,7 +467,7 @@ export default function BrokerUploadPage() {
             <input
               ref={stmtInputRef}
               type="file"
-              accept="application/pdf,.pdf"
+              accept=".pdf,application/pdf"
               multiple
               onChange={onStatementsChange}
               disabled={submitting}
@@ -407,29 +481,14 @@ export default function BrokerUploadPage() {
                 disabled={submitting}
                 style={{ fontSize: 11, padding: '4px 10px' }}
               >
-                Clear all
+                Clear
               </button>
             )}
           </div>
           {statementFiles.length > 0 && (
-            <ul
-              style={{
-                margin: '8px 0 0 0',
-                padding: 0,
-                listStyle: 'none',
-                fontSize: 12,
-                color: 'var(--text-2)',
-              }}
-            >
-              {statementFiles.map((f, i) => (
-                <li key={i} style={{ marginTop: 2 }}>
-                  <strong>{f.name}</strong>
-                  <span style={{ color: 'var(--text-3)', marginLeft: 8 }}>
-                    {(f.size / 1024).toFixed(0)} KB
-                  </span>
-                </li>
-              ))}
-            </ul>
+            <div style={{ fontSize: 12, color: 'var(--text-2)', marginTop: 6 }}>
+              <strong>{statementFiles.length} file(s) selected</strong>
+            </div>
           )}
           <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
             Optional. Each PDF is one monthly statement. Hold Shift/Ctrl to
@@ -437,7 +496,7 @@ export default function BrokerUploadPage() {
           </div>
         </div>
 
-        {/* Canonical positions — v27g */}
+        {/* Canonical positions — v27g picker, v27q error-aware response handling */}
         <div style={{ marginBottom: 20 }}>
           <label
             style={{
@@ -543,31 +602,22 @@ export default function BrokerUploadPage() {
           >
             {submitting ? `Uploading… ${elapsedSec}s` : 'Upload & parse'}
           </button>
-
-          {submitting && (
-            <div style={{ fontSize: 12, color: 'var(--text-2)' }}>
-              Parsing broker PDFs can take 1–5 minutes. Don’t close this tab.
-            </div>
-          )}
-
-          {!submitting && !canSubmit && (
-            <div style={{ fontSize: 12, color: 'var(--warn)' }}>
-              {portfolioId === '' && 'Select a portfolio. '}
-              {!contractNotesFile && 'Attach a contract notes PDF.'}
-            </div>
+          {!canSubmit && !submitting && (
+            <span style={{ fontSize: 11, color: 'var(--text-3)' }}>
+              {portfolioId === ''
+                ? 'Pick a portfolio.'
+                : 'Attach a contract notes PDF.'}
+            </span>
           )}
         </div>
       </div>
 
-      {/* Helper card */}
-      <div
-        className="panel"
-        style={{ marginTop: 16, background: 'var(--bg-soft)' }}
-      >
+      {/* What happens next */}
+      <div className="panel" style={{ marginTop: 20 }}>
         <div className="panel-header">
-          <div className="panel-title">What happens next</div>
+          <div className="panel-title hybrid-serif">What happens next</div>
         </div>
-        <ol style={{ margin: 0, paddingLeft: 20, fontSize: 13, lineHeight: 1.7 }}>
+        <ul style={{ paddingLeft: 18, margin: 0, fontSize: 12, lineHeight: 1.7 }}>
           <li>
             Each file is uploaded to private storage and parsed in place — no
             files touch your machine after this page.
@@ -586,14 +636,10 @@ export default function BrokerUploadPage() {
           </li>
           <li>
             If you attached a CSCS canonical positions file, a variance panel
-            appears post-commit showing per-ticker differences. One click
-            writes the reconciliation transfers and refreshes NAV.
+            renders post-commit with per-row date pickers for held-orphan
+            reconciliation transfers.
           </li>
-          <li>
-            If anything is off, rollback unwinds the whole commit. Staged rows
-            stay intact so you can re-commit after fixing the issue.
-          </li>
-        </ol>
+        </ul>
       </div>
     </div>
   )
