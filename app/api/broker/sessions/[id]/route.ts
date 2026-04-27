@@ -1,10 +1,19 @@
 /**
- * app/api/broker/sessions/[id]/route.ts — v27q-fix3
+ * app/api/broker/sessions/[id]/route.ts — v27q-fix4
  *
- * v27q-fix3: replaced .from('market_prices').select(...).in().order().limit()
- * with .rpc('get_prices_for_tickers', { p_tickers }) to bypass the silent
- * 1000-row PostgREST cap. Pattern matches v27f get_distinct_market_price_dates.
- * Pitfall #59 + #92 + new pitfall (server-side row cap overrides client .limit).
+ * v27q-fix4: pairs with a Supabase function rewrite (RETURNS jsonb instead
+ * of RETURNS TABLE). PostgREST db-max-rows applies to RPC table-returns
+ * too — v27q-fix3's .rpc() call was capped at 1705 rows, just at a
+ * different alphabetical boundary than v27p's direct query. Switching the
+ * function to return jsonb (a scalar from PostgREST's perspective) lifts
+ * the cap entirely. Code-side change: defensive Array.isArray() guard
+ * around the iteration. Wire-format-compatible with the v27q-fix3 code
+ * because Supabase JS surfaces both shapes as `data: Array<row>`.
+ *
+ * v27q-fix3 history: replaced .from('market_prices').select(...).in().order().limit()
+ * with .rpc('get_prices_for_tickers', { p_tickers }). Correct call site,
+ * but the RPC was still server-capped due to TABLE return type.
+ * Pitfall #59 + #92 + new pitfall (server-side row cap overrides client .limit AND RPC TABLE returns).
  *
  * v27p change: variance engine now needs full per-ticker price history
  * (not just latest price) to power the date picker, plus
@@ -290,19 +299,20 @@ export async function GET(
 
               const tickerList = Array.from(allTickers)
 
-              // v27q-fix3: load via RPC to bypass PostgREST row cap (pitfall #59).
-              // The previous .from('market_prices').select(...).in(...).order(...)
-              // .limit(50000) call was silently capped at 1000 rows by the server's
-              // db-max-rows policy, regardless of the client-side .limit(). This
-              // truncated multi-year price history at ~2024-01-31, polluting the
-              // variance panel's "latest priced date" smart default. Same pattern
-              // as v27f get_distinct_market_price_dates (pitfall #92).
+              // v27q-fix4: load via RPC returning jsonb (paired with a Supabase
+              // function rewrite from RETURNS TABLE -> RETURNS jsonb). PostgREST's
+              // db-max-rows caps RPC TABLE returns just like .from().select() —
+              // v27q-fix3's RPC was silently truncating at 1705 rows. jsonb scalar
+              // returns aren't subject to the cap. Wire format is identical from
+              // Supabase JS's perspective (both surface as Array<row>), so the
+              // change here is just a defensive Array.isArray() guard plus the
+              // version marker. See pitfall #59 / #92 / new (RPC cap).
               const pricesByTicker: Record<string, PriceEntry[]> = {}
               if (tickerList.length > 0) {
                 const { data: prices, error: pErr } = await db
                   .rpc('get_prices_for_tickers', { p_tickers: tickerList })
 
-                if (!pErr && prices) {
+                if (!pErr && Array.isArray(prices)) {
                   for (const p of prices as Array<{ instrument_id: string; price_date: string; price: number | string | null }>) {
                     const id = p.instrument_id
                     if (!pricesByTicker[id]) pricesByTicker[id] = []
