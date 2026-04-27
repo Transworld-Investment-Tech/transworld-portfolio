@@ -1,36 +1,60 @@
 /**
- * lib/fee-calc.ts — v27n
+ * lib/fee-calc.ts — v27o-fix1
  *
- * Pure fee-math helper. Implements XIRR-style timing-aware target calculation
- * matching standard portfolio-finance practice.
+ * v27o-fix1 change: Period-flow filter now strict on the lower bound.
+ * Flows DATED EXACTLY ON the period start are excluded — they're
+ * already captured by startNAV.
  *
- * METHODOLOGY
- * ───────────
+ * THE BUG IN v27n
+ * ───────────────
+ * v27n's flow filter was inclusive on startDate:
+ *   if (flowDate < startDate || flowDate > endDate) continue
+ *
+ * Synthetic recovery TRANSFER_IN rows produced by v27o are dated AT
+ * portfolio.start_date. inferPortfolioStart already includes those
+ * shares' value in starting_nav (via postDayPositionValue). With the
+ * old filter, fee-calc then ALSO added them as period flows — double-
+ * counting.
+ *
+ * Concrete failure on DON-C ITD (post v27o, pre v27o-fix1):
+ *   startNAV (incl. synth)        = ₦41.54M
+ *   Period flows (incl. synth)    = +₦22.97M − ₦1.43M
+ *   contributedCapital            = ₦64.51M     ← inflated
+ *   targetValue at 15%            = ₦143.74M    ← grossly inflated
+ *   IRR (ITD)                     = +3.53%      ← nonsense low
+ *
+ * THE FIX
+ * ───────
+ * Change the filter to strict-less-than-or-equal on the lower bound:
+ *   if (flowDate <= startDate || flowDate > endDate) continue
+ *
+ * Flows on or before startDate are already accounted for in startNAV
+ * (whether by inferPortfolioStart's day-1 valuation or by upstream
+ * NAV computation for non-inception periods). Including them as flows
+ * is double-counting in every period.
+ *
+ * Verified semantics across period types:
+ *   - ITD: startDate = portfolio.start_date. Synth TRANSFER_INs at
+ *     start_date are part of starting NAV, not flows. ✓
+ *   - YTD/LY/L3Y/L5Y: startDate is a calendar date. Any TRANSFER_IN
+ *     happening on that calendar date is part of EOD NAV at that
+ *     date, which is the "starting NAV" for the period. ✓
+ *
+ * METHODOLOGY (preserved from v27n)
+ * ─────────────────────────────────
  * Contributed capital is the FACE-VALUE sum of all flows over the period:
  *
  *   contributedCapital = startNAV + Σ TRANSFER_IN − Σ TRANSFER_OUT
  *
- * (No time-weighting on contributed capital itself — this represents the actual
- * net amount of capital the client has put to work, in flat naira terms.)
+ * (No time-weighting on contributed capital itself — this represents the
+ * actual net amount of capital the client has put to work.)
  *
- * Target value at end-of-period is computed by growing each flow forward from
- * its flow date to the period end at the threshold rate:
+ * Target value at end-of-period grows each flow forward at the threshold
+ * rate from its flow date to the period end:
  *
  *   targetValue = Σ flow_i × (1 + r)^(years_remaining_i)
  *
- * where years_remaining_i = (endDate − flow_date_i) / 365.25.
- *
- * This is the standard XIRR-style calculation. Beginning NAV is treated as a
- * flow at period start (full-period growth). A ₦10M deposit at midyear of a
- * 1-year, 15% target period contributes ₦10M × 1.15^0.5 ≈ ₦10.72M to the
- * target. A ₦5M withdrawal at midyear is netted negatively, growing at the
- * same rate (the firm doesn't owe a return on capital that has been pulled).
- *
- * FEE SPLIT
- * ─────────
- * Excess return = actualEndingNAV − targetValue (can be negative)
- * Below target → no fee charged
- * Above target → 70/30 client/Transworld split (configurable via clientShare)
+ * Standard XIRR-style calculation.
  *
  * EFFECTIVE RETURN
  * ────────────────
@@ -38,17 +62,6 @@
  *
  * This is a PERIOD return (total return over the window), not annualized.
  * For annualized return, see lib/analytics.ts → computeIRR (Newton-Raphson).
- *
- * HISTORICAL CONTEXT
- * ──────────────────
- * Prior to v27n (v27k–v27m), this module computed contributedCapital as the
- * time-weighted sum (Σ amount × years_remaining). That mechanic was wrong:
- * it inflated contributed capital for any period > 1 year (e.g. DON-C L5Y
- * showed startNAV × 5 ≈ ₦59.69M instead of face-value ~₦12M) and deflated
- * it for periods < 1 year (e.g. DON-C YTD at Apr 2026 showed startNAV × 0.32
- * ≈ ₦8.03M instead of face value ~₦25.49M). v27n reverts contributedCapital
- * to face-value semantics (standard XIRR) and applies time-weighting only
- * inside the target calculation, where it belongs.
  */
 
 export interface FeeInput {
@@ -103,7 +116,10 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
 
   const flows: FeeOutput['flows'] = []
 
-  // 1. Beginning NAV — treated as a flow at period start (full-period growth)
+  // 1. Beginning NAV — treated as a flow at period start (full-period growth).
+  // This is the value the portfolio held going into the period: position
+  // values at start, plus same-day transfers and BUYs (per inferPortfolioStart
+  // for ITD, or NAV reconstruction for other periods).
   if (startNAV > 0) {
     flows.push({
       date:                startDate.toISOString().slice(0, 10),
@@ -114,11 +130,16 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
     })
   }
 
-  // 2. TRANSFER_IN / TRANSFER_OUT during the period — time-weighted growth from flow date
+  // 2. TRANSFER_IN / TRANSFER_OUT STRICTLY AFTER startDate, on/before endDate.
+  //
+  // v27o-fix1: Strict inequality on the lower bound (flowDate <= startDate
+  // means SKIP). Flows on the period start are already captured in startNAV
+  // and would be double-counted if included here. See module header for
+  // the v27o → v27o-fix1 bug description.
   for (const t of transactions) {
     if (t.action !== 'TRANSFER_IN' && t.action !== 'TRANSFER_OUT') continue
     const flowDate = new Date(t.trade_date)
-    if (flowDate < startDate || flowDate > endDate) continue
+    if (flowDate <= startDate || flowDate > endDate) continue
 
     const amt = Math.abs(Number(t.amount ?? 0))
     if (amt === 0) continue
@@ -136,7 +157,7 @@ export function computeFeeMetrics(input: FeeInput): FeeOutput {
     })
   }
 
-  // 3. Face-value contributed capital (XIRR semantics — flat naira sum, no time-weighting)
+  // 3. Face-value contributed capital (XIRR semantics — flat naira sum).
   const contributedCapital = flows.reduce((s, f) => s + f.amount, 0)
 
   // 4. Target value = Σ flow_i × (1 + r)^years_remaining_i

@@ -1,69 +1,64 @@
 /**
- * lib/recovery-synth.ts — v27o
+ * lib/recovery-synth.ts — v27o-fix1
  *
- * Detects and synthesizes TRANSFER_IN rows for in-kind share transfers
- * that recovery-account clients bring with them at the start of their
- * relationship.
+ * v27o-fix1 change: Replaces broken cumulative-position FIFO with real
+ * BUY-lot inventory matching.
  *
- * THE PROBLEM
- * ───────────
+ * THE BUG IN v27o
+ * ───────────────
+ * The original v27o algorithm tracked cumBuy and cumSell as scalars and
+ * emitted a synthetic TRANSFER_IN whenever (cumSell − cumBuy) grew over
+ * the prior SELL's position. This over-counts when the orphan position
+ * temporarily shrinks (BUYs cover part of an existing orphan position)
+ * and then grows again (later SELLs exceed the new BUYs). The same
+ * physical "phantom" shares get re-counted as new orphans.
+ *
+ * Concrete failure on DON-C FIRSTHOLDCO:
+ *   2021-03-11 SELL 1,681,315 against empty queue   → orphan 1,681,315 ✓
+ *   2022-11-11 BUY 93,700                            (queue has 93,700)
+ *   2023-05-04 BUY 200,000                           (queue has 293,700)
+ *   2023-07-06 SELL 293,700 against queue of 293,700 → real BUYs sold,
+ *                                                       NOT an orphan
+ *   v27o emitted an extra synthesis row of 293,700 @ ₦18.65 = ₦5.48M
+ *   that should not have existed.
+ *
+ * THE FIX
+ * ───────
+ * Real FIFO inventory matching: maintain an explicit queue of BUY lots
+ * per instrument. Each SELL consumes lots oldest-first. If the queue
+ * runs dry mid-SELL, only the unmatched remainder is an orphan, dated
+ * at portfolio.start_date and priced at the SELL's price. This handles
+ * temporary BUY-coverage cleanly because the BUYs are removed from the
+ * queue when they're consumed and cannot be "re-revealed" later.
+ *
+ * Same idempotency, same external_ref tagging, same return shape as v27o.
+ *
+ * THE BACKDROP (preserved from v27o)
+ * ──────────────────────────────────
  * Recovery-account clients (DON-C, ADE-C, OPC-A, FMI-A, CDOO-A, CMFB-D,
  * etc.) walk through Transworld's door already holding shares in their
- * CSCS account from prior broker relationships. Those shares are part
- * of the firm's managed AUM from day one but the broker-import flow
- * records ONLY the subsequent BUY/SELL/FEE activity from contract notes
- * — not the in-kind share value.
+ * CSCS account from prior broker relationships. The broker-import flow
+ * records ONLY the subsequent BUY/SELL/FEE activity — not the in-kind
+ * share value. v27o introduces synthetic TRANSFER_IN rows to capture
+ * that initial value. v27o-fix1 corrects the detection algorithm.
  *
- * Consequences before v27o:
- * - contributedCapital was radically understated (DON-C showed +₦1.08M
- *   when the true figure is ~₦16M)
- * - Period IRR was correspondingly inflated (DON-C ITD showed +155% p.a.
- *   when the true figure is ~+24% p.a.)
- * - Performance fees would have been over-charged on this inflated excess
+ * SCOPE
+ * ─────
+ * v27o-fix1 still handles SOLD orphans only. Held orphans (current CSCS
+ * positions with no BUY history) continue to flow through
+ * apply-reconciliation/route.ts and the variance panel UI. Held-orphan
+ * auto-detection is on the v27p ship list.
  *
- * THE DETECTION (sold orphans)
- * ────────────────────────────
- * Any SELL whose cumulative same-instrument SELL quantity exceeds
- * cumulative BUY quantity at that point in time is, by definition, an
- * in-kind transfer the system never recorded. NGX prohibits short-selling,
- * so the excess MUST have come from somewhere — in recovery-account
- * context, that "somewhere" is the client's pre-existing CSCS holdings.
+ * SIGN CONVENTION (preserved)
+ * ───────────────────────────
+ * Synthetic TRANSFER_IN rows use POSITIVE amount, consistent with
+ * pre-v27o existing TRANSFER_IN rows. fee-calc.ts uses Math.abs() so it
+ * tolerates either sign.
  *
- * FIFO walk per (portfolio, instrument) identifies these. Each orphan
- * SELL portion produces one synthetic TRANSFER_IN row dated at
- * portfolio.start_date with amount = orphan_qty × sell_price.
- *
- * SCOPE NOTES
- * ───────────
- * v27o handles SOLD orphans only. Held orphans (current CSCS positions
- * with no BUY history — variance-engine's `cscs_only` bucket) continue
- * to flow through apply-reconciliation/route.ts and the variance panel
- * UI. v27p will add held-orphan auto-detection at commit time.
- *
- * IDEMPOTENCY
- * ───────────
- * Synthesized rows carry `external_ref = synthetic-recovery-v1-<portfolio_id>`.
- * synthesizeRecoveryTransfers refuses to insert if any row with this ref
- * already exists for the portfolio (unless options.rerun=true, which
- * deletes existing synth rows first).
- *
- * SIGN CONVENTION
- * ───────────────
- * Synthetic TRANSFER_IN rows use POSITIVE `amount`. lib/fee-calc.ts uses
- * Math.abs() so it tolerates either sign, but for consistency with
- * DON-C's existing pre-v27o TRANSFER_IN row (₦961,868 stored positive)
- * we use positive. The reconciliation route's negative-amount convention
- * is preserved as-is — fee-calc tolerates both. A future cleanup release
- * can unify the convention across writers.
- *
- * FALLBACK BEHAVIOR
- * ─────────────────
- * If portfolios.start_date is NULL at synthesis time (e.g. a brand-new
- * portfolio that has not yet run inferPortfolioStart), we fall back to
- * the earliest transaction date as the anchor. The downstream
- * inferPortfolioStart call (commit route step 11) will then see the
- * synthetic rows AND the real transactions and arrive at the same
- * earliest date — stable.
+ * START_DATE FALLBACK (preserved)
+ * ───────────────────────────────
+ * If portfolios.start_date is NULL, falls back to earliest transaction
+ * date as the synthesis anchor.
  */
 
 import { SupabaseClient } from '@supabase/supabase-js'
@@ -106,8 +101,8 @@ export function externalRefFor(portfolioId: string): string {
 }
 
 /**
- * Pure detection — runs FIFO walk over BUY/SELL transactions and
- * identifies orphan SELL portions. No DB writes. Safe to call from
+ * Pure detection — runs FIFO inventory matching over BUY/SELL transactions
+ * and identifies orphan SELL portions. No DB writes. Safe to call from
  * read-only / diagnostic contexts.
  */
 export async function detectOrphans(
@@ -155,9 +150,10 @@ export async function detectOrphans(
     }
   }
 
-  // Fetch BUY/SELL transactions ordered for FIFO walk.
-  // Same-day BUY before SELL (alphabetical 'BUY' < 'SELL') extends BUY
-  // coverage as far as possible before declaring an orphan — conservative.
+  // IMPORTANT: We must EXCLUDE prior synthetic TRANSFER_IN rows from the
+  // FIFO walk. We're walking only real BUY/SELL events to detect orphans.
+  // The synthetic rows have action='TRANSFER_IN' so they're already filtered
+  // by the .in('action', ['BUY', 'SELL']) below — but noting for clarity.
   const { data: txs, error: txErr } = await db
     .from('transactions')
     .select('id, trade_date, instrument_id, action, quantity, price, cn_number, created_at')
@@ -165,7 +161,7 @@ export async function detectOrphans(
     .in('action', ['BUY', 'SELL'])
     .not('instrument_id', 'is', null)
     .order('trade_date', { ascending: true })
-    .order('action', { ascending: true })
+    .order('action', { ascending: true })  // BUY < SELL alphabetically; same-day BUY-before-SELL
     .order('created_at', { ascending: true })
 
   if (txErr) {
@@ -176,7 +172,7 @@ export async function detectOrphans(
     }
   }
 
-  // FIFO walk per instrument.
+  // Group by instrument for per-instrument FIFO walk.
   type Tx = {
     id:            string
     trade_date:    string
@@ -197,25 +193,49 @@ export async function detectOrphans(
 
   const soldOrphans: OrphanSoldRow[] = []
 
+  // ── Real FIFO inventory matching (v27o-fix1) ──────────────────
+  //
+  // For each instrument, maintain a queue of BUY lots (each lot tracks
+  // its remaining unmatched quantity). SELL events consume lots oldest-
+  // first. Any portion of a SELL that the queue can't satisfy is an
+  // orphan (priced at the SELL's price, dated at start_date).
+  //
+  // This correctly handles the BUY→SELL→BUY→SELL pattern that confused
+  // the v27o cumulative-position tracker — once a BUY lot is consumed,
+  // it's gone from the queue and can't be re-counted.
   for (const [instrumentId, list] of byInstrument) {
-    let cumBuy  = 0
-    let cumSell = 0
+    type BuyLot = { remaining: number }
+    const buyQueue: BuyLot[] = []
+
     for (const t of list) {
       const q = Number(t.quantity ?? 0)
       if (q === 0) continue
+
       if (t.action === 'BUY') {
-        cumBuy += q
-      } else if (t.action === 'SELL') {
-        const orphanBefore = Math.max(0, cumSell - cumBuy)
-        cumSell += q
-        const orphanAfter  = Math.max(0, cumSell - cumBuy)
-        const orphanQty    = orphanAfter - orphanBefore
-        if (orphanQty > 0) {
+        buyQueue.push({ remaining: q })
+        continue
+      }
+
+      if (t.action === 'SELL') {
+        let remainingSell = q
+        while (remainingSell > 0 && buyQueue.length > 0) {
+          const lot = buyQueue[0]
+          if (lot.remaining <= remainingSell) {
+            remainingSell -= lot.remaining
+            buyQueue.shift()
+          } else {
+            lot.remaining -= remainingSell
+            remainingSell = 0
+          }
+        }
+
+        if (remainingSell > 0) {
+          // Unmatched portion of this SELL — orphan in-kind shares.
           const price  = Number(t.price ?? 0)
-          const amount = Math.round(orphanQty * price * 100) / 100
+          const amount = Math.round(remainingSell * price * 100) / 100
           soldOrphans.push({
             instrumentId,
-            qty:           orphanQty,
+            qty:           remainingSell,
             price,
             amount,
             sellTradeDate: t.trade_date,
