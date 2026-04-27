@@ -1,5 +1,10 @@
 /**
- * app/api/broker/sessions/[id]/route.ts — v27p
+ * app/api/broker/sessions/[id]/route.ts — v27q-fix3
+ *
+ * v27q-fix3: replaced .from('market_prices').select(...).in().order().limit()
+ * with .rpc('get_prices_for_tickers', { p_tickers }) to bypass the silent
+ * 1000-row PostgREST cap. Pattern matches v27f get_distinct_market_price_dates.
+ * Pitfall #59 + #92 + new pitfall (server-side row cap overrides client .limit).
  *
  * v27p change: variance engine now needs full per-ticker price history
  * (not just latest price) to power the date picker, plus
@@ -285,21 +290,24 @@ export async function GET(
 
               const tickerList = Array.from(allTickers)
 
+              // v27q-fix3: load via RPC to bypass PostgREST row cap (pitfall #59).
+              // The previous .from('market_prices').select(...).in(...).order(...)
+              // .limit(50000) call was silently capped at 1000 rows by the server's
+              // db-max-rows policy, regardless of the client-side .limit(). This
+              // truncated multi-year price history at ~2024-01-31, polluting the
+              // variance panel's "latest priced date" smart default. Same pattern
+              // as v27f get_distinct_market_price_dates (pitfall #92).
               const pricesByTicker: Record<string, PriceEntry[]> = {}
               if (tickerList.length > 0) {
                 const { data: prices, error: pErr } = await db
-                  .from('market_prices')
-                  .select('instrument_id, price, price_date')
-                  .in('instrument_id', tickerList)
-                  .order('price_date', { ascending: true })
-                  .limit(50000)
+                  .rpc('get_prices_for_tickers', { p_tickers: tickerList })
 
                 if (!pErr && prices) {
-                  for (const p of prices) {
-                    const id = p.instrument_id as string
+                  for (const p of prices as Array<{ instrument_id: string; price_date: string; price: number | string | null }>) {
+                    const id = p.instrument_id
                     if (!pricesByTicker[id]) pricesByTicker[id] = []
                     pricesByTicker[id].push({
-                      date:  p.price_date as string,
+                      date:  p.price_date,
                       price: Number(p.price ?? 0),
                     })
                   }
