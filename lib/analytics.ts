@@ -339,7 +339,7 @@ export function computePeriodMetrics(
 
   const periodTxns = transactions.filter(t => {
     const d = new Date(t.trade_date)
-    return d >= startDate && d <= endDate &&
+    return d > startDate && d <= endDate &&
       ['TRANSFER_IN', 'TRANSFER_OUT', 'FEE'].includes(t.action)
   })
 
