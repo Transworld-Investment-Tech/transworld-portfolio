@@ -1,5 +1,11 @@
 /**
- * lib/variance-engine.ts — v27p
+ * lib/variance-engine.ts — v27q-fix5
+ *
+ * v27q-fix5: VarianceRow gains availablePrices: Array<{date, price}>
+ * to support reactive price + amount columns in the panel UI. Each
+ * row-construction site now populates from the same priceHistory
+ * already in scope. availablePriceDates is preserved for backward
+ * compat with consumers that don't yet read availablePrices.
  *
  * v27p change: per-row date picker support for held-orphan transfers.
  *
@@ -59,6 +65,8 @@ export interface VarianceRow {
   // v27p: per-row date picker support
   suggestedTransferDate: string | null   // ISO YYYY-MM-DD or null if no priced dates
   availablePriceDates:   string[]        // sorted ascending; subset of market_prices.price_date for this ticker
+  // v27q-fix5: per-date prices for reactive UI display
+  availablePrices:       Array<{ date: string; price: number }>
 }
 
 export interface CanonicalPosition {
@@ -169,6 +177,7 @@ export function computeVariance(
         canonicalPrice: c.closingPrice, proposedPrice: 0,
         symbolName: c.symbolName, autoApply: false, note: '',
         suggestedTransferDate: null, availablePriceDates: datesList,
+        availablePrices: history.map(p => ({ date: p.date, price: p.price })),
       })
       continue
     }
@@ -194,6 +203,7 @@ export function computeVariance(
         note: 'CSCS holds this position; portfolio history does not show it. Likely inception transfer or recovery shares.',
         suggestedTransferDate: suggested,
         availablePriceDates:   datesList,
+        availablePrices: history.map(p => ({ date: p.date, price: p.price })),
       })
     } else if (delta > 0) {
       rows.push({
@@ -205,6 +215,7 @@ export function computeVariance(
         note: `Canonical has ${delta.toLocaleString()} more units than portfolio.`,
         suggestedTransferDate: suggested,
         availablePriceDates:   datesList,
+        availablePrices: history.map(p => ({ date: p.date, price: p.price })),
       })
     } else {
       rows.push({
@@ -216,6 +227,7 @@ export function computeVariance(
         note: `Portfolio has ${Math.abs(delta).toLocaleString()} more units than canonical. Review — likely a unit typo or unrecorded SELL.`,
         suggestedTransferDate: suggested,
         availablePriceDates:   datesList,
+        availablePrices: history.map(p => ({ date: p.date, price: p.price })),
       })
     }
   }
@@ -232,6 +244,7 @@ export function computeVariance(
         symbolName: 'Cash (NGN)', autoApply: false,
         note: 'CSCS does not track operational cash — variance here is expected and should be ignored.',
         suggestedTransferDate: null, availablePriceDates: [],
+        availablePrices: [],
       })
       continue
     }
@@ -249,6 +262,7 @@ export function computeVariance(
       note: 'Portfolio holds shares not in canonical. Could be delisted (TRANSFER_OUT at delisting price) or sold elsewhere (offset trade). Review before applying.',
       suggestedTransferDate: suggested,
       availablePriceDates:   datesList,
+      availablePrices: history.map(p => ({ date: p.date, price: p.price })),
     })
   }
 

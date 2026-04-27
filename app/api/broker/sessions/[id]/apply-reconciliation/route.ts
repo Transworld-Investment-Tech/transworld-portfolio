@@ -1,6 +1,20 @@
 /**
- * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27p
+ * app/api/broker/sessions/[id]/apply-reconciliation/route.ts — v27q-fix5
  *
+ * v27q-fix5: TransferInput accepts forceZero?: boolean. Force-zero rows
+ * skip market_prices lookup and write price=0, amount=0 — for corporate
+ * actions where the broker's transaction ledger never recorded the event
+ * (license revocation, share consolidation phantom retirement).
+ *
+ * external_ref tagging:
+ *   - forceZero=true                  → corp-action-zero-recovery-<sessionId>
+ *   - portfolio_only TRANSFER_OUT     → corp-action-delisting-<sessionId>
+ *   - top_up_needed / cscs_only       → no external_ref (regular reconciliation)
+ *
+ * The retired-shares report at /admin/portfolios/[id]/retired-shares
+ * filters by these tags to surface positions warranting registrar follow-up.
+ *
+ * v27p baseline:
  * v27p changes:
  *   1. Per-row transferDate is now REQUIRED in the request body. Operator
  *      picked a date in the variance panel; server uses that date.
@@ -51,6 +65,8 @@ interface TransferInput {
   reason:       string
   // price field deliberately ignored; server resolves authoritatively
   price?:       number
+  // v27q-fix5: force write at price=0 (corporate action with no recovery)
+  forceZero?:   boolean
 }
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/
@@ -170,15 +186,24 @@ export async function POST(
     // 3. v27p: Resolve price for every (ticker, transferDate) pair via
     // exact match against market_prices. Build a lookup table in a single
     // query, then walk transfers.
-    const distinctPairs = Array.from(new Set(transfers.map(t => `${t.ticker}|${t.transferDate}`)))
-    const distinctDates = Array.from(new Set(transfers.map(t => t.transferDate)))
+    // v27q-fix5: force-zero rows skip the lookup entirely (price=0).
+    const lookupTransfers = transfers.filter(t => !t.forceZero)
+    const distinctPairs = Array.from(new Set(lookupTransfers.map(t => `${t.ticker}|${t.transferDate}`)))
+    const distinctDates = Array.from(new Set(lookupTransfers.map(t => t.transferDate)))
 
-    const { data: priceRows, error: priceErr } = await db
-      .from('market_prices')
-      .select('instrument_id, price_date, price')
-      .in('instrument_id', distinctTickers)
-      .in('price_date', distinctDates)
-      .limit(50000)
+    // v27q-fix5: skip the lookup entirely if no non-force-zero rows
+    let priceRows: Array<{ instrument_id: string; price_date: string; price: number }> = []
+    let priceErr: { message: string } | null = null
+    if (distinctDates.length > 0) {
+      const lookupResult = await db
+        .from('market_prices')
+        .select('instrument_id, price_date, price')
+        .in('instrument_id', distinctTickers)
+        .in('price_date', distinctDates)
+        .limit(50000)
+      priceRows = (lookupResult.data ?? []) as typeof priceRows
+      priceErr = lookupResult.error
+    }
 
     if (priceErr) {
       return NextResponse.json(
@@ -188,12 +213,12 @@ export async function POST(
     }
 
     const priceMap: Record<string, number> = {}
-    for (const p of priceRows ?? []) {
+    for (const p of priceRows) {
       const key = `${p.instrument_id}|${p.price_date}`
       priceMap[key] = Number(p.price ?? 0)
     }
 
-    // Validate every pair found a price
+    // Validate every pair (excluding force-zero) found a price
     const missingPairs: Array<{ ticker: string; date: string }> = []
     for (const pair of distinctPairs) {
       if (priceMap[pair] === undefined || priceMap[pair] === null) {
@@ -212,11 +237,25 @@ export async function POST(
       )
     }
 
-    // 4. v27p: Build transactions rows. POSITIVE amount for both directions.
+    // 4. v27q-fix5: Build transactions rows.
+    //    - Force-zero rows: price=0, amount=0, external_ref=corp-action-zero-recovery-...
+    //    - portfolio_only TRANSFER_OUT (delisting): external_ref=corp-action-delisting-...
+    //    - everything else: no external_ref
     const txRows = transfers.map(t => {
-      const key   = `${t.ticker}|${t.transferDate}`
-      const price = priceMap[key]
+      const isForceZero = t.forceZero === true
+      const price = isForceZero ? 0 : priceMap[`${t.ticker}|${t.transferDate}`]
       const grossValue = Math.abs(t.quantity * price)
+
+      let external_ref: string | null = null
+      let notesPrefix = 'Reconciliation TRANSFER'
+      if (isForceZero) {
+        external_ref = `corp-action-zero-recovery-${session_id}`
+        notesPrefix = 'Corporate action — zero recovery'
+      } else if (t.action === 'TRANSFER_OUT' && t.reason === 'portfolio_only') {
+        external_ref = `corp-action-delisting-${session_id}`
+        notesPrefix = 'Delisting writeoff'
+      }
+
       return {
         portfolio_id,
         trade_date:     t.transferDate,
@@ -226,8 +265,9 @@ export async function POST(
         price,
         gross_value:    grossValue,
         amount:         grossValue,   // v27p: POSITIVE for both IN and OUT
-        notes:          `Reconciliation TRANSFER (session=${session_id}, ticker=${t.ticker}, reason=${t.reason}, date=${t.transferDate})`,
+        notes:          `${notesPrefix} (session=${session_id}, ticker=${t.ticker}, reason=${t.reason}, date=${t.transferDate}${isForceZero ? ', forceZero=true' : ''})`,
         source_file_id: canonicalFile.id,
+        external_ref,
       }
     })
 

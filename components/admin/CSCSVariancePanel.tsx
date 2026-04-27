@@ -1,6 +1,24 @@
 /**
- * components/admin/CSCSVariancePanel.tsx — v27p
+ * components/admin/CSCSVariancePanel.tsx — v27q-fix5
  *
+ * v27q-fix5: reactive PRICE + AMOUNT columns + Force-Zero toggle.
+ *
+ * (1) chosenPrice now derives from VarianceRow.availablePrices
+ *     (added in v27q-fix5 lib/variance-engine.ts), looked up by the
+ *     row's currently-selected date. Recomputes on date change.
+ *
+ * (2) New per-row Force-Zero checkbox alongside the date picker.
+ *     When checked, the row writes a TRANSFER at price=0, amount=0
+ *     regardless of market_prices for the picked date. The picker
+ *     date is still recorded as trade_date, capturing when the
+ *     corporate action occurred. Use case: license revocation,
+ *     share consolidation phantom-unit retirement.
+ *
+ * (3) Apply payload includes forceZero per row. Server tags
+ *     external_ref distinctly so the retired-shares report can
+ *     surface zero-recovery vs delisting writeoffs separately.
+ *
+ * v27p baseline:
  * v27p change: per-row date picker for held-orphan transfers.
  *
  * For each actionable row, operator picks a transfer date from a
@@ -178,6 +196,8 @@ export default function CSCSVariancePanel({
     }
     return m
   })
+  // v27q-fix5: per-row force-zero toggle (corporate-action zero-recovery writeoff)
+  const [forceZero, setForceZero] = useState<Record<string, boolean>>({})
   const [notice, setNotice] = useState<{ kind: 'ok' | 'error'; text: string } | null>(null)
 
   // Reset selection + dates if variance changes
@@ -198,6 +218,11 @@ export default function CSCSVariancePanel({
 
   function setDate(ticker: string, date: string) {
     setTransferDates(prev => ({ ...prev, [ticker]: date }))
+  }
+
+  // v27q-fix5: toggle force-zero (price=0) for a row
+  function toggleForceZero(ticker: string) {
+    setForceZero(prev => ({ ...prev, [ticker]: !prev[ticker] }))
   }
 
   const filteredRows = useMemo(() => {
@@ -236,13 +261,14 @@ export default function CSCSVariancePanel({
   async function handleApply() {
     setNotice(null)
     try {
-      // v27p: include transferDate per row
+      // v27q-fix5: include transferDate AND forceZero per row
       const transfers = selectedRowsWithDates.map(r => ({
         ticker:       r.ticker,
         action:       r.proposedAction,
         quantity:     Math.abs(r.unitDelta),
         transferDate: transferDates[r.ticker],
         reason:       r.bucket,
+        forceZero:    forceZero[r.ticker] === true,
       }))
       const res = await fetch(
         `/api/broker/sessions/${sessionId}/apply-reconciliation`,
@@ -444,6 +470,7 @@ export default function CSCSVariancePanel({
                 <th className="num">Δ units</th>
                 <th>Action</th>
                 <th>Transfer date</th>
+                <th style={{ textAlign: 'center' }}>₦0</th>
                 <th className="num">Price</th>
                 <th className="num">Amount</th>
                 <th>Note</th>
@@ -454,12 +481,14 @@ export default function CSCSVariancePanel({
                 const isActionable    = r.proposedAction !== null
                 const isSelected      = selected[r.ticker] || false
                 const chosenDate      = transferDates[r.ticker] || ''
-                const chosenPrice     = chosenDate
-                  ? (r.availablePriceDates.includes(chosenDate)
-                      ? // amount-preview only — server is authoritative
-                        r.proposedPrice
-                      : 0)
-                  : r.proposedPrice
+                const isForceZero     = forceZero[r.ticker] === true
+                // v27q-fix5: reactive price lookup from availablePrices
+                const matchedPrice    = chosenDate
+                  ? (r.availablePrices.find(p => p.date === chosenDate)?.price ?? 0)
+                  : (r.availablePrices.length > 0
+                      ? r.availablePrices[r.availablePrices.length - 1].price
+                      : r.proposedPrice)
+                const chosenPrice     = isForceZero ? 0 : matchedPrice
                 const transferAmount  = Math.abs(r.unitDelta) * chosenPrice
                 const hasPricedDates  = r.availablePriceDates.length > 0
                 const cantApply       = isActionable && !hasPricedDates
@@ -559,13 +588,34 @@ export default function CSCSVariancePanel({
                         <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>
                       )}
                     </td>
-                    <td className="num num-serif">
-                      {chosenPrice > 0 ? fmtNum(chosenPrice, 2) : '—'}
+                    {/* v27q-fix5: Force-Zero toggle */}
+                    <td style={{ textAlign: 'center' }}>
+                      {isActionable && r.proposedAction === 'TRANSFER_OUT' ? (
+                        <input
+                          type="checkbox"
+                          checked={isForceZero}
+                          onChange={() => toggleForceZero(r.ticker)}
+                          style={{
+                            cursor: 'pointer',
+                            accentColor: 'var(--neg)',
+                          }}
+                          title="Force write at price=0 (corporate action with no recovery, e.g. license revocation, consolidation phantom retirement)"
+                        />
+                      ) : (
+                        <span style={{ fontSize: 10, color: 'var(--text-3)' }}>—</span>
+                      )}
                     </td>
                     <td className="num num-serif">
-                      {isActionable && transferAmount > 0
-                        ? fmtNaira(transferAmount)
-                        : '—'}
+                      {isForceZero
+                        ? <span style={{ color: 'var(--neg)', fontWeight: 600 }}>0.00</span>
+                        : (chosenPrice > 0 ? fmtNum(chosenPrice, 2) : '—')}
+                    </td>
+                    <td className="num num-serif">
+                      {isForceZero
+                        ? <span style={{ color: 'var(--neg)', fontWeight: 600 }}>₦0.00</span>
+                        : (isActionable && transferAmount > 0
+                            ? fmtNaira(transferAmount)
+                            : '—')}
                     </td>
                     <td
                       style={{
