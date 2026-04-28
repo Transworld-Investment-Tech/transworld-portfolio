@@ -1,23 +1,32 @@
 /**
- * app/admin/portfolios/[id]/retired-shares/page.tsx — v27q-fix5 (NEW)
+ * app/admin/portfolios/[id]/retired-shares/page.tsx — v27w
  *
- * Report page listing positions retired from a portfolio via the variance
- * panel's reconciliation flow. Two sections:
+ * v27q-fix5 (original) → v27w design refresh:
+ *   - Full hybrid v3 vocabulary (navy × cream × gold, Cormorant + DM Sans)
+ *   - <main className="hybrid-page"> wrapper (was <div className="main">)
+ *   - hybrid-serif h1, eyebrow crumb, KPI summary strip
+ *   - btn-h buttons (was .btn)
+ *   - alert-h-warn for the "for client follow-up" disclaimer
+ *   - h-table for tables (was bare <table>)
+ *   - Proper "Back to overview" link returning to /portfolio/[id] (the
+ *     Overview page) instead of /portfolio/[id]/holdings — Overview
+ *     gets the v27w callout that surfaces this report's count
+ *
+ * Page lists positions retired from a portfolio via the variance panel's
+ * reconciliation flow. Two sections:
  *
  *   1. Zero-recovery writeoffs — Force-Zero toggle was used. Positions
- *      retired with no consideration recorded. Client may be entitled to
- *      payment from the issuer's registrar (license revocation, share
- *      consolidation that compressed unit count, etc.) and never received
- *      it. Highest-priority follow-up.
+ *      retired with no consideration recorded. Highest-priority follow-up.
  *
  *   2. Delisting writeoffs — picker date set to delisting era, price was
- *      the scheme/last-traded price. Scheme consideration would have been
- *      paid directly to the client (not to the broker). Worth verifying
- *      with registrar that payment was received.
+ *      the scheme/last-traded price. Worth verifying with registrar.
  *
  * Tagged in transactions via external_ref:
  *   - corp-action-zero-recovery-<sessionId>
  *   - corp-action-delisting-<sessionId>
+ *
+ * Server-rendered (async function, no 'use client') — uses service-role
+ * key for the read so it bypasses RLS without needing browser auth.
  */
 
 import { createClient } from '@supabase/supabase-js'
@@ -136,71 +145,100 @@ export default async function RetiredSharesPage({
   const { id } = await params
   const { portfolio, zeroRecovery, delisting, error } = await fetchData(id)
 
+  // ─── Error state ───────────────────────────────────────────────
   if (error || !portfolio) {
     return (
-      <div className="main">
+      <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
         <div className="page-head">
           <div>
-            <div className="crumb">Retired Shares Report</div>
-            <h1>Error</h1>
+            <div className="eyebrow" style={{ marginBottom: 10 }}>Retired shares report</div>
+            <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+              Error
+            </h1>
           </div>
         </div>
-        <div style={{ padding: 24, color: 'var(--neg)' }}>
+        <div className="alert-h" style={{
+          background: 'rgba(166, 59, 59, 0.08)',
+          borderColor: 'var(--neg)',
+          color: 'var(--neg)',
+          fontSize: 12,
+        }}>
           {error ?? 'Portfolio not found'}
         </div>
-      </div>
+      </main>
     )
   }
 
   const totalCount = zeroRecovery.length + delisting.length
+  const totalQuantityZero = zeroRecovery.reduce((s, r) => s + r.quantity, 0)
+  const totalConsiderationDelisting = delisting.reduce((s, r) => s + r.amount, 0)
 
   return (
-    <div className="main">
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+      {/* Page header — hybrid v3 vocabulary */}
       <div className="page-head">
         <div>
-          <div className="crumb">{portfolio.client_name} · Portfolio {portfolio.label}</div>
-          <h1>Retired Shares</h1>
+          <div className="eyebrow" style={{ marginBottom: 10 }}>
+            {portfolio.client_name} · Portfolio {portfolio.label}
+          </div>
+          <h1 className="hybrid-serif" style={{ fontSize: 36, fontWeight: 500, letterSpacing: '-0.005em', lineHeight: 1, color: 'var(--text)' }}>
+            Retired shares
+          </h1>
         </div>
-        <div className="page-actions">
-          <Link href={`/portfolio/${portfolio.id}/holdings`}>
-            <button className="btn">← Back to portfolio</button>
+        <div style={{ display: 'flex', gap: 8 }}>
+          <Link href={`/portfolio/${portfolio.id}`} style={{ textDecoration: 'none' }}>
+            <button className="btn-h">← Back to overview</button>
           </Link>
         </div>
       </div>
 
+      {/* Empty state */}
       {totalCount === 0 ? (
-        <div
-          style={{
-            padding: 32,
-            textAlign: 'center',
-            background: 'var(--card)',
-            border: '1px solid var(--border)',
-            borderRadius: 5,
-            color: 'var(--text-2)',
-          }}
-        >
+        <div className="panel" style={{ padding: 32, textAlign: 'center', color: 'var(--text-2)', fontSize: 13 }}>
           No retired-share records for this portfolio.
         </div>
       ) : (
         <>
-          {/* Disclaimer banner */}
-          <div
-            style={{
-              padding: '14px 18px',
-              background: 'rgba(176, 139, 62, 0.08)',
-              border: '1px solid rgba(176, 139, 62, 0.3)',
-              borderRadius: 4,
-              marginBottom: 24,
-              fontSize: 12,
-              lineHeight: 1.6,
-              color: 'var(--text)',
-            }}
-          >
-            <strong style={{ color: 'var(--gold)' }}>For client follow-up.</strong>{' '}
-            Positions retired from the portfolio that may have outstanding consideration
-            from the issuer&apos;s registrar. Operator should contact each registrar with
-            the client&apos;s CSCS number and original holding details to confirm payment
-            status. This report is a checklist for client service, not a record of unpaid amounts.
+          {/* KPI summary strip */}
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 24 }}>
+            <div className="kpi-mini" style={{ borderTopColor: 'var(--neg)' }}>
+              <div className="kpi-mini-label">Zero-recovery positions</div>
+              <div className="kpi-mini-value" style={{ color: 'var(--neg)' }}>
+                {zeroRecovery.length}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+                {totalQuantityZero > 0 ? `${fmtNum(totalQuantityZero)} units · high priority` : 'High priority'}
+              </div>
+            </div>
+            <div className="kpi-mini" style={{ borderTopColor: 'var(--warn)' }}>
+              <div className="kpi-mini-label">Delisting writeoffs</div>
+              <div className="kpi-mini-value" style={{ color: 'var(--warn)' }}>
+                {delisting.length}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+                {totalConsiderationDelisting > 0 ? `~${fmtNaira(totalConsiderationDelisting)} consideration` : 'Verify with registrar'}
+              </div>
+            </div>
+            <div className="kpi-mini" style={{ borderTopColor: 'var(--gold)' }}>
+              <div className="kpi-mini-label">Total retired</div>
+              <div className="kpi-mini-value" style={{ color: 'var(--gold)' }}>
+                {totalCount}
+              </div>
+              <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+                Across both categories
+              </div>
+            </div>
+          </div>
+
+          {/* Disclaimer banner — hybrid alert-h-warn vocabulary */}
+          <div className="alert-h alert-h-warn" style={{ marginBottom: 24, fontSize: 12, lineHeight: 1.6, alignItems: 'flex-start' }}>
+            <div>
+              <strong style={{ color: 'var(--gold)' }}>For client follow-up.</strong>{' '}
+              Positions retired from the portfolio that may have outstanding consideration
+              from the issuer&apos;s registrar. Operator should contact each registrar with
+              the client&apos;s CSCS number and original holding details to confirm payment
+              status. This report is a checklist for client service, not a record of unpaid amounts.
+            </div>
           </div>
 
           {/* Section 1: Zero-recovery writeoffs */}
@@ -208,35 +246,46 @@ export default async function RetiredSharesPage({
             <div className="panel" style={{ marginBottom: 20 }}>
               <div className="panel-header">
                 <div>
-                  <div className="panel-title">Zero-Recovery Writeoffs</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
-                    Retired with no recorded consideration · {zeroRecovery.length} position{zeroRecovery.length === 1 ? '' : 's'} · HIGH PRIORITY
+                  <div className="panel-title">Zero-recovery writeoffs</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4, lineHeight: 1.5 }}>
+                    Retired with no recorded consideration · {zeroRecovery.length} position{zeroRecovery.length === 1 ? '' : 's'} ·{' '}
+                    <span style={{ color: 'var(--neg)', fontWeight: 600 }}>HIGH PRIORITY</span>
                   </div>
                 </div>
                 <span className="pill pill-breach">Action recommended</span>
               </div>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Ticker</th>
-                    <th>Name</th>
-                    <th className="num">Quantity retired</th>
-                    <th>Retirement date</th>
-                    <th>Reason / corporate action</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {zeroRecovery.map(r => (
-                    <tr key={r.id}>
-                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{r.instrument_id}</td>
-                      <td style={{ fontSize: 11, color: 'var(--text-2)' }}>{r.instrument_name || '—'}</td>
-                      <td className="num num-serif">{fmtNum(r.quantity)}</td>
-                      <td style={{ fontSize: 12, fontFamily: 'monospace' }}>{r.trade_date}</td>
-                      <td style={{ fontSize: 11, color: 'var(--text-2)', maxWidth: 480 }}>{r.notes || '—'}</td>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="h-table">
+                  <thead>
+                    <tr>
+                      <th>Ticker</th>
+                      <th>Name</th>
+                      <th className="num">Quantity retired</th>
+                      <th>Retirement date</th>
+                      <th>Reason / corporate action</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {zeroRecovery.map(r => (
+                      <tr key={r.id}>
+                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 500 }}>
+                          {r.instrument_id}
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                          {r.instrument_name || '—'}
+                        </td>
+                        <td className="num num-serif">{fmtNum(r.quantity)}</td>
+                        <td style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+                          {r.trade_date}
+                        </td>
+                        <td style={{ fontSize: 11, color: 'var(--text-2)', maxWidth: 480, lineHeight: 1.5 }}>
+                          {r.notes || '—'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
 
@@ -245,46 +294,59 @@ export default async function RetiredSharesPage({
             <div className="panel">
               <div className="panel-header">
                 <div>
-                  <div className="panel-title">Delisting Writeoffs</div>
-                  <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
+                  <div className="panel-title">Delisting writeoffs</div>
+                  <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4, lineHeight: 1.5 }}>
                     Retired at scheme/last-traded price · {delisting.length} position{delisting.length === 1 ? '' : 's'} · Verify with registrar
                   </div>
                 </div>
                 <span className="pill pill-warn">Verify</span>
               </div>
-              <div style={{ fontSize: 11, color: 'var(--text-2)', padding: '0 0 14px', lineHeight: 1.5 }}>
+              <div style={{
+                fontSize: 11, color: 'var(--text-2)', padding: '0 0 14px',
+                lineHeight: 1.6, fontStyle: 'italic',
+              }}>
                 Scheme consideration for these positions would have been paid directly to the client&apos;s bank account
                 or registrar — not to the broker. The recorded amount approximates the per-share consideration but
                 actual payment status should be confirmed with the registrar.
               </div>
-              <table>
-                <thead>
-                  <tr>
-                    <th>Ticker</th>
-                    <th>Name</th>
-                    <th className="num">Quantity retired</th>
-                    <th className="num">Per-share price</th>
-                    <th className="num">Approx. consideration</th>
-                    <th>Retirement date</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {delisting.map(r => (
-                    <tr key={r.id}>
-                      <td style={{ fontFamily: 'monospace', fontSize: 12 }}>{r.instrument_id}</td>
-                      <td style={{ fontSize: 11, color: 'var(--text-2)' }}>{r.instrument_name || '—'}</td>
-                      <td className="num num-serif">{fmtNum(r.quantity)}</td>
-                      <td className="num num-serif">{r.price > 0 ? fmtNum(r.price, 2) : '—'}</td>
-                      <td className="num num-serif">{r.amount > 0 ? fmtNaira(r.amount) : '—'}</td>
-                      <td style={{ fontSize: 12, fontFamily: 'monospace' }}>{r.trade_date}</td>
+              <div style={{ overflowX: 'auto' }}>
+                <table className="h-table">
+                  <thead>
+                    <tr>
+                      <th>Ticker</th>
+                      <th>Name</th>
+                      <th className="num">Quantity retired</th>
+                      <th className="num">Per-share price</th>
+                      <th className="num">Approx. consideration</th>
+                      <th>Retirement date</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
+                  </thead>
+                  <tbody>
+                    {delisting.map(r => (
+                      <tr key={r.id}>
+                        <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12, fontWeight: 500 }}>
+                          {r.instrument_id}
+                        </td>
+                        <td style={{ fontSize: 12, color: 'var(--text-2)' }}>
+                          {r.instrument_name || '—'}
+                        </td>
+                        <td className="num num-serif">{fmtNum(r.quantity)}</td>
+                        <td className="num num-serif">{r.price > 0 ? fmtNum(r.price, 2) : '—'}</td>
+                        <td className="num num-serif" style={{ color: 'var(--gold)' }}>
+                          {r.amount > 0 ? fmtNaira(r.amount) : '—'}
+                        </td>
+                        <td style={{ fontSize: 12, fontFamily: 'var(--font-mono)' }}>
+                          {r.trade_date}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
             </div>
           )}
         </>
       )}
-    </div>
+    </main>
   )
 }

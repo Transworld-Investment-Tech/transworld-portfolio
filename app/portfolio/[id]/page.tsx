@@ -4,7 +4,7 @@ import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import * as XLSX from 'xlsx'
 import {
-  RefreshCw, FileText, Download, AlertTriangle, Info, FileSpreadsheet, Sparkles,
+  RefreshCw, FileText, Download, AlertTriangle, Info, FileSpreadsheet, Sparkles, Archive,
 } from 'lucide-react'
 import dynamic from 'next/dynamic'
 import { supabase } from '@/lib/supabase'
@@ -112,6 +112,9 @@ export default function PortfolioOverviewPage() {
 
   // v21y: Scenario modal state
   const [scenarioOpen, setScenarioOpen] = useState(false)
+
+  // v27w: retired shares count — surfaces callout if > 0
+  const [retiredCount, setRetiredCount] = useState<number>(0)
 
   // v27b: mandate-health engine inputs
   const [navHistory, setNavHistory] = useState<{ nav_date: string; nav_value: number }[]>([])
@@ -224,6 +227,17 @@ export default function PortfolioOverviewPage() {
         if (data?.div_last_refreshed_at) setDivFreshness(new Date(data.div_last_refreshed_at))
       })
   }, [])
+
+  // v27w: fetch retired shares count for this portfolio (surfaces callout)
+  useEffect(() => {
+    if (!portfolioId) return
+    supabase
+      .from('transactions')
+      .select('id', { count: 'exact', head: true })
+      .eq('portfolio_id', portfolioId)
+      .or('external_ref.like.corp-action-zero-recovery-%,external_ref.like.corp-action-delisting-%')
+      .then(({ count }) => { setRetiredCount(count ?? 0) })
+  }, [portfolioId])
 
   useEffect(() => {
     if (!portfolioId || loading) return
@@ -497,6 +511,36 @@ export default function PortfolioOverviewPage() {
             </div>
           ))}
         </div>
+      )}
+
+      {/* v27w: retired shares callout — visible only when this portfolio has retired positions */}
+      {retiredCount > 0 && (
+        <Link
+          href={`/admin/portfolios/${portfolioId}/retired-shares`}
+          style={{
+            display: 'flex', alignItems: 'center', gap: 14,
+            padding: '14px 18px', marginBottom: 24,
+            background: 'rgba(176, 139, 62, 0.08)',
+            border: '1px solid rgba(176, 139, 62, 0.35)',
+            borderRadius: 5,
+            textDecoration: 'none',
+            color: 'var(--text)',
+            transition: 'background 0.15s, border-color 0.15s',
+          }}
+        >
+          <Archive size={18} style={{ color: 'var(--gold)', flexShrink: 0 }} />
+          <div style={{ flex: 1, lineHeight: 1.4 }}>
+            <div style={{ fontWeight: 600, fontSize: 13, color: 'var(--text)' }}>
+              {retiredCount} retired position{retiredCount === 1 ? '' : 's'} pending registrar follow-up
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 2 }}>
+              Zero-recovery writeoffs and delisting consideration may need verification with the issuer&apos;s registrar.
+            </div>
+          </div>
+          <span style={{ fontSize: 11, color: 'var(--gold)', fontWeight: 600, letterSpacing: '0.04em', flexShrink: 0 }}>
+            Review report →
+          </span>
+        </Link>
       )}
 
       {/* ── KPI row ────────────────────────────────────────────────────────── */}
