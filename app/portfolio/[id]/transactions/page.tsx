@@ -4,7 +4,9 @@ import { useParams } from 'next/navigation'
 import * as XLSX from 'xlsx'
 import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
-import { Plus, Search, Copy, Check, Info, FileSpreadsheet } from 'lucide-react'
+import { Plus, Search, Copy, Check, Info, FileSpreadsheet, Edit2 } from 'lucide-react'
+// v27v: Transaction CRUD modal
+import EditTransactionModal from '@/components/admin/EditTransactionModal'
 
 // v20d: Hybrid rewrite.
 // Sidebar rendered by app/portfolio/[id]/layout.tsx — do NOT render here.
@@ -85,6 +87,8 @@ export default function TransactionsPage() {
   const [saving,      setSaving]      = useState(false)
   const [feeView,     setFeeView]     = useState<FeeView>('total')
   const [copied,      setCopied]      = useState(false)
+  // v27v: edit modal state — null when closed, txn object when open
+  const [editingTxn,  setEditingTxn]  = useState<any>(null)
   const [filter, setFilter] = useState({ action: '', search: '', feeType: '' })
   const [form, setForm] = useState({
     trade_date: new Date().toISOString().slice(0, 10),
@@ -139,6 +143,17 @@ export default function TransactionsPage() {
     const { data } = await supabase.from('transactions').select('*').eq('portfolio_id', portfolioId).order('trade_date', { ascending: false }).limit(300)
     setTxns(data ?? [])
     setSaving(false)
+  }
+
+  // v27v: refresh helper used by edit modal callbacks
+  async function reloadTxns() {
+    const { data } = await supabase
+      .from('transactions')
+      .select('*')
+      .eq('portfolio_id', portfolioId)
+      .order('trade_date', { ascending: false })
+      .limit(300)
+    setTxns(data ?? [])
   }
 
   const feeRows = buildFeeRows(txns)
@@ -617,6 +632,7 @@ export default function TransactionsPage() {
                   </>
                 )}
                 <th>Notes</th>
+                {/* v27v */}<th style={{ width: 70 }}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -661,12 +677,35 @@ export default function TransactionsPage() {
                   <td style={{ fontSize: 11, color: 'var(--text-3)', maxWidth: 160, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
                     {t.notes || '—'}
                   </td>
+                  {/* v27v: Edit button per row (hidden for virtual fee-decomposition rows) */}
+                  <td>
+                    {!t._virtual && (
+                      <button
+                        onClick={() => setEditingTxn(t)}
+                        className="btn-h"
+                        style={{ padding: '4px 8px', fontSize: 11 }}
+                        title="Edit transaction"
+                      >
+                        <Edit2 size={11} />
+                      </button>
+                    )}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         )}
       </div>
+      {/* v27v: Edit transaction modal — rendered when a row is selected */}
+      {editingTxn && (
+        <EditTransactionModal
+          transaction={editingTxn}
+          instruments={instruments}
+          onClose={() => setEditingTxn(null)}
+          onSaved={() => { reloadTxns() }}
+          onDeleted={() => { reloadTxns() }}
+        />
+      )}
     </main>
   )
 }
