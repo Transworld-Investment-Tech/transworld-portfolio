@@ -70,6 +70,9 @@ export interface ReportData {
     ddAction: number
   }
   irr: number | null
+  irrITD?: number | null    // v27u: explicit ITD (alias for irr; either works)
+  irrLY?:  number | null    // v27u: LY IRR, annualised
+  irrYTD?: number | null    // v27u: YTD IRR, annualised
   annualisedReturn: number | null
   periodReturns: Array<{
     label: string
@@ -738,13 +741,26 @@ export function generateHTMLReport(data: ReportData): string {
       ${markdownToHTML(data.aiReport.content)}
     </div>` : ''
 
-  // ─── Performance: IRR-led display ────────────────────────────
-  // The period returns table was replaced because the export route passes
-  // identical inception-to-date data for every period row, and starting
-  // NAV = ₦0 produces +∞% returns. IRR (Newton-Raphson) is always correct.
-  const irrDisplay = portfolioIRR !== 0
-    ? `${portfolioIRR >= 0 ? '+' : ''}${(portfolioIRR * 100).toFixed(2)}%`
-    : 'N/A'
+  // ─── Performance: 3-period IRR display (v27u) ────────────────
+  // YTD IRR is the headline. LY + ITD shown smaller below in a 2-col grid.
+  // portfolioIRR (= ITD) retained for page-1 KPI strip + benchmarks comparison.
+  const fmtIRR = (v: number | null | undefined): string => {
+    if (v === null || v === undefined || !isFinite(v) || v === 0) return 'N/A'
+    return `${v >= 0 ? '+' : ''}${(v * 100).toFixed(2)}%`
+  }
+  const colorOf = (v: number | null | undefined): string => {
+    if (v === null || v === undefined || !isFinite(v) || v === 0) return 'color:var(--text-3);'
+    return v >= 0 ? 'color:var(--pos);' : 'color:var(--neg);'
+  }
+  const portfolioIRRITD = data.irrITD ?? data.irr ?? data.annualisedReturn ?? null
+  const portfolioIRRLY  = data.irrLY  ?? null
+  const portfolioIRRYTD = data.irrYTD ?? null
+  const irrYTDDisplay   = fmtIRR(portfolioIRRYTD)
+  const irrLYDisplay    = fmtIRR(portfolioIRRLY)
+  const irrITDDisplay   = fmtIRR(portfolioIRRITD)
+  const irrYTDColor     = colorOf(portfolioIRRYTD)
+  const irrLYColor      = colorOf(portfolioIRRLY)
+  const irrITDColor     = colorOf(portfolioIRRITD)
 
   const totalReturnDisplay = isFinite(data.totalReturnPct) && !isNaN(data.totalReturnPct)
     ? `${data.totalReturnPct >= 0 ? '+' : ''}${(data.totalReturnPct * 100).toFixed(1)}%`
@@ -836,8 +852,18 @@ export function generateHTMLReport(data: ReportData): string {
       <div class="section-title">Performance &amp; benchmarks</div>
       <div class="perf-grid">
         <div class="perf-left">
-          <div class="irr-label">IRR (Inception)</div>
-          <div class="irr-value">${irrDisplay}<span class="irr-pa">p.a.</span></div>
+          <div class="irr-label">YTD IRR (annualised)</div>
+          <div class="irr-value" style="${irrYTDColor}">${irrYTDDisplay}<span class="irr-pa">p.a.</span></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:14px 0;padding:10px 0;border-top:1px solid var(--border);border-bottom:1px solid var(--border);">
+            <div>
+              <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-3);margin-bottom:4px;">LY IRR</div>
+              <div style="font-family:'Cormorant Garamond',serif;font-size:16pt;font-weight:500;${irrLYColor}">${irrLYDisplay}<span style="font-size:9pt;color:var(--text-3);font-family:'DM Sans',sans-serif;font-weight:400;margin-left:4px;">p.a.</span></div>
+            </div>
+            <div>
+              <div style="font-size:8.5pt;font-weight:600;text-transform:uppercase;letter-spacing:0.1em;color:var(--text-3);margin-bottom:4px;">ITD IRR</div>
+              <div style="font-family:'Cormorant Garamond',serif;font-size:16pt;font-weight:500;${irrITDColor}">${irrITDDisplay}<span style="font-size:9pt;color:var(--text-3);font-family:'DM Sans',sans-serif;font-weight:400;margin-left:4px;">p.a.</span></div>
+            </div>
+          </div>
           <div class="perf-meta">
             Money-weighted return, annualised${daysHeld ? ' · <strong>' + daysHeld.toLocaleString() + ' days held</strong>' : ''}<br>
             Since inception: <strong>${data.startDate}</strong><br>

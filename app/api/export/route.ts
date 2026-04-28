@@ -53,19 +53,21 @@ export async function GET(req: NextRequest) {
 
   const fxRate = fxRes?.rates?.NGN ?? 1665
 
-  // IRR — v27s: route through computePeriodMetrics, the same consolidated codepath
-  // the portfolio page and AI report engine use. Eliminates the divergence between
-  // dashboard IRR and PDF-report IRR that v27s was created to fix. Pattern mirrors
-  // report-engine.ts lines 107-118 (computePerformanceMetrics).
-  let irr: number | null = null
+  // IRR — v27u: extend v27s single-period to three periods (ITD + LY + YTD).
+  // YTD becomes the report headline; LY + ITD shown smaller below.
+  // navHistory is required for LY/YTD period-boundary NAV lookups; ITD
+  // reads portfolio.starting_nav directly so it works either way.
+  let irrITD: number | null = null
+  let irrLY:  number | null = null
+  let irrYTD: number | null = null
   if ((portfolio.starting_nav ?? 0) > 0 && portfolio.start_date) {
-    try {
-      const m = computePeriodMetrics('ITD', portfolio, currentNAV, [], txns)
-      irr = m.irr
-    } catch {
-      irr = null
-    }
+    try { irrITD = computePeriodMetrics('ITD', portfolio, currentNAV, navHistory, txns).irr } catch { irrITD = null }
+    try { irrLY  = computePeriodMetrics('LY',  portfolio, currentNAV, navHistory, txns).irr } catch { irrLY  = null }
+    try { irrYTD = computePeriodMetrics('YTD', portfolio, currentNAV, navHistory, txns).irr } catch { irrYTD = null }
   }
+  // Backward compat: page-1 KPI strip and benchmarks "This Portfolio" row
+  // continue reading `irr` which keeps its prior meaning (ITD).
+  const irr = irrITD
   const navWithCurrent = [...navHistory, { nav_date: new Date().toISOString().slice(0, 10), nav_value: currentNAV }]
   const periodReturns = [
     { label: '1 Month',   days: 30  },
@@ -146,6 +148,9 @@ export async function GET(req: NextRequest) {
       ddAction:     Math.abs(portfolio.dd_action),
     },
     irr,
+    irrITD,    // v27u
+    irrLY,     // v27u
+    irrYTD,    // v27u
     annualisedReturn,
     periodReturns: periodReturns.map(p => ({
       label: p.label,
