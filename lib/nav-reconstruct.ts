@@ -1,28 +1,37 @@
 /**
- * lib/nav-reconstruct.ts — v27k
+ * lib/nav-reconstruct.ts — v27r
  *
- * v27k change: three-level price fallback eliminates the day-to-day NAV
- * oscillation that was visible on portfolios with sparse market_prices
- * coverage (DON-C showed ±70% swings between adjacent days because some
- * holdings had market prices on day N but fell back to avg cost on day N+1).
+ * v27r change: market_prices loader migrated to RPC + jsonb to bypass
+ * PostgREST's server-side db-max-rows cap (~1000 rows). The previous
+ * .from('market_prices').select(...).in(...).in(...).limit(50000) call
+ * was silently truncating to 1000 rows, missing up to 70% of price data
+ * for portfolios with broad instrument coverage. Holdings whose prices
+ * were missing fell through to lastKnownPrice → avgCost → 0 (for
+ * TRANSFER_IN-only positions), undercounting NAV by 30-50% across the
+ * entire history. ADE-D's NAV on 2024-12-31 was reconstructed as ₦54.76M
+ * vs the actual ₦107.13M (51% ratio). YTD/LY/L3Y/L5Y IRRs were all
+ * distorted as a result; ITD escaped because it reads starting NAV from
+ * portfolios.starting_nav and current NAV from the live holdings cache,
+ * neither of which goes through reconstruction.
  *
- * Old chain (v27g):
- *   price = prices[instrId] ?? avgCost
+ * The fix uses get_prices_for_recon(p_instrument_ids text[], p_dates date[])
+ * which RETURNS jsonb — PostgREST treats the result as a single scalar,
+ * which is not subject to db-max-rows. Same pattern as v27q-fix4's
+ * get_prices_for_tickers. Defensive Array.isArray guard on the response.
  *
- * New chain (v27k):
+ * v27k preserved: three-level price fallback eliminates day-to-day NAV
+ * oscillation on sparse coverage. Chain unchanged:
  *   price = prices[instrId] ?? lastKnownPrice.get(instrId) ?? avgCost
  *
- * The lastKnownPrice map is rebuilt per-portfolio (not global) and updated
- * each time a date HAS market price for an instrument. On dates where the
- * market_prices table is sparse for a given instrument, the most recent
- * known price is carried forward instead of dropping to cost basis. NAV
- * trajectory becomes monotonic-ish (only changes when actual transactions
- * or actual price updates happen) — same behavior as a real broker
+ * The lastKnownPrice map is rebuilt per-portfolio (not global) and
+ * updated each time a date has market price for an instrument. NAV
+ * trajectory becomes monotonic-ish — same behavior as a real broker
  * statement.
  *
  * To benefit, existing nav_log rows must be wiped and rebuilt. Use the
  * companion POST /api/admin/rebuild-nav endpoint (destructive) to wipe
- * and rebuild firm-wide.
+ * and rebuild firm-wide, or DELETE FROM nav_log WHERE portfolio_id = ...
+ * for a single portfolio then click Reconstruct in the UI.
  */
 
 import { SupabaseClient } from '@supabase/supabase-js'
@@ -121,21 +130,38 @@ export async function reconstructPortfolioNav(
   }
 
   // ── 3. Filter prices to portfolio's instruments only ──────────────
+  // v27r: switched from .from('market_prices').select(...).in(...).in(...).limit(50000)
+  // to .rpc('get_prices_for_recon', ...) because PostgREST's server-side
+  // db-max-rows cap (~1000) silently truncated the direct query. The RPC
+  // returns jsonb, which is treated as a single scalar by PostgREST and
+  // bypasses the cap. Same pattern as v27q-fix4's get_prices_for_tickers.
   const portfolioInstruments = [...new Set(
     txns.map((t: any) => t.instrument_id).filter(Boolean) as string[]
   )]
 
-  const { data: priceRows } = await db
-    .from('market_prices')
-    .select('instrument_id, price_date, price')
-    .in('instrument_id', portfolioInstruments)
-    .in('price_date', dates)
-    .limit(50000)
+  const { data: priceRowsRaw, error: priceErr } = await db.rpc(
+    'get_prices_for_recon',
+    { p_instrument_ids: portfolioInstruments, p_dates: dates }
+  )
+
+  if (priceErr) {
+    return {
+      portfolioId,
+      navEntriesAdded: 0,
+      datesProcessed: dates.length,
+      instrumentsTracked: portfolioInstruments.length,
+      error: `get_prices_for_recon: ${priceErr.message}`,
+    }
+  }
+
+  // Defensive guard: RPC returns jsonb which deserialises to array,
+  // but null/undefined possible if function returns nothing.
+  const priceRows = Array.isArray(priceRowsRaw) ? priceRowsRaw : []
 
   const priceMap: Record<string, Record<string, number>> = {}
-  for (const p of priceRows ?? []) {
+  for (const p of priceRows) {
     if (!priceMap[p.price_date]) priceMap[p.price_date] = {}
-    priceMap[p.price_date][p.instrument_id] = p.price
+    priceMap[p.price_date][p.instrument_id] = Number(p.price)
   }
 
   // ── 4. Skip existing nav_log dates ────────────────────────────────
