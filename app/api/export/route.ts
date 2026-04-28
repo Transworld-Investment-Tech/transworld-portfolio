@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { computeNAV, computeSleeveData, complianceAlerts, fmt } from '@/lib/portfolio'
-import { calculateIRR, buildCashFlows, calcPeriodReturn, BENCHMARKS } from '@/lib/analytics'
+import { computePeriodMetrics, calcPeriodReturn, BENCHMARKS } from '@/lib/analytics'  // v27s: route IRR through consolidated codepath
 import { generateHTMLReport } from '@/lib/html-report'
 
 // v20g fix: complianceAlerts() was being called with arguments 2 and 3
@@ -53,9 +53,19 @@ export async function GET(req: NextRequest) {
 
   const fxRate = fxRes?.rates?.NGN ?? 1665
 
-  // IRR
-  const cashFlows = buildCashFlows(portfolio.starting_nav, portfolio.start_date, txns, currentNAV)
-  const irr = calculateIRR(cashFlows)
+  // IRR — v27s: route through computePeriodMetrics, the same consolidated codepath
+  // the portfolio page and AI report engine use. Eliminates the divergence between
+  // dashboard IRR and PDF-report IRR that v27s was created to fix. Pattern mirrors
+  // report-engine.ts lines 107-118 (computePerformanceMetrics).
+  let irr: number | null = null
+  if ((portfolio.starting_nav ?? 0) > 0 && portfolio.start_date) {
+    try {
+      const m = computePeriodMetrics('ITD', portfolio, currentNAV, [], txns)
+      irr = m.irr
+    } catch {
+      irr = null
+    }
+  }
   const navWithCurrent = [...navHistory, { nav_date: new Date().toISOString().slice(0, 10), nav_value: currentNAV }]
   const periodReturns = [
     { label: '1 Month',   days: 30  },
