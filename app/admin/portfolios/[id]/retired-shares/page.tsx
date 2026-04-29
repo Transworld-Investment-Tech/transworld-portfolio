@@ -31,8 +31,6 @@
 
 import { createClient } from '@supabase/supabase-js'
 import Link from 'next/link'
-// v27x: print button (client island)
-import PrintButton from '@/components/admin/PrintButton'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -187,9 +185,15 @@ export default async function RetiredSharesPage({
             Retired shares
           </h1>
         </div>
-        <div style={{ display: 'flex', gap: 8 }} className="no-print">
-          {/* v27x: print / save as PDF */}
-          <PrintButton />
+        <div style={{ display: 'flex', gap: 8 }}>
+          {/* v27z: download self-contained HTML report (open + print from browser) */}
+          <a
+            href={`/api/admin/portfolios/${portfolio.id}/retired-shares/html?download=1`}
+            className="btn-h"
+            style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+          >
+            ⬇ Download HTML
+          </a>
           <Link href={`/portfolio/${portfolio.id}`} style={{ textDecoration: 'none' }}>
             <button className="btn-h">← Back to overview</button>
           </Link>
@@ -351,7 +355,6 @@ export default async function RetiredSharesPage({
           )}
         </>
       )}
-      {/* v27y: print styles consolidated into globals.css */}
     </main>
   )
 }
