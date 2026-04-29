@@ -1,17 +1,40 @@
 /**
- * lib/holdings-rebuild.ts — v21d
+ * lib/holdings-rebuild.ts — v27aa
  *
  * Recomputes a portfolio's holdings table from its transactions.
  * Called by:
  *   - app/api/broker/sessions/[id]/commit/route.ts  (after transactions INSERT)
  *   - app/api/broker/sessions/[id]/rollback/route.ts (after transactions DELETE)
+ *   - app/api/admin/synthesize-recovery/route.ts    (after synth INSERT)
+ *   - app/api/admin/transactions/[id]/route.ts      (v27v: after CRUD edit/delete)
+ *   - app/api/holdings/route.ts                     (manual rebuild trigger)
  *
- * Why not incremental?  The portfolio-wide full rebuild is trivially
- * correct for any mix of historical SQL-seeded transactions + new
- * broker-committed transactions, and at typical scales (<1000
- * transactions per portfolio) it's sub-second. Incremental gets
- * complicated fast — partial fills, transfer-in cost treatment,
- * rollbacks of split trades.
+ * v27aa change (Priority 2 from 02_app_state.md):
+ * ─────────────────────────────────────────────────────────────────
+ * Previously TRANSFER_IN rows were ignored in avg_cost computation,
+ * which left transfer-only positions showing avg_cost = ₦0.00 and
+ * inflated unrealised P&L (~₦56M aggregate across affected portfolios).
+ *
+ * v27aa makes avg_cost category-aware for TRANSFER_IN rows:
+ *
+ *   (A) SYNTH ROWS (external_ref LIKE 'synthetic-recovery-%')
+ *       Use the price stored on the row. recovery-synth.ts populates
+ *       this with the orphan SELL match price — the correct economic
+ *       anchor for synth-derived positions. Cannot use market_prices
+ *       because synth dates are typically portfolio inception (e.g.
+ *       2015-12-23) which predates our market_prices history.
+ *
+ *   (B) RECONCILIATION + MANUAL ROWS (everything else)
+ *       Look up market_prices[(instrument_id, trade_date)] for the
+ *       authoritative historical price. The row's `price` field is
+ *       NOT trusted — it can be stale (e.g. v27r date corrections
+ *       changed trade_date but not price, leaving 2026-era prices
+ *       on rows now dated 2024). Fallback chain:
+ *
+ *         1. market_prices exact match (instrument_id, trade_date)
+ *         2. market_prices nearest-prior (instrument_id, ≤ trade_date)
+ *         3. row's stored `price` field (last resort)
+ *         4. skip cost contribution (qty contributes; cost does not)
  *
  * Algorithm per instrument_id (skipping NULL, which indicates cash
  * events / fees / untyped transfers):
@@ -19,27 +42,23 @@
  *   net_quantity  = sum(BUY.qty) + sum(TRANSFER_IN.qty)
  *                 − sum(SELL.qty) − sum(TRANSFER_OUT.qty)
  *
- *   weighted_avg  = Σ(BUY.price × BUY.qty) / Σ(BUY.qty)
- *     (SELLs do NOT change avg_cost — standard cost-basis accounting.
- *      TRANSFER_IN is treated as avg_cost = 0 per known issue #5.
- *      If a holding exists only from TRANSFER_IN, avg_cost stays 0
- *      and the user overrides via /admin/prices manual price.)
+ *   weighted_avg  = Σ(BUY.price × BUY.qty + TRANSFER_IN.cost × TRANSFER_IN.qty)
+ *                 / Σ(BUY.qty + TRANSFER_IN.qty_with_cost)
+ *
+ *     where TRANSFER_IN.cost is resolved via the category-aware chain
+ *     above. SELLs and TRANSFER_OUTs do NOT change avg_cost — standard
+ *     cost-basis accounting.
  *
  *   as_of_date    = latest market_prices.price_date globally
- *                   (falls back to CURRENT_DATE if the table is empty)
- *
  *   sleeve_id     = copied from instruments master
  *
  * Then:
  *   - net_quantity > 0  → upsert holdings row
  *   - net_quantity ≤ 0  → delete existing holdings row (if any)
- *   - any holdings row for an instrument_id that appears in NONE of
- *     the portfolio's transactions → delete (rollback may have wiped
- *     all trades of a security that was only ever broker-ingested)
+ *   - any holdings row for an instrument_id with NO transactions
+ *     → delete (post-rollback cleanup)
  *
- * Returns a summary for logging / UI confirmation. Does not throw —
- * callers can surface warnings but a failed rebuild shouldn't roll
- * back an already-successful transactions INSERT / DELETE.
+ * Returns a summary for logging / UI confirmation.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js'
@@ -52,15 +71,23 @@ export interface RebuildResult {
 }
 
 type TxRow = {
-  action: string
+  action:        string
   instrument_id: string | null
-  quantity: number | null
-  price: number | null
+  quantity:      number | null
+  price:         number | null
+  trade_date:    string | null
+  external_ref:  string | null
 }
 
 type InstrumentRow = {
   instrument_id: string
-  sleeve_id: string | null
+  sleeve_id:     string | null
+}
+
+type PriceRow = {
+  instrument_id: string
+  price_date:    string
+  price:         number
 }
 
 export async function rebuildPortfolioHoldings(
@@ -68,16 +95,18 @@ export async function rebuildPortfolioHoldings(
   portfolio_id: string
 ): Promise<RebuildResult> {
   const result: RebuildResult = {
-    upserted: 0,
-    deleted: 0,
+    upserted:              0,
+    deleted:               0,
     skipped_no_instrument: 0,
-    errors: [],
+    errors:                [],
   }
 
   // ── 1. Fetch all transactions for this portfolio ────────────
+  // v27aa: now also pulls trade_date + external_ref for category-aware
+  // TRANSFER_IN cost basis resolution.
   const { data: txs, error: txErr } = await db
     .from('transactions')
-    .select('action, instrument_id, quantity, price')
+    .select('action, instrument_id, quantity, price, trade_date, external_ref')
     .eq('portfolio_id', portfolio_id)
 
   if (txErr) {
@@ -102,7 +131,127 @@ export async function rebuildPortfolioHoldings(
     instrumentsMap.set(i.instrument_id, i)
   }
 
-  // ── 3. Determine as_of_date from latest market_prices row ────
+  // ── 3. v27aa: Pre-fetch market_prices for non-synth TRANSFER_IN rows ──
+  //
+  // Build the unique set of (instrument_id, trade_date) pairs we need
+  // for cost-basis resolution. Synth rows are excluded — they always
+  // use their stored row.price per the category rule.
+  //
+  // Two-step lookup:
+  //   (a) Exact-date match for non-synth TRANSFER_IN rows
+  //   (b) Nearest-prior-date map per instrument (built once, used as
+  //       fallback when exact-date misses)
+  const isSynth = (ref: string | null | undefined): boolean =>
+    !!ref && ref.startsWith('synthetic-recovery-')
+
+  const nonSynthTransferIns = transactions.filter(
+    t => t.action === 'TRANSFER_IN' &&
+         t.instrument_id &&
+         t.trade_date &&
+         !isSynth(t.external_ref)
+  )
+
+  const exactPriceMap = new Map<string, number>()  // key: `${id}|${date}`
+  const allPricesByInstrument = new Map<string, PriceRow[]>()  // for nearest-prior fallback
+
+  if (nonSynthTransferIns.length > 0) {
+    const distinctIds = Array.from(new Set(
+      nonSynthTransferIns.map(t => t.instrument_id!).filter(Boolean)
+    ))
+    const distinctDates = Array.from(new Set(
+      nonSynthTransferIns.map(t => t.trade_date!).filter(Boolean)
+    ))
+
+    // 3a. Exact-date prefetch.
+    if (distinctIds.length > 0 && distinctDates.length > 0) {
+      const { data: exactRows, error: exactErr } = await db
+        .from('market_prices')
+        .select('instrument_id, price_date, price')
+        .in('instrument_id', distinctIds)
+        .in('price_date', distinctDates)
+
+      if (exactErr) {
+        result.errors.push(`market_prices exact lookup: ${exactErr.message}`)
+        // Continue — fallback chain will still work via row.price + skip
+      } else {
+        for (const p of (exactRows || []) as PriceRow[]) {
+          exactPriceMap.set(`${p.instrument_id}|${p.price_date}`, Number(p.price))
+        }
+      }
+    }
+
+    // 3b. Nearest-prior prefetch — fetch all price history for the
+    // distinct instruments, sorted descending. We'll scan this in
+    // the resolver to find the latest price ≤ trade_date.
+    //
+    // This is a single batched query that returns all rows we might
+    // need; with v27y's db-max-rows raise to 50,000, we have plenty
+    // of headroom.
+    if (distinctIds.length > 0) {
+      const { data: priorRows, error: priorErr } = await db
+        .from('market_prices')
+        .select('instrument_id, price_date, price')
+        .in('instrument_id', distinctIds)
+        .order('price_date', { ascending: false })
+        .limit(50000)
+
+      if (priorErr) {
+        result.errors.push(`market_prices nearest-prior lookup: ${priorErr.message}`)
+      } else {
+        for (const p of (priorRows || []) as PriceRow[]) {
+          if (!allPricesByInstrument.has(p.instrument_id)) {
+            allPricesByInstrument.set(p.instrument_id, [])
+          }
+          allPricesByInstrument.get(p.instrument_id)!.push({
+            instrument_id: p.instrument_id,
+            price_date:    p.price_date,
+            price:         Number(p.price),
+          })
+        }
+      }
+    }
+  }
+
+  // Cost-basis resolver for TRANSFER_IN rows. Returns 0 if no cost
+  // contribution should be made (in which case caller must NOT add
+  // to cost_qty_sum either).
+  function resolveTransferInCost(tx: TxRow): number {
+    // (A) Synth rows always use stored price.
+    if (isSynth(tx.external_ref)) {
+      return Number(tx.price ?? 0)
+    }
+
+    // (B) Reconciliation / manual rows: market_prices first, fallback chain.
+    if (tx.instrument_id && tx.trade_date) {
+      // 1. Exact match
+      const exactKey = `${tx.instrument_id}|${tx.trade_date}`
+      if (exactPriceMap.has(exactKey)) {
+        return exactPriceMap.get(exactKey)!
+      }
+
+      // 2. Nearest prior
+      const history = allPricesByInstrument.get(tx.instrument_id)
+      if (history && history.length > 0) {
+        // history is sorted descending by price_date — find first row
+        // whose price_date <= tx.trade_date
+        for (const p of history) {
+          if (p.price_date <= tx.trade_date) {
+            return p.price
+          }
+        }
+      }
+    }
+
+    // 3. Last resort: row's stored price
+    if (tx.price !== null && tx.price !== undefined && Number(tx.price) > 0) {
+      return Number(tx.price)
+    }
+
+    // 4. Nothing usable.
+    return 0
+  }
+
+  // ── 4. Determine as_of_date from latest market_prices row ────
   const { data: latestPrice, error: lpErr } = await db
     .from('market_prices')
     .select('price_date')
@@ -110,19 +259,20 @@ export async function rebuildPortfolioHoldings(
     .limit(1)
     .single()
 
-  // Fallback to today if market_prices is empty or errors — don't
-  // fail the whole rebuild over the as_of_date lookup.
   const asOfDate: string =
     !lpErr && latestPrice?.price_date
       ? latestPrice.price_date
       : new Date().toISOString().slice(0, 10)
 
-  // ── 4. Aggregate per instrument_id ───────────────────────────
+  // ── 5. Aggregate per instrument_id ───────────────────────────
+  // v27aa: cost_qty_sum / cost_qxp_sum (renamed from buy_qty_sum /
+  // buy_qxp_sum) since they now include both BUY and TRANSFER_IN
+  // contributions.
   type Agg = {
     instrument_id: string
-    quantity: number
-    buy_qty_sum: number
-    buy_qxp_sum: number // Σ(buy qty × buy price)
+    quantity:      number
+    cost_qty_sum:  number
+    cost_qxp_sum:  number  // Σ(qty × cost_basis)
   }
 
   const aggMap = new Map<string, Agg>()
@@ -136,31 +286,39 @@ export async function rebuildPortfolioHoldings(
     if (!aggMap.has(key)) {
       aggMap.set(key, {
         instrument_id: key,
-        quantity: 0,
-        buy_qty_sum: 0,
-        buy_qxp_sum: 0,
+        quantity:      0,
+        cost_qty_sum:  0,
+        cost_qxp_sum:  0,
       })
     }
     const agg = aggMap.get(key)!
-    const qty = tx.quantity ?? 0
-    const price = tx.price ?? 0
+    const qty = Number(tx.quantity ?? 0)
 
     switch (tx.action) {
-      case 'BUY':
-        agg.quantity += qty
-        agg.buy_qty_sum += qty
-        agg.buy_qxp_sum += qty * price
+      case 'BUY': {
+        const price = Number(tx.price ?? 0)
+        agg.quantity     += qty
+        agg.cost_qty_sum += qty
+        agg.cost_qxp_sum += qty * price
         break
+      }
       case 'SELL':
         agg.quantity -= qty
-        // Does NOT touch buy_qty_sum / buy_qxp_sum — avg_cost
-        // reflects original cost basis, not disposal.
+        // SELLs do NOT touch cost_qty_sum / cost_qxp_sum —
+        // avg_cost reflects original cost basis, not disposal.
         break
-      case 'TRANSFER_IN':
+      case 'TRANSFER_IN': {
         agg.quantity += qty
-        // Known-issue #5: TRANSFER_IN comes in at avg_cost = 0.
-        // Intentionally does NOT contribute to buy_qty_sum.
+        // v27aa: category-aware cost basis. resolveTransferInCost
+        // returns 0 if no cost source could be determined (in which
+        // case the row contributes quantity but not cost).
+        const cost = resolveTransferInCost(tx)
+        if (cost > 0) {
+          agg.cost_qty_sum += qty
+          agg.cost_qxp_sum += qty * cost
+        }
         break
+      }
       case 'TRANSFER_OUT':
         agg.quantity -= qty
         break
@@ -168,9 +326,7 @@ export async function rebuildPortfolioHoldings(
     }
   }
 
-  // ── 5. Fetch existing holdings for this portfolio ────────────
-  //      We need this to know what to delete (zero-qty or instruments
-  //      that no longer appear in any transaction at all).
+  // ── 6. Fetch existing holdings for this portfolio ────────────
   const { data: existing, error: exErr } = await db
     .from('holdings')
     .select('instrument_id')
@@ -185,7 +341,7 @@ export async function rebuildPortfolioHoldings(
     ((existing || []) as { instrument_id: string }[]).map((h) => h.instrument_id)
   )
 
-  // ── 6. Decide upserts vs deletes ─────────────────────────────
+  // ── 7. Decide upserts vs deletes ─────────────────────────────
   const upsertRows: any[] = []
   const deleteIds: string[] = []
 
@@ -193,41 +349,40 @@ export async function rebuildPortfolioHoldings(
     if (agg.quantity > 0) {
       const instrument = instrumentsMap.get(agg.instrument_id)
       if (!instrument) {
-        // Should be impossible after commit pre-check, but belt-and-braces
         result.errors.push(
           `instrument ${agg.instrument_id} missing from instruments master — skipping holding`
         )
         continue
       }
+      // v27aa: avg_cost from cost_qxp_sum / cost_qty_sum. If no cost
+      // source resolved for any row contributing to this position,
+      // avg_cost is 0 (preserved fallback behavior — but should be
+      // rare now that TRANSFER_IN contributes via market_prices).
       const avgCost =
-        agg.buy_qty_sum > 0 ? agg.buy_qxp_sum / agg.buy_qty_sum : 0
+        agg.cost_qty_sum > 0 ? agg.cost_qxp_sum / agg.cost_qty_sum : 0
 
       upsertRows.push({
         portfolio_id,
         instrument_id: agg.instrument_id,
-        sleeve_id: instrument.sleeve_id,
-        quantity: agg.quantity,
-        avg_cost: avgCost,
-        as_of_date: asOfDate,
+        sleeve_id:     instrument.sleeve_id,
+        quantity:      agg.quantity,
+        avg_cost:      avgCost,
+        as_of_date:    asOfDate,
       })
     } else {
-      // Net qty ≤ 0 — position closed. Delete if exists.
       if (existingIds.has(agg.instrument_id)) {
         deleteIds.push(agg.instrument_id)
       }
     }
   }
 
-  // Also delete any existing holdings row for an instrument_id
-  // that has NO transactions in the portfolio at all (post-rollback
-  // cleanup).
   for (const existingId of existingIds) {
     if (!aggMap.has(existingId) && !deleteIds.includes(existingId)) {
       deleteIds.push(existingId)
     }
   }
 
-  // ── 7. Execute ───────────────────────────────────────────────
+  // ── 8. Execute ───────────────────────────────────────────────
   if (upsertRows.length > 0) {
     const { data: upResult, error: upErr } = await db
       .from('holdings')
