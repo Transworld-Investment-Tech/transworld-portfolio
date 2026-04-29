@@ -31,6 +31,8 @@
 
 import { createClient } from '@supabase/supabase-js'
 import Link from 'next/link'
+// v27x: print button (client island)
+import PrintButton from '@/components/admin/PrintButton'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -185,7 +187,9 @@ export default async function RetiredSharesPage({
             Retired shares
           </h1>
         </div>
-        <div style={{ display: 'flex', gap: 8 }}>
+        <div style={{ display: 'flex', gap: 8 }} className="no-print">
+          {/* v27x: print / save as PDF */}
+          <PrintButton />
           <Link href={`/portfolio/${portfolio.id}`} style={{ textDecoration: 'none' }}>
             <button className="btn-h">← Back to overview</button>
           </Link>
@@ -347,6 +351,43 @@ export default async function RetiredSharesPage({
           )}
         </>
       )}
+      {/* v27x: print stylesheet — collapses chrome, tightens spacing for paper */}
+      <style>{`
+        @media print {
+          @page { size: A4; margin: 14mm 12mm; }
+          body { background: white !important; }
+          .no-print { display: none !important; }
+          .hybrid-page {
+            background: white !important;
+            padding: 0 !important;
+            min-height: 0 !important;
+            color: #000 !important;
+          }
+          .panel {
+            box-shadow: none !important;
+            border: 1px solid #999 !important;
+            page-break-inside: avoid;
+            background: white !important;
+          }
+          .alert-h, .alert-h-warn {
+            background: #faf5ea !important;
+            border: 1px solid #b08b3e !important;
+            color: #000 !important;
+            page-break-inside: avoid;
+          }
+          .kpi-mini {
+            border: 1px solid #999 !important;
+            box-shadow: none !important;
+            page-break-inside: avoid;
+          }
+          .h-table { font-size: 10pt; }
+          .h-table thead { display: table-header-group; }
+          .h-table tr { page-break-inside: avoid; }
+          .pill { border: 1px solid currentColor; }
+          h1.hybrid-serif { font-size: 26pt !important; }
+          .panel-title { font-size: 13pt !important; }
+        }
+      `}</style>
     </main>
   )
 }
