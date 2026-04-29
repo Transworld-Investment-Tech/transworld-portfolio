@@ -135,6 +135,46 @@
     color: #111 !important;
     border-color: #ddd !important;
   }
+
+  /* v27y: print height resets — fix single-page clipping.
+     Three sources of min-height: 100vh would clip content to one A4 page:
+     html/body (Tailwind min-h-screen), .hybrid-page (line 150), and any
+     inline style. Reset all three so content flows across pages. */
+  html, body {
+    min-height: 0 !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+  .hybrid-page {
+    min-height: 0 !important;
+    height: auto !important;
+    padding: 0 !important;
+    overflow: visible !important;
+  }
+  @page { size: A4; margin: 14mm 12mm; }
+
+  /* v27y: avoid breaking inside cohesive blocks; repeat table headers
+     across page boundaries when content spans multiple sheets. */
+  .panel, .kpi-mini, .alert-h, .h-kpi { page-break-inside: avoid; }
+  .h-table thead { display: table-header-group; }
+  .h-table tr { page-break-inside: avoid; }
+  .h-table { font-size: 9pt; }
+
+  /* v27y: alert backgrounds need explicit print-friendly colors
+     because Chrome strips background-color from elements by default
+     unless "Background graphics" is checked. Borders survive. */
+  .alert-h, .alert-h-warn {
+    background: #faf5ea !important;
+    border: 1px solid #b08b3e !important;
+    color: #111 !important;
+  }
+
+  /* v27y: pill borders survive grayscale printing better than solid fills */
+  .pill { border: 1px solid currentColor; }
+
+  /* v27y: tighten serif headings for paper */
+  h1.hybrid-serif { font-size: 24pt !important; }
+  .panel-title { font-size: 13pt !important; }
 }
 .print-header { display: none; }
 

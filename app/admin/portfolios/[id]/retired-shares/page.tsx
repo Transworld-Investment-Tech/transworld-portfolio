@@ -176,7 +176,7 @@ export default async function RetiredSharesPage({
   const totalConsiderationDelisting = delisting.reduce((s, r) => s + r.amount, 0)
 
   return (
-    <main className="hybrid-page" style={{ padding: '32px 44px 64px', minHeight: '100vh' }}>
+    <main className="hybrid-page" style={{ padding: '32px 44px 64px' }}>
       {/* Page header — hybrid v3 vocabulary */}
       <div className="page-head">
         <div>
@@ -351,43 +351,7 @@ export default async function RetiredSharesPage({
           )}
         </>
       )}
-      {/* v27x: print stylesheet — collapses chrome, tightens spacing for paper */}
-      <style>{`
-        @media print {
-          @page { size: A4; margin: 14mm 12mm; }
-          body { background: white !important; }
-          .no-print { display: none !important; }
-          .hybrid-page {
-            background: white !important;
-            padding: 0 !important;
-            min-height: 0 !important;
-            color: #000 !important;
-          }
-          .panel {
-            box-shadow: none !important;
-            border: 1px solid #999 !important;
-            page-break-inside: avoid;
-            background: white !important;
-          }
-          .alert-h, .alert-h-warn {
-            background: #faf5ea !important;
-            border: 1px solid #b08b3e !important;
-            color: #000 !important;
-            page-break-inside: avoid;
-          }
-          .kpi-mini {
-            border: 1px solid #999 !important;
-            box-shadow: none !important;
-            page-break-inside: avoid;
-          }
-          .h-table { font-size: 10pt; }
-          .h-table thead { display: table-header-group; }
-          .h-table tr { page-break-inside: avoid; }
-          .pill { border: 1px solid currentColor; }
-          h1.hybrid-serif { font-size: 26pt !important; }
-          .panel-title { font-size: 13pt !important; }
-        }
-      `}</style>
+      {/* v27y: print styles consolidated into globals.css */}
     </main>
   )
 }
