@@ -7,7 +7,7 @@ import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
 import { computeDurationConvexity } from '@/lib/bond-yield'
 import YieldCurvePanel from '@/components/admin/YieldCurvePanel'
-import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle, FileSpreadsheet } from 'lucide-react'
+import { Save, Plus, Trash2, LineChart, Copy, Check, AlertTriangle, FileSpreadsheet, Edit3 } from 'lucide-react'
 
 // v20d: Hybrid rewrite.
 // v17:  prices display an "As of" date with a stale indicator.
@@ -77,6 +77,15 @@ export default function HoldingsPage() {
   const [saving, setSaving] = useState<Record<string, boolean>>({})
   const [adding, setAdding] = useState(false)
   const [newHolding, setNewHolding] = useState({ instrument_id: '', quantity: '', avg_cost: '', trade_date: '' })
+  const [editingPosition, setEditingPosition] = useState<{
+    instrument_id: string
+    instrument_name: string
+    quantity: string
+    avg_cost: string
+    trade_date: string
+  } | null>(null)
+  const [editBusy, setEditBusy] = useState(false)
+  const [deleteBusy, setDeleteBusy] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [msg, setMsg] = useState('')
   const [copied, setCopied] = useState(false)
@@ -144,9 +153,102 @@ export default function HoldingsPage() {
   }
 
   async function deleteHolding(instrumentId: string) {
-    if (!confirm('Remove this position?')) return
-    await supabase.from('holdings').delete().match({ portfolio_id: portfolioId, instrument_id: instrumentId })
-    load()
+    // v27ae: provenance-aware delete. Cascade-removes only manual-entry
+    // transaction rows and rebuilds holdings. Synth / reconciliation /
+    // broker rows are preserved.
+    let prov: any = null
+    try {
+      const provRes = await fetch(`/api/holdings/provenance?portfolioId=${portfolioId}&instrumentId=${instrumentId}`)
+      prov = await provRes.json()
+    } catch {
+      /* fall through with prov = null */
+    }
+
+    const c = prov?.counts ?? null
+    let confirmMsg = 'Remove this position?\n\nThis will delete'
+    if (c) {
+      confirmMsg += ` ${c.manual} manual-entry transaction(s).`
+      const nonManual = c.synth + c.reconciliation + c.broker + c.other
+      if (nonManual > 0) {
+        const parts: string[] = []
+        if (c.synth > 0)          parts.push(`${c.synth} synthetic-recovery`)
+        if (c.reconciliation > 0) parts.push(`${c.reconciliation} reconciliation`)
+        if (c.broker > 0)         parts.push(`${c.broker} broker-import`)
+        if (c.other > 0)          parts.push(`${c.other} other`)
+        confirmMsg += `\n\n⚠ ${nonManual} non-manual transaction(s) will be PRESERVED: ${parts.join(', ')}.`
+        confirmMsg += `\nThe position may still appear (re-derived from those rows) after rebuild.`
+      }
+    } else {
+      confirmMsg += ' all manually-added transaction rows for this position.'
+    }
+
+    if (!confirm(confirmMsg)) return
+
+    setDeleteBusy(instrumentId)
+    try {
+      const res = await fetch(`/api/holdings?portfolioId=${portfolioId}&instrumentId=${instrumentId}`, {
+        method: 'DELETE',
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        flashMsg('Delete failed: ' + (data.error ?? res.statusText))
+      } else {
+        const tail = data.preserved_count > 0
+          ? ` · ${data.preserved_count} non-manual row(s) preserved`
+          : ''
+        flashMsg(`Position removed — ${data.deleted_count} transaction(s) deleted${tail}`)
+      }
+    } finally {
+      setDeleteBusy(null)
+      load()
+    }
+  }
+
+  function openEditModal(h: any) {
+    setEditingPosition({
+      instrument_id: h.instrument_id,
+      instrument_name: h.instrument?.name ?? h.instrument_id,
+      quantity: String(h.quantity ?? ''),
+      avg_cost: String(h.avg_cost ?? ''),
+      trade_date: '',
+    })
+  }
+
+  async function saveEdit() {
+    if (!editingPosition) return
+    const { instrument_id, quantity, avg_cost, trade_date } = editingPosition
+    if (!quantity || Number(quantity) === 0) {
+      flashMsg('Quantity must be non-zero')
+      return
+    }
+    if (!trade_date) {
+      flashMsg('Trade date required')
+      return
+    }
+    setEditBusy(true)
+    try {
+      const res = await fetch('/api/holdings', {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          portfolioId,
+          instrumentId: instrument_id,
+          quantity: Number(quantity),
+          avgCost: Number(avg_cost),
+          tradeDate: trade_date,
+        }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        flashMsg('Edit failed: ' + (data.error ?? res.statusText))
+      } else {
+        flashMsg(`Position updated — ${data.deleted_count} replaced ✓`)
+        setEditingPosition(null)
+      }
+    } finally {
+      setEditBusy(false)
+      load()
+    }
   }
 
   function flashMsg(m: string) { setMsg(m); setTimeout(() => setMsg(''), 2500) }
@@ -652,7 +754,16 @@ export default function HoldingsPage() {
                             <button
                               className="btn-h"
                               style={{ fontSize: 11, padding: '4px 8px', color: 'var(--text-3)' }}
+                              onClick={() => openEditModal(h)}
+                              title="Edit quantity / cost / date"
+                            >
+                              <Edit3 size={10} />
+                            </button>
+                            <button
+                              className="btn-h"
+                              style={{ fontSize: 11, padding: '4px 8px', color: 'var(--text-3)' }}
                               onClick={() => deleteHolding(h.instrument_id)}
+                              disabled={deleteBusy === h.instrument_id}
                               title="Remove position"
                             >
                               <Trash2 size={10} />
@@ -676,6 +787,199 @@ export default function HoldingsPage() {
           lockedPortfolioName={`${portfolio?.client?.name ?? ''} ${portfolio?.name ?? ''}`.trim()}
         />
       )}
+      {editingPosition && (
+        <EditPositionModal
+          portfolioId={portfolioId}
+          state={editingPosition}
+          onChange={setEditingPosition}
+          onSave={saveEdit}
+          onCancel={() => setEditingPosition(null)}
+          busy={editBusy}
+        />
+      )}
     </main>
+  )
+}
+
+function EditPositionModal({
+  portfolioId,
+  state,
+  onChange,
+  onSave,
+  onCancel,
+  busy,
+}: {
+  portfolioId: string
+  state: {
+    instrument_id: string
+    instrument_name: string
+    quantity: string
+    avg_cost: string
+    trade_date: string
+  }
+  onChange: (next: any) => void
+  onSave: () => void
+  onCancel: () => void
+  busy: boolean
+}) {
+  const [provenance, setProvenance] = useState<{
+    manual: number
+    synth: number
+    reconciliation: number
+    broker: number
+    other: number
+    total: number
+  } | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      try {
+        const res = await fetch(
+          `/api/holdings/provenance?portfolioId=${portfolioId}&instrumentId=${state.instrument_id}`
+        )
+        const data = await res.json()
+        if (!cancelled && data?.counts) setProvenance(data.counts)
+      } catch {
+        /* ignore */
+      }
+    })()
+    return () => { cancelled = true }
+  }, [portfolioId, state.instrument_id])
+
+  const nonManual = provenance
+    ? provenance.synth + provenance.reconciliation + provenance.broker + provenance.other
+    : 0
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 50,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'rgba(10, 31, 58, 0.55)',
+      }}
+    >
+      <div
+        style={{
+          background: 'var(--card)',
+          border: '1px solid var(--border)',
+          borderRadius: 5,
+          padding: 24,
+          width: 460,
+          boxShadow: '0 10px 40px rgba(10, 31, 58, 0.3)',
+        }}
+      >
+        <div style={{ marginBottom: 16 }}>
+          <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, color: 'var(--text)' }}>
+            Edit position
+          </div>
+          <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+            {state.instrument_name} ({state.instrument_id})
+          </div>
+        </div>
+
+        {nonManual > 0 && provenance && (
+          <div
+            style={{
+              padding: '10px 12px',
+              background: 'rgba(166, 124, 42, 0.1)',
+              border: '1px solid rgba(166, 124, 42, 0.3)',
+              borderRadius: 4,
+              marginBottom: 14,
+              fontSize: 11,
+              color: 'var(--text-2)',
+              display: 'flex',
+              gap: 10,
+              alignItems: 'flex-start',
+            }}
+          >
+            <AlertTriangle size={14} style={{ color: 'var(--warn)', flexShrink: 0, marginTop: 1 }} />
+            <div>
+              <strong style={{ color: 'var(--warn)' }}>Mixed provenance.</strong>{' '}
+              {provenance.manual} manual-entry row(s) will be replaced.{' '}
+              {nonManual} non-manual row(s) will be PRESERVED:{' '}
+              {[
+                provenance.synth          > 0 && `${provenance.synth} synth`,
+                provenance.reconciliation > 0 && `${provenance.reconciliation} reconciliation`,
+                provenance.broker         > 0 && `${provenance.broker} broker`,
+                provenance.other          > 0 && `${provenance.other} other`,
+              ].filter(Boolean).join(', ')}.
+              {' '}The position's final qty / cost will blend your edit with the preserved rows.
+            </div>
+          </div>
+        )}
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 14 }}>
+          <div>
+            <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+              Quantity / Face (₦)
+            </label>
+            <input
+              type="number"
+              value={state.quantity}
+              onChange={e => onChange({ ...state, quantity: e.target.value })}
+              disabled={busy}
+              className="input-h input-h-mono"
+              style={{ width: '100%' }}
+            />
+          </div>
+          <div>
+            <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+              Avg cost
+            </label>
+            <input
+              type="number"
+              value={state.avg_cost}
+              onChange={e => onChange({ ...state, avg_cost: e.target.value })}
+              disabled={busy}
+              step="0.01"
+              className="input-h input-h-mono"
+              style={{ width: '100%' }}
+            />
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 18 }}>
+          <label
+            style={{
+              display: 'block',
+              fontSize: 10,
+              letterSpacing: '0.1em',
+              fontWeight: 600,
+              color: 'var(--text-3)',
+              textTransform: 'uppercase',
+              marginBottom: 6,
+            }}
+          >
+            Trade date
+          </label>
+          <input
+            type="date"
+            value={state.trade_date}
+            onChange={e => onChange({ ...state, trade_date: e.target.value })}
+            disabled={busy}
+            className="input-h"
+            style={{ width: 200 }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button
+            onClick={onSave}
+            disabled={busy || !state.quantity || !state.trade_date}
+            className="btn-h btn-h-primary"
+          >
+            {busy ? 'Saving…' : 'Save changes'}
+          </button>
+          <button onClick={onCancel} disabled={busy} className="btn-h">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
   )
 }
