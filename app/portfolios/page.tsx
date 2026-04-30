@@ -7,7 +7,7 @@ import { fmt } from '@/lib/portfolio'
 import Sidebar from '@/components/shared/Sidebar'
 import {
   Users, BarChart3, TrendingUp, Plus, RefreshCw,
-  ChevronRight, Trash2, AlertTriangle, X,
+  ChevronRight, Trash2, AlertTriangle, AlertOctagon, X,
 } from 'lucide-react'
 
 // v27: All Portfolios moved from / to /portfolios. The new home (/) is
@@ -40,21 +40,26 @@ export default function PortfoliosPage() {
   const [confirmDel, setConfirmDel] = useState<{ id: string; name: string } | null>(null)
   const [confirmArchiveClient, setConfirmArchiveClient] = useState<{ id: string; name: string } | null>(null)
   const [archivingClient, setArchivingClient] = useState<string | null>(null)
+  const [showArchived, setShowArchived] = useState(false)
+  const [confirmHardDel, setConfirmHardDel] = useState<{ id: string; code: string; name: string } | null>(null)
+  const [hardDeleting, setHardDeleting] = useState<string | null>(null)
   const [stats, setStats] = useState({ totalPortfolios: 0, totalNAV: 0, activeClients: 0 })
 
   const loadClients = useCallback(async () => {
     setLoading(true)
-    const { data } = await supabase
+    const baseQuery = supabase
       .from('clients')
       .select('*, portfolios(id, label, name, starting_nav, currency, status, valuation_date)')
-      .eq('status', 'active')
-      .order('name', { ascending: true })
+    const filteredQuery = showArchived ? baseQuery : baseQuery.eq('status', 'active')
+    const { data } = await filteredQuery.order('name', { ascending: true })
 
     if (!data) { setLoading(false); return }
 
     const clientsWithActivePortfolios = data.map((c: any) => ({
       ...c,
-      portfolios: (c.portfolios || []).filter((p: any) => p.status === 'active'),
+      portfolios: showArchived
+        ? (c.portfolios || [])
+        : (c.portfolios || []).filter((p: any) => p.status === 'active'),
     }))
 
     const allPortfolioIds = clientsWithActivePortfolios.flatMap((c: any) =>
@@ -87,9 +92,9 @@ export default function PortfoliosPage() {
       activeClients: clientsWithActivePortfolios.length,
     })
     setLoading(false)
-  }, [])
+  }, [showArchived])
 
-  useEffect(() => { loadClients() }, [])
+  useEffect(() => { loadClients() }, [loadClients])
 
   async function archiveClient(id: string) {
     setArchivingClient(id)
@@ -104,6 +109,26 @@ export default function PortfoliosPage() {
     await fetch(`/api/portfolios/${id}`, { method: 'DELETE' })
     setConfirmDel(null)
     setDeleting(null)
+    loadClients()
+  }
+
+  async function hardDeletePortfolio(id: string, code: string) {
+    setHardDeleting(id)
+    const res = await fetch(
+      `/api/portfolios/${id}?hard=true&confirm_code=${encodeURIComponent(code)}`,
+      { method: 'DELETE' }
+    )
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) {
+      alert(`Hard delete failed: ${body.error ?? res.statusText}`)
+    } else if (body.storage_partial) {
+      alert(
+        `Portfolio deleted, but ${body.storage_partial.failed_count} storage object(s) ` +
+          `failed to remove. Manual cleanup required for orphan storage paths.`
+      )
+    }
+    setConfirmHardDel(null)
+    setHardDeleting(null)
     loadClients()
   }
 
@@ -150,6 +175,16 @@ export default function PortfoliosPage() {
             busy={archivingClient === confirmArchiveClient.id}
           />
         )}
+        {confirmHardDel && (
+          <HardDeleteModal
+            portfolioId={confirmHardDel.id}
+            code={confirmHardDel.code}
+            name={confirmHardDel.name}
+            onConfirm={() => hardDeletePortfolio(confirmHardDel.id, confirmHardDel.code)}
+            onCancel={() => setConfirmHardDel(null)}
+            busy={hardDeleting === confirmHardDel.id}
+          />
+        )}
 
         <main style={{ padding: '32px 44px 64px', maxWidth: '100%' }}>
           <div className="page-head">
@@ -169,6 +204,13 @@ export default function PortfoliosPage() {
               </h1>
             </div>
             <div style={{ display: 'flex', gap: 8 }}>
+              <button
+                className="btn-h"
+                onClick={() => setShowArchived(!showArchived)}
+                title={showArchived ? 'Hiding archived now' : 'Show archived portfolios'}
+              >
+                {showArchived ? 'Hide archived' : 'Show archived'}
+              </button>
               <button className="btn-h" onClick={loadClients} disabled={loading}>
                 <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> Refresh
               </button>
@@ -502,6 +544,45 @@ export default function PortfoliosPage() {
                           <button
                             onClick={e => {
                               e.preventDefault()
+                              setConfirmHardDel({
+                                id: p.id,
+                                code: `${client.code}-${p.label}`,
+                                name: p.name,
+                              })
+                            }}
+                            style={{
+                              position: 'absolute',
+                              top: 10,
+                              right: 38,
+                              width: 22,
+                              height: 22,
+                              borderRadius: 3,
+                              background: 'transparent',
+                              border: 'none',
+                              display: 'flex',
+                              alignItems: 'center',
+                              justifyContent: 'center',
+                              cursor: 'pointer',
+                              color: 'var(--text-3)',
+                              opacity: 0,
+                              transition: 'opacity 0.15s, color 0.15s',
+                              zIndex: 10,
+                            }}
+                            className="delete-hover"
+                            onMouseEnter={e => {
+                              e.currentTarget.style.color = 'var(--neg)'
+                            }}
+                            onMouseLeave={e => {
+                              e.currentTarget.style.color = 'var(--text-3)'
+                            }}
+                            title="Delete permanently"
+                          >
+                            <AlertOctagon size={12} />
+                          </button>
+
+                          <button
+                            onClick={e => {
+                              e.preventDefault()
                               setConfirmDel({ id: p.id, name: p.name })
                             }}
                             style={{
@@ -770,6 +851,267 @@ function ConfirmModal({
           </button>
         </div>
       </div>
+    </div>
+  )
+}
+
+function HardDeleteModal({
+  portfolioId,
+  code,
+  name,
+  onConfirm,
+  onCancel,
+  busy,
+}: {
+  portfolioId: string
+  code: string
+  name: string
+  onConfirm: () => void
+  onCancel: () => void
+  busy: boolean
+}) {
+  const [counts, setCounts] = useState<Record<string, number> | null>(null)
+  const [storageCount, setStorageCount] = useState<number>(0)
+  const [typed, setTyped] = useState('')
+  const matches = typed.trim().toUpperCase() === code.toUpperCase()
+
+  useEffect(() => {
+    let cancelled = false
+    ;(async () => {
+      const tables = [
+        'transactions',
+        'holdings',
+        'nav_log',
+        'staged_transactions',
+        'broker_files',
+        'reports',
+      ] as const
+      const results = await Promise.all(
+        tables.map(t =>
+          supabase
+            .from(t)
+            .select('portfolio_id', { count: 'exact', head: true })
+            .eq('portfolio_id', portfolioId)
+        )
+      )
+      if (cancelled) return
+      const out: Record<string, number> = {}
+      tables.forEach((t, i) => {
+        out[t] = results[i].count ?? 0
+      })
+      setCounts(out)
+
+      try {
+        const { data: bf } = await supabase
+          .from('broker_files')
+          .select('storage_path')
+          .eq('portfolio_id', portfolioId)
+        if (cancelled) return
+        const paths = (bf ?? []).map((r: any) => r.storage_path).filter(Boolean)
+        setStorageCount(paths.length)
+      } catch {
+        if (!cancelled) setStorageCount(0)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [portfolioId])
+
+  return (
+    <div
+      style={{
+        position: 'fixed',
+        inset: 0,
+        zIndex: 50,
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        background: 'rgba(10, 31, 58, 0.6)',
+      }}
+    >
+      <div
+        style={{
+          background: 'var(--card)',
+          border: '2px solid var(--neg)',
+          borderRadius: 5,
+          padding: 24,
+          width: 460,
+          boxShadow: '0 10px 40px rgba(10, 31, 58, 0.35)',
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 14 }}>
+          <div
+            style={{
+              width: 36,
+              height: 36,
+              borderRadius: 5,
+              background: 'rgba(166, 59, 59, 0.12)',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              flexShrink: 0,
+            }}
+          >
+            <AlertOctagon size={18} style={{ color: 'var(--neg)' }} />
+          </div>
+          <div>
+            <div className="hybrid-serif" style={{ fontSize: 18, fontWeight: 500, color: 'var(--text)' }}>
+              Permanently delete portfolio?
+            </div>
+            <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 2 }}>
+              This cannot be undone. Daily backup is your only recovery.
+            </div>
+          </div>
+          <button
+            onClick={onCancel}
+            disabled={busy}
+            style={{
+              marginLeft: 'auto',
+              background: 'transparent',
+              border: 'none',
+              color: 'var(--text-3)',
+              cursor: busy ? 'not-allowed' : 'pointer',
+            }}
+          >
+            <X size={16} />
+          </button>
+        </div>
+
+        <div
+          style={{
+            padding: '10px 12px',
+            background: 'var(--bg-soft)',
+            borderRadius: 4,
+            marginBottom: 14,
+            fontSize: 13,
+            color: 'var(--text)',
+          }}
+        >
+          <div style={{ fontWeight: 600, fontFamily: 'var(--font-mono)' }}>{code}</div>
+          <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 2 }}>{name}</div>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div
+            style={{
+              fontSize: 10,
+              letterSpacing: '0.14em',
+              fontWeight: 600,
+              color: 'var(--text-3)',
+              textTransform: 'uppercase',
+              marginBottom: 8,
+            }}
+          >
+            This will permanently delete
+          </div>
+          {counts === null ? (
+            <div style={{ fontSize: 12, color: 'var(--text-3)', fontStyle: 'italic' }}>
+              Loading impact…
+            </div>
+          ) : (
+            <div
+              style={{
+                fontSize: 12,
+                color: 'var(--text-2)',
+                lineHeight: 1.6,
+                fontVariantNumeric: 'tabular-nums',
+              }}
+            >
+              <ImpactRow label="Transactions" n={counts.transactions} />
+              <ImpactRow label="Holdings" n={counts.holdings} />
+              <ImpactRow label="NAV history" n={counts.nav_log} />
+              <ImpactRow label="Staged transactions" n={counts.staged_transactions} />
+              <ImpactRow label="Broker files (DB)" n={counts.broker_files} />
+              <ImpactRow label="Reports" n={counts.reports} />
+              {storageCount > 0 && <ImpactRow label="Storage objects" n={storageCount} />}
+              <div
+                style={{
+                  fontSize: 10,
+                  color: 'var(--text-3)',
+                  marginTop: 6,
+                  fontStyle: 'italic',
+                }}
+              >
+                Plus any briefs / sleeve_targets (cascade automatic).
+              </div>
+            </div>
+          )}
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+            Type{' '}
+            <code
+              style={{
+                fontFamily: 'var(--font-mono)',
+                background: 'var(--bg-soft)',
+                padding: '1px 6px',
+                borderRadius: 3,
+                color: 'var(--neg)',
+              }}
+            >
+              {code}
+            </code>{' '}
+            to confirm:
+          </div>
+          <input
+            type="text"
+            value={typed}
+            onChange={e => setTyped(e.target.value)}
+            disabled={busy}
+            autoFocus
+            placeholder={code}
+            style={{
+              width: '100%',
+              padding: '8px 10px',
+              fontSize: 13,
+              fontFamily: 'var(--font-mono)',
+              background: 'var(--bg-soft)',
+              border: `1px solid ${matches ? 'var(--neg)' : 'var(--border)'}`,
+              borderRadius: 3,
+              color: 'var(--text)',
+              outline: 'none',
+            }}
+          />
+        </div>
+
+        <div style={{ display: 'flex', gap: 10 }}>
+          <button
+            onClick={onConfirm}
+            disabled={busy || !matches || counts === null}
+            className="btn-h"
+            style={{
+              background: matches && !busy ? 'var(--neg)' : 'rgba(166, 59, 59, 0.4)',
+              color: 'white',
+              borderColor: 'var(--neg)',
+              cursor: matches && !busy && counts !== null ? 'pointer' : 'not-allowed',
+            }}
+          >
+            {busy ? <RefreshCw size={12} className="animate-spin" /> : <AlertOctagon size={12} />}
+            Delete permanently
+          </button>
+          <button onClick={onCancel} disabled={busy} className="btn-h">
+            Cancel
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ImpactRow({ label, n }: { label: string; n: number }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', padding: '2px 0' }}>
+      <span>{label}</span>
+      <span
+        style={{
+          fontFamily: 'var(--font-mono)',
+          color: n > 0 ? 'var(--text)' : 'var(--text-3)',
+        }}
+      >
+        {n.toLocaleString()}
+      </span>
     </div>
   )
 }
