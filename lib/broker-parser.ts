@@ -1,5 +1,5 @@
 /**
- * lib/broker-parser.ts — v21a
+ * lib/broker-parser.ts — v27aj
  *
  * Parses Transworld Investment and Securities broker PDFs:
  *   - Contract Notes (trade-level detail with fee breakdown)
@@ -907,6 +907,15 @@ export function reconcile(
         case 'demat_fee':      proposed = 'FEE';          break
         case 'bank_charge':    proposed = 'FEE';          break
         case 'refund':         proposed = 'TRANSFER_OUT'; break
+        case 'unknown': {
+          // v27aj (#121): don't silently drop unclassified cash movements.
+          // Emit by direction so cash math is faithful; the kind='unknown'
+          // tag survives into the staging UI so the operator can review
+          // and reclassify in the variance panel before commit.
+          if (r.debit > 0)       proposed = 'TRANSFER_OUT'
+          else if (r.credit > 0) proposed = 'TRANSFER_IN'
+          break
+        }
         default: proposed = null
       }
       if (proposed === null) return
