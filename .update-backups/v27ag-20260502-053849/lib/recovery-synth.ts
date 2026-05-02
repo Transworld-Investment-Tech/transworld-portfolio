@@ -1,48 +1,64 @@
 /**
- * lib/recovery-synth.ts — v27ag
+ * lib/recovery-synth.ts — v27o-fix1
  *
- * v27ag change: defensive start_date anchor. The pre-v27ag function
- * accepted `portfolio.start_date` whenever it was non-null and only
- * fell through to the earliest transaction date when it was missing
- * entirely. This was unsafe in two cases:
+ * v27o-fix1 change: Replaces broken cumulative-position FIFO with real
+ * BUY-lot inventory matching.
  *
- *   (1) `portfolio.start_date` future-dated (e.g. equal to today, the
- *       broker-import day, instead of the real portfolio inception).
- *       This was the DON-C bug — synth rows landed at 2026-04-30
- *       instead of 2020-07-23, making the IRR engine see ₦16.47M of
- *       investor capital deployed yesterday returning ₦61.13M today
- *       (+143% ITD, nonsense). The pitfall #105 retraction in v27r
- *       inspected the file in isolation and missed this; the actual
- *       failure mode is the post-commit chain ordering corrupting
- *       portfolio.start_date BEFORE detectOrphans reads it.
+ * THE BUG IN v27o
+ * ───────────────
+ * The original v27o algorithm tracked cumBuy and cumSell as scalars and
+ * emitted a synthetic TRANSFER_IN whenever (cumSell − cumBuy) grew over
+ * the prior SELL's position. This over-counts when the orphan position
+ * temporarily shrinks (BUYs cover part of an existing orphan position)
+ * and then grows again (later SELLs exceed the new BUYs). The same
+ * physical "phantom" shares get re-counted as new orphans.
  *
- *   (2) `portfolio.start_date` strictly later than the earliest BUY/
- *       SELL trade — anomalous regardless of cause; the orphan SELL
- *       cannot be older than the portfolio.
+ * Concrete failure on DON-C FIRSTHOLDCO:
+ *   2021-03-11 SELL 1,681,315 against empty queue   → orphan 1,681,315 ✓
+ *   2022-11-11 BUY 93,700                            (queue has 93,700)
+ *   2023-05-04 BUY 200,000                           (queue has 293,700)
+ *   2023-07-06 SELL 293,700 against queue of 293,700 → real BUYs sold,
+ *                                                       NOT an orphan
+ *   v27o emitted an extra synthesis row of 293,700 @ ₦18.65 = ₦5.48M
+ *   that should not have existed.
  *
- * The new logic:
- *   - Fetch earliest BUY/SELL trade_date as a sanity floor.
- *   - Accept `portfolio.start_date` only if it's plausible:
- *     - not null, AND
- *     - <= today, AND
- *     - <= earliest BUY/SELL trade_date (when one exists)
- *   - Otherwise fall through to earliest BUY/SELL trade_date as the
- *     synthesis anchor.
- *   - The new startDateSource value 'plausibility_fallback' surfaces
- *     in returned metadata so operators can spot when the defensive
- *     branch triggered.
+ * THE FIX
+ * ───────
+ * Real FIFO inventory matching: maintain an explicit queue of BUY lots
+ * per instrument. Each SELL consumes lots oldest-first. If the queue
+ * runs dry mid-SELL, only the unmatched remainder is an orphan, dated
+ * at portfolio.start_date and priced at the SELL's price. This handles
+ * temporary BUY-coverage cleanly because the BUYs are removed from the
+ * queue when they're consumed and cannot be "re-revealed" later.
  *
- * v27o-fix1 preserved: real FIFO BUY-lot inventory matching for orphan
- * SELL detection.
+ * Same idempotency, same external_ref tagging, same return shape as v27o.
+ *
+ * THE BACKDROP (preserved from v27o)
+ * ──────────────────────────────────
+ * Recovery-account clients (DON-C, ADE-C, OPC-A, FMI-A, CDOO-A, CMFB-D,
+ * etc.) walk through Transworld's door already holding shares in their
+ * CSCS account from prior broker relationships. The broker-import flow
+ * records ONLY the subsequent BUY/SELL/FEE activity — not the in-kind
+ * share value. v27o introduces synthetic TRANSFER_IN rows to capture
+ * that initial value. v27o-fix1 corrects the detection algorithm.
  *
  * SCOPE
  * ─────
- * v27ag still handles SOLD orphans only. Held orphans continue through
- * apply-reconciliation/route.ts variance panel UI.
+ * v27o-fix1 still handles SOLD orphans only. Held orphans (current CSCS
+ * positions with no BUY history) continue to flow through
+ * apply-reconciliation/route.ts and the variance panel UI. Held-orphan
+ * auto-detection is on the v27p ship list.
  *
  * SIGN CONVENTION (preserved)
  * ───────────────────────────
- * Synthetic TRANSFER_IN rows use POSITIVE amount.
+ * Synthetic TRANSFER_IN rows use POSITIVE amount, consistent with
+ * pre-v27o existing TRANSFER_IN rows. fee-calc.ts uses Math.abs() so it
+ * tolerates either sign.
+ *
+ * START_DATE FALLBACK (preserved)
+ * ───────────────────────────────
+ * If portfolios.start_date is NULL, falls back to earliest transaction
+ * date as the synthesis anchor.
  */
 
 import { SupabaseClient } from '@supabase/supabase-js'
@@ -60,7 +76,7 @@ export interface DetectionResult {
   ok:              boolean
   portfolioId:     string
   startDate:       string | null
-  startDateSource: 'portfolio' | 'earliest_transaction' | 'plausibility_fallback' | 'none'
+  startDateSource: 'portfolio' | 'earliest_transaction' | 'none'
   soldOrphans:     OrphanSoldRow[]
   totalSoldAmount: number
   reason?:         string
@@ -85,63 +101,6 @@ export function externalRefFor(portfolioId: string): string {
 }
 
 /**
- * Resolve the synthesis anchor date.
- *
- * Priority:
- *   1. portfolio.start_date IF plausible (not null, <= today, <= earliest trade)
- *   2. earliest BUY/SELL trade_date (defensive fallback)
- *   3. null (cannot anchor — caller should treat as error)
- *
- * Returns the anchor date and a source tag so the caller can log which
- * branch fired.
- */
-async function resolveAnchorDate(
-  db: SupabaseClient,
-  portfolioId: string,
-  portfolioStartDate: string | null
-): Promise<{ startDate: string | null; source: DetectionResult['startDateSource'] }> {
-  // Earliest BUY/SELL trade — used both as a sanity floor for the stored
-  // start_date and as the fallback if the stored value is missing/wrong.
-  const { data: earliest } = await db
-    .from('transactions')
-    .select('trade_date')
-    .eq('portfolio_id', portfolioId)
-    .in('action', ['BUY', 'SELL'])
-    .order('trade_date', { ascending: true })
-    .limit(1)
-    .maybeSingle()
-  const earliestTradeDate: string | null = earliest?.trade_date ?? null
-
-  const today = new Date().toISOString().slice(0, 10)
-
-  // Plausibility check on the stored value
-  let plausible: string | null = portfolioStartDate ?? null
-  let usedFallback = false
-  if (plausible) {
-    if (plausible > today) {
-      plausible = null
-      usedFallback = true
-    } else if (earliestTradeDate && plausible > earliestTradeDate) {
-      plausible = null
-      usedFallback = true
-    }
-  }
-
-  if (plausible) {
-    return { startDate: plausible, source: 'portfolio' }
-  }
-
-  if (earliestTradeDate) {
-    return {
-      startDate: earliestTradeDate,
-      source: usedFallback ? 'plausibility_fallback' : 'earliest_transaction',
-    }
-  }
-
-  return { startDate: null, source: 'none' }
-}
-
-/**
  * Pure detection — runs FIFO inventory matching over BUY/SELL transactions
  * and identifies orphan SELL portions. No DB writes. Safe to call from
  * read-only / diagnostic contexts.
@@ -150,7 +109,7 @@ export async function detectOrphans(
   db: SupabaseClient,
   portfolioId: string
 ): Promise<DetectionResult> {
-  // Resolve portfolio start_date with v27ag plausibility-aware fallback.
+  // Resolve portfolio start_date with fallback to earliest transaction.
   const { data: portfolio, error: pfErr } = await db
     .from('portfolios')
     .select('start_date')
@@ -165,17 +124,29 @@ export async function detectOrphans(
     }
   }
 
-  const { startDate, source: startDateSource } = await resolveAnchorDate(
-    db,
-    portfolioId,
-    portfolio.start_date ?? null
-  )
+  let startDate: string | null = portfolio.start_date ?? null
+  let startDateSource: DetectionResult['startDateSource'] =
+    startDate ? 'portfolio' : 'none'
+
+  if (!startDate) {
+    const { data: earliest } = await db
+      .from('transactions')
+      .select('trade_date')
+      .eq('portfolio_id', portfolioId)
+      .order('trade_date', { ascending: true })
+      .limit(1)
+      .maybeSingle()
+    if (earliest?.trade_date) {
+      startDate = earliest.trade_date
+      startDateSource = 'earliest_transaction'
+    }
+  }
 
   if (!startDate) {
     return {
       ok: false, portfolioId, startDate: null, startDateSource: 'none',
       soldOrphans: [], totalSoldAmount: 0,
-      reason: 'portfolios.start_date is NULL/implausible and no BUY/SELL transactions exist — cannot anchor synthetic rows',
+      reason: 'portfolios.start_date is NULL and no transactions exist — cannot anchor synthetic rows',
     }
   }
 
@@ -227,7 +198,11 @@ export async function detectOrphans(
   // For each instrument, maintain a queue of BUY lots (each lot tracks
   // its remaining unmatched quantity). SELL events consume lots oldest-
   // first. Any portion of a SELL that the queue can't satisfy is an
-  // orphan (priced at the SELL's price, dated at startDate).
+  // orphan (priced at the SELL's price, dated at start_date).
+  //
+  // This correctly handles the BUY→SELL→BUY→SELL pattern that confused
+  // the v27o cumulative-position tracker — once a BUY lot is consumed,
+  // it's gone from the queue and can't be re-counted.
   for (const [instrumentId, list] of byInstrument) {
     type BuyLot = { remaining: number }
     const buyQueue: BuyLot[] = []

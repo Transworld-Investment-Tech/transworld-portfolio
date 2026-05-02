@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { computeNAV, computeSleeveData, complianceAlerts, fmt } from '@/lib/portfolio'
-import { computeNAVWithCash } from '@/lib/cash'  // v27ag
 import { computePeriodMetrics, calcPeriodReturn, BENCHMARKS } from '@/lib/analytics'  // v27s: route IRR through consolidated codepath
 import { generateHTMLReport } from '@/lib/html-report'
 
@@ -44,7 +43,7 @@ export async function GET(req: NextRequest) {
   }))
 
   const sleeveDefs = sleeveRes.data ?? []
-  const currentNAV = computeNAVWithCash(holdings, txns)  // v27ag
+  const currentNAV = computeNAV(holdings)
   const sleeveData = computeSleeveData(holdings, sleeveDefs, currentNAV)
 
   // v20g: arg order is (portfolio, holdings, sleeveData, totalNAV).

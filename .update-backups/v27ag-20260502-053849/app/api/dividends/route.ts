@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { computeNAV } from '@/lib/portfolio'
-import { computeNAVWithCash } from '@/lib/cash'  // v27ag
 
 export interface DividendEstimate {
   instrumentId:   string
@@ -49,11 +48,10 @@ export async function GET(req: NextRequest) {
 
   const db = supabaseAdmin()
 
-  const [portRes, holdRes, pricesRes, txnRes] = await Promise.all([
+  const [portRes, holdRes, pricesRes] = await Promise.all([
     db.from('portfolios').select('*').eq('id', portfolioId).single(),
     db.from('holdings').select('*, instrument:instruments(*)').eq('portfolio_id', portfolioId),
     db.from('market_prices').select('instrument_id, price').order('price_date', { ascending: false }),
-    db.from('transactions').select('*').eq('portfolio_id', portfolioId).order('trade_date', { ascending: true }),  // v27ag — cash walk
   ])
 
   if (!portRes.data) return NextResponse.json({ error: 'Not found' }, { status: 404 })
@@ -66,8 +64,7 @@ export async function GET(req: NextRequest) {
     ...h, latest_price: priceMap[h.instrument_id] ?? h.avg_cost,
   }))
 
-  const transactions = txnRes.data ?? []  // v27ag
-  const portfolioNAV = computeNAVWithCash(holdings, transactions)  // v27ag
+  const portfolioNAV = computeNAV(holdings)
   const equities = holdings.filter((h: any) => h.instrument?.type === 'Stock')
 
   const positions: DividendEstimate[] = equities.map((h: any) => {

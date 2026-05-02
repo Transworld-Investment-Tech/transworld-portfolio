@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
 import { computeNAV } from '@/lib/portfolio'
-import { computeNAVWithCash } from '@/lib/cash'  // v27ag
 import {
   computePeriodMetrics, PERIODS, type PeriodKey,
   buildCashFlows, calculateIRR, BENCHMARKS,
@@ -52,7 +51,7 @@ export async function GET(req: NextRequest) {
     latest_price: priceMap[h.instrument_id] ?? h.avg_cost,
   }))
 
-  const currentNAV = computeNAVWithCash(holdings, transactions)  // v27ag
+  const currentNAV = computeNAV(holdings)
 
   const metrics = computePeriodMetrics(periodKey, portfolio, currentNAV, navHistory, transactions)
 

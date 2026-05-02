@@ -1,6 +1,6 @@
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
-import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
+import { Portfolio, Holding, SleeveTarget, Transaction, computeNAV, computeSleeveData, fmt } from './portfolio'
 import { computeNAVWithCash } from './cash'  // v27ag
 import { computePeriodMetrics } from './analytics'  // v27l: report consolidated
 import type { FIInstrument } from './fi-context'
@@ -39,6 +39,7 @@ export interface WatchlistItem {
 export interface ReportInput {
   portfolio:     Portfolio
   holdings:      Holding[]
+  transactions?: Transaction[]   // v27ag — when present, NAV is cash-aware via computeNAVWithCash
   sleeveDefs:    SleeveTarget[]
   reportType:    ReportType
   dateFrom?:     string

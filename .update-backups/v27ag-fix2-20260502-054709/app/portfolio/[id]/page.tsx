@@ -12,7 +12,6 @@ import {
   computeNAV, computeSleeveData, estimatedIncomePA,
   fmt, type Portfolio, type Holding, type SleeveTarget,
 } from '@/lib/portfolio'
-import { computeNAVWithCash } from '@/lib/cash'  // v27ag
 import { fmtSignedNGN } from '@/lib/fee-calc'  // v27l: fee panel
 import { computeMandateHealth, healthToLegacyAlerts } from '@/lib/mandate-health'
 
@@ -116,7 +115,6 @@ export default function PortfolioOverviewPage() {
 
   // v27w: retired shares count — surfaces callout if > 0
   const [retiredCount, setRetiredCount] = useState<number>(0)
-  const [allTxns, setAllTxns]             = useState<any[]>([])  // v27ag — full transactions for cash-aware NAV
 
   // v27b: mandate-health engine inputs
   const [navHistory, setNavHistory] = useState<{ nav_date: string; nav_value: number }[]>([])
@@ -241,18 +239,6 @@ export default function PortfolioOverviewPage() {
       .then(({ count }) => { setRetiredCount(count ?? 0) })
   }, [portfolioId])
 
-  // v27ag: fetch full transactions for cash-aware NAV computation
-  useEffect(() => {
-    if (!portfolioId) return
-    supabase
-      .from('transactions')
-      .select('*')
-      .eq('portfolio_id', portfolioId)
-      .order('trade_date', { ascending: true })
-      .limit(50000)
-      .then(({ data }) => { setAllTxns(data ?? []) })
-  }, [portfolioId])
-
   useEffect(() => {
     if (!portfolioId || loading) return
     setAnalyticsLoading(true)
@@ -298,7 +284,7 @@ export default function PortfolioOverviewPage() {
     )
   }
 
-  const tot            = computeNAVWithCash(holdings, allTxns)  // v27ag
+  const tot            = computeNAV(holdings)
   const sv             = computeSleeveData(holdings, sleeveDefs, tot)
   const hasStartingNav = portfolio.starting_nav > 0
   const pl             = tot - portfolio.starting_nav

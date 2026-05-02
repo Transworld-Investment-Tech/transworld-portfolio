@@ -1,7 +1,6 @@
 import { REPORT_TONE_INSTRUCTION } from './report-tone'
 import Anthropic from '@anthropic-ai/sdk'
 import { Portfolio, Holding, SleeveTarget, computeNAV, computeSleeveData, fmt } from './portfolio'
-import { computeNAVWithCash } from './cash'  // v27ag
 import { computePeriodMetrics } from './analytics'  // v27l: report consolidated
 import type { FIInstrument } from './fi-context'
 import { buildFIContextBlock } from './fi-context'
@@ -194,7 +193,7 @@ export async function generateAIReport(input: ReportInput): Promise<string> {
     dateFrom, dateTo, fxRate, transactions, navHistory, watchlist, fiUniverse,
   } = input
 
-  const tot    = input.transactions ? computeNAVWithCash(holdings, input.transactions) : computeNAV(holdings)  // v27ag
+  const tot    = computeNAV(holdings)
   const sv     = computeSleeveData(holdings, sleeveDefs, tot)
   const period = periodLabel(reportType, dateFrom, dateTo)
   const today  = new Date().toLocaleDateString('en-GB', { weekday: 'long', day: 'numeric', month: 'long', year: 'numeric' })
