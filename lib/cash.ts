@@ -1,88 +1,78 @@
 /**
- * lib/cash.ts — v27ag
+ * lib/cash.ts — v27ah
  *
- * Single source of truth for cash bookkeeping. Cash is derived from the
- * transaction series. Three exports:
+ * v27ah change: BUY/SELL cash math corrected. The v27ag implementation
+ * trusted `gross_value` as a post-fee net amount, but in this schema
+ * the importer populates `gross_value` as the PRE-fee principal
+ * (= quantity × price). The trade fees live in a separate `fees` column
+ * (or in the breakdown columns: fee_commission, fee_vat, fee_exchange,
+ * fee_clearing, fee_sec, fee_contract_stamp, fee_sms).
  *
- *   applyCashEvent(currentCash, t)  - reducer over a single transaction
- *   computeCashBalance(transactions) - walk the full transaction series
- *   computeNAVWithCash(holdings, transactions) - share NAV + cash, with
- *     CASH_NGN holdings filtered out to avoid double-counting against
- *     the accumulator below
+ * Concrete failure on DON-C:
+ *   App cash post-v27ag:          ₦11,805,017.13
+ *   Canonical broker statement:   ₦ 7,439,622.43
+ *   Overstatement:                ₦ 4,365,394.70
  *
- * THE IN-KIND RULE
- * ────────────────
- * Recovery-account portfolios (ADE-D, DON-C, OPC-A, etc.) and the variance-
- * panel reconciliation flow both produce TRANSFER_IN/TRANSFER_OUT rows
- * tagged with an instrument_id and a quantity, representing in-kind share
- * movements (not cash). A naive cash accumulator that treats every
- * TRANSFER_IN as a cash inflow overstates cash by the value of those in-
- * kind shares.
+ * Decomposition of the gap:
+ *   - SELL fees not deducted:     ₦1,970,330.54
+ *   - BUY  fees not added:        ₦1,433,196.50
+ *   - NIBSS pass-through debit:   ₦  961,867.66  (data fix, separate)
  *
- * For ADE-D this is a ~₦111M overstatement (24 reconciliation TRANSFER_IN
- * rows totalling 110.9M); for DON-C the synth path stamps these too but
- * the smaller portfolio amplifies less. The rule below is exhaustive
- * across every TRANSFER row pattern observed in production:
+ * The fee-deduction shortfall on SELL and fee-addition shortfall on
+ * BUY exactly accounts for ₦3.40M of the ₦4.37M gap. The remaining
+ * ₦962K is a parser-level issue (NIBSS deposit credit imported but
+ * matching debit leg dropped) which v27ah does NOT touch — that's
+ * deferred to v27ai. For DON-C, the missing NIBSS debit is patched in
+ * via a one-off SQL INSERT (see the v27ah accompanying SQL block).
  *
+ * Symmetric corrected rule:
+ *   BUY  → cash -= principal + fees   (pay for shares, plus pay broker)
+ *   SELL → cash += principal − fees   (receive proceeds, less broker fees)
+ *   where principal = qty × price (or gross_value if non-zero — they
+ *   are equal in this schema, gross_value being qty × price by
+ *   importer convention)
+ *
+ * THE IN-KIND RULE (preserved from v27ag)
+ * ────────────────────────────────────────
  *   instrument_id IS NULL              → real cash event
  *   instrument_id = 'CASH_NGN'         → real cash event (legacy import)
  *   instrument_id is anything else     → in-kind shares, no cash impact
  *
- * The CASH_NGN carve-out matters because the legacy DON-C import (and
- * earlier import scripts) used CASH_NGN as a sentinel instrument_id on
- * deposit/withdrawal/fee rows. We must continue to treat those as cash.
+ * (CASH_NGN BUY/SELL paths preserved for the legacy DON-C-style
+ *  importer pattern — when CASH_NGN is the instrument the row is a cash
+ *  deposit/withdrawal recorded as a trade, and the principal IS the
+ *  cash amount with no separate broker fees.)
  *
- * ACTION-BY-ACTION
- * ────────────────
+ * ACTION-BY-ACTION (post-v27ah)
+ * ─────────────────────────────
  *
  *   BUY (non-CASH_NGN):
- *     cash -= gross_value (or qty × price + fees if gross_value missing)
+ *     cash -= principal + fees    [v27ah: + fees added]
  *
- *   BUY of CASH_NGN (rare; cash deposit recorded as a BUY):
- *     cash += gross_value || amount || qty × price
+ *   BUY of CASH_NGN (cash deposit recorded as BUY):
+ *     cash += principal           [no fees on cash deposits]
  *
  *   SELL (non-CASH_NGN):
- *     cash += gross_value (or qty × price - fees if gross_value missing)
- *     gross_value on SELLs is the broker-side post-fee credit per
- *     statements, so we trust it as-is.
+ *     cash += principal − fees    [v27ah: − fees added]
  *
- *   SELL of CASH_NGN (rare):
- *     cash -= gross_value || amount || qty × price
+ *   SELL of CASH_NGN (cash withdrawal recorded as SELL):
+ *     cash -= principal           [no fees on cash withdrawals]
  *
- *   FEE: cash -= amount  (instrument_id may be NULL or CASH_NGN)
+ *   FEE: cash -= amount           [unchanged — standalone fee debit]
  *
- *   TRANSFER_IN with cash-eligible instrument_id (NULL or CASH_NGN):
- *     cash += amount
+ *   TRANSFER_IN with cash-eligible instrument_id:
+ *     cash += amount              [unchanged]
  *
  *   TRANSFER_IN with share instrument_id:
- *     cash impact = 0 (in-kind shares — share-side accounting only)
+ *     cash impact = 0             [unchanged — in-kind rule]
  *
- *   TRANSFER_OUT mirrors TRANSFER_IN (with sign flipped).
+ *   TRANSFER_OUT mirrors TRANSFER_IN.
  *
- *   INCOME: cash += amount  (dividends, INCOME-tagged events)
- *
- * CASH_NGN HOLDING ROWS
- * ─────────────────────
- * Some portfolios (DON-C and others using the legacy import path) carry
- * a CASH_NGN row in the holdings cache representing cash as a "holding"
- * with quantity = cash_balance and avg_cost = 1.0. This pre-dates the
- * v27ag cash accumulator. To prevent double-counting (cash recorded as
- * both a CASH_NGN holding AND through the transaction walk),
- * computeNAVWithCash filters CASH_NGN out of the holdings array before
- * delegating to computeNAV. Same exclusion lives in nav-reconstruct.ts
- * via this same module.
- *
- * Existing computeNAV in lib/portfolio.ts is intentionally NOT changed.
- * Its callers that should display TRUE NAV switch to computeNAVWithCash;
- * callers that should display share-only NAV continue to use computeNAV.
+ *   INCOME: cash += amount        [unchanged]
  */
 
 import { Holding, computeNAV } from './portfolio'
 
-// Transactions can come from various sources (live Supabase rows, broker
-// imports, in-memory test fixtures), so we accept a structural shape
-// rather than the full Transaction interface — this lets us walk
-// transactions before they've been narrowed by the loader.
 export interface CashTxnLike {
   action?:        string | null
   instrument_id?: string | null
@@ -99,9 +89,6 @@ const num = (v: unknown): number => {
   return isFinite(n) ? n : 0
 }
 
-// Returns true when an instrument_id should be treated as cash-eligible
-// (i.e. cash event flows through). NULL or CASH_NGN qualify; share
-// tickers do not.
 function isCashEligibleId(id: string | null | undefined): boolean {
   if (id === null || id === undefined || id === '') return true
   if (id === 'CASH_NGN') return true
@@ -124,33 +111,32 @@ export function applyCashEvent(currentCash: number, t: CashTxnLike): number {
   switch (action) {
     case 'BUY': {
       if (id === 'CASH_NGN') {
-        // Cash deposit recorded as BUY — cash up
+        // Cash deposit recorded as BUY — no broker fees, principal is the cash credit
         const credit = grossValue > 0 ? grossValue : (amount > 0 ? amount : qty * price)
         return currentCash + credit
       }
-      // Standard share purchase — cash down
-      // Trust gross_value if present (post-fee debit per broker statements),
-      // else fall back to qty*price + fees.
-      const debit = grossValue > 0 ? grossValue : (qty * price + fees)
-      return currentCash - debit
+      // v27ah: principal + fees. principal = qty × price (= gross_value
+      // by importer convention). Trust gross_value when present, fall
+      // back to qty × price; ALWAYS add fees on top.
+      const principal = grossValue > 0 ? grossValue : qty * price
+      return currentCash - principal - fees
     }
     case 'SELL': {
       if (id === 'CASH_NGN') {
+        // Cash withdrawal recorded as SELL — no broker fees, principal is cash debit
         const debit = grossValue > 0 ? grossValue : (amount > 0 ? amount : qty * price)
         return currentCash - debit
       }
-      // Standard share sale — cash up. gross_value is broker-side post-fee
-      // credit; if absent fall back to qty*price - fees.
-      const credit = grossValue > 0 ? grossValue : Math.max(0, qty * price - fees)
-      return currentCash + credit
+      // v27ah: principal − fees. Symmetric correction.
+      const principal = grossValue > 0 ? grossValue : qty * price
+      return currentCash + principal - fees
     }
     case 'FEE': {
-      // FEE rows are unconditionally cash debits regardless of how
-      // instrument_id was populated by the importer.
+      // Standalone management fee / demat fee / etc. cash debit
       return currentCash - amount
     }
     case 'TRANSFER_IN': {
-      // The in-kind rule: only fires when instrument_id is cash-eligible
+      // In-kind rule: only cash-eligible instrument_ids fire
       if (isCashEligibleId(id)) return currentCash + amount
       return currentCash
     }
@@ -159,8 +145,7 @@ export function applyCashEvent(currentCash: number, t: CashTxnLike): number {
       return currentCash
     }
     case 'INCOME': {
-      // Dividends paid into the brokerage account. Treat as cash inflow
-      // regardless of instrument_id (often set to the paying security).
+      // Dividends paid into the brokerage account
       return currentCash + amount
     }
     default:
@@ -170,9 +155,7 @@ export function applyCashEvent(currentCash: number, t: CashTxnLike): number {
 
 /**
  * Walk a full transaction series and compute the resulting cash balance.
- * Transactions are assumed to be in chronological order (or order-
- * independent — the operations are all linear additions/subtractions so
- * the result is order-invariant).
+ * Order-invariant — operations are linear additions/subtractions.
  */
 export function computeCashBalance(transactions: CashTxnLike[] | null | undefined): number {
   if (!transactions || transactions.length === 0) return 0
@@ -184,9 +167,8 @@ export function computeCashBalance(transactions: CashTxnLike[] | null | undefine
 }
 
 /**
- * Cash-aware NAV: share value (excluding the legacy CASH_NGN holding,
- * which would otherwise double-count against the cash accumulator) plus
- * cash balance derived from the transaction series.
+ * Cash-aware NAV: share value (excluding the legacy CASH_NGN holding)
+ * plus cash balance derived from the transaction series.
  *
  * Drop-in replacement for computeNAV(holdings) at any callsite that
  * should display the TRUE portfolio NAV including cash.
