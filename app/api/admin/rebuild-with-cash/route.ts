@@ -1,12 +1,28 @@
 /**
- * app/api/admin/rebuild-with-cash/route.ts — v27ag
+ * app/api/admin/rebuild-with-cash/route.ts — v27ai-fix1
  *
- * Admin endpoint: wipe nav_log for a portfolio and re-run NAV
- * reconstruction with the v27ag cash-aware code path.
+ * v27ai-fix1: portfolio_label cosmetic fix. The previous v27ag code
+ * read `portfolio.client?.[0]?.code` to build a "<CLIENT>-<LABEL>"
+ * string (e.g. "ADE-D"), but Supabase's embedded relation
+ * `client:clients(code)` is a many-to-one FK and returns a single
+ * OBJECT at runtime — not an array. So `[0]?.code` resolved to
+ * undefined and the response fell through to bare `portfolio.label`
+ * (e.g. "D" instead of "ADE-D"). The defensive fix handles both
+ * shapes so behaviour is correct regardless of how Supabase's
+ * TypeScript inference (which types embeddings as arrays) and the
+ * runtime shape diverge.
  *
- * Use after deploying v27ag to refresh historical NAV for any portfolio
- * with cash activity. Replaces the manual `DELETE FROM nav_log WHERE
- * portfolio_id = ...` + click-Reconstruct sequence.
+ * No behavior change to the actual NAV rebuild — only the response
+ * payload's portfolio_label string is corrected.
+ *
+ * ───────────────────────────────────────────────────────────────────
+ * v27ag (preserved): Admin endpoint — wipe nav_log for a portfolio
+ * and re-run NAV reconstruction with the cash-aware code path.
+ *
+ * Use after deploying v27ag/v27ah/v27ai to refresh historical NAV
+ * for any portfolio with cash activity, or after any manual SQL
+ * write that changes cash impact (manual NIBSS recovery, true-ups,
+ * FEE column repairs, BUY/SELL price corrections).
  *
  * POST body: { portfolio_id: string }
  * Returns:   {
@@ -87,8 +103,19 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const portfolioLabel = portfolio.client?.[0]?.code && portfolio.label
-    ? `${portfolio.client[0].code}-${portfolio.label}`
+  // v27ai-fix1: Supabase's TypeScript inference types embedded relations
+  // as arrays, but at runtime a many-to-one FK relation returns a single
+  // object. Handle both shapes defensively so portfolio_label surfaces
+  // as "<CLIENT>-<LABEL>" (e.g. "ADE-D") in either case.
+  const clientRel = portfolio.client as unknown as
+    | { code?: string | null }
+    | { code?: string | null }[]
+    | null
+  const clientCode: string | undefined =
+    Array.isArray(clientRel) ? (clientRel[0]?.code ?? undefined) : (clientRel?.code ?? undefined)
+
+  const portfolioLabel = clientCode && portfolio.label
+    ? `${clientCode}-${portfolio.label}`
     : portfolio.label ?? null
 
   // ── 1. Wipe nav_log for this portfolio ────────────────────────────
