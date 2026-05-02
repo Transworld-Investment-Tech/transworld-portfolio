@@ -12,7 +12,7 @@ import {
   computeNAV, computeSleeveData, estimatedIncomePA,
   fmt, type Portfolio, type Holding, type SleeveTarget,
 } from '@/lib/portfolio'
-import { computeNAVWithCash } from '@/lib/cash'  // v27ag
+import { computeNAVComponents } from '@/lib/cash'  // v27ak
 import { fmtSignedNGN } from '@/lib/fee-calc'  // v27l: fee panel
 import { computeMandateHealth, healthToLegacyAlerts } from '@/lib/mandate-health'
 
@@ -298,7 +298,7 @@ export default function PortfolioOverviewPage() {
     )
   }
 
-  const tot            = computeNAVWithCash(holdings, allTxns)  // v27ag
+  const { shareValue, cash, total: tot } = computeNAVComponents(holdings, allTxns)  // v27ak
   const sv             = computeSleeveData(holdings, sleeveDefs, tot)
   const hasStartingNav = portfolio.starting_nav > 0
   const pl             = tot - portfolio.starting_nav
@@ -623,6 +623,38 @@ export default function PortfolioOverviewPage() {
             {incPA && portfolio.income_target && tot > 0 ? (
               incPA / tot >= portfolio.income_target ? ' · on target' : ' · shortfall'
             ) : ''}
+          </div>
+        </div>
+      </div>
+
+      {/* ── KPI row 2: Securities + Cash split (v27ak) ─────────────────── */}
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(2, 1fr)', gap: 14, marginBottom: 28 }}>
+
+        {/* KPI 5: Securities NAV */}
+        <div className="h-kpi">
+          <div className="h-kpi-label">Securities</div>
+          <div className={`h-kpi-value ${shareValue > 0 ? 'pos' : ''}`}>{fmt.ngnM(shareValue)}</div>
+          <div className="h-kpi-sub">
+            {tot > 0 ? (
+              <>
+                {((shareValue / tot) * 100).toFixed(1)}% of NAV
+                {(() => {
+                  const positionCount = (holdings ?? []).filter(h => h.instrument_id !== 'CASH_NGN' && Number(h.quantity) > 0).length
+                  return positionCount > 0 ? ` · ${positionCount} position${positionCount === 1 ? '' : 's'}` : ''
+                })()}
+              </>
+            ) : (
+              'No share value'
+            )}
+          </div>
+        </div>
+
+        {/* KPI 6: Cash NAV */}
+        <div className="h-kpi">
+          <div className="h-kpi-label">Cash</div>
+          <div className={`h-kpi-value ${cash > 0 ? 'pos' : (cash < 0 ? 'neg' : '')}`}>{fmt.ngnM(cash)}</div>
+          <div className="h-kpi-sub">
+            {tot > 0 ? `${((cash / tot) * 100).toFixed(1)}% of NAV` : 'No cash balance'}
           </div>
         </div>
       </div>

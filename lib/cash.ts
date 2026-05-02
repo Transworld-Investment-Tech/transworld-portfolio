@@ -1,97 +1,14 @@
 /**
- * lib/cash.ts — v27ai
+ * Cash-aware NAV reducer (v27ag → v27ah → v27ai → v27ak).
  *
- * v27ai change: FEE branch column-fallback chain (pitfall #119).
+ * Single source of truth for cash math across the application.
  *
- * The v27ah FEE branch read `amount` only:
- *   case 'FEE': return currentCash - amount
- *
- * This was correct for the common case but silently zeroed cash impact
- * when a CRUD edit reshuffled values from `amount` into one of the
- * breakdown columns (`fees`, `fee_management`, `fee_other`). Concrete
- * v27ah-session instance: ADE-D 22-Jan-2024 FEE row id=d8c4d308...
- * had amount=NULL after a CRUD reclassification, leaving ₦9.87M of
- * fee debit invisible to the cash-aware NAV reducer.
- *
- * v27ai fix: the FEE branch now falls through a precedence chain,
- * taking the FIRST non-zero candidate as the fee debit:
- *
- *   amount → fees → fee_management → fee_other → gross_value → 0
- *
- * Behaviour is IDENTICAL to v27ah whenever `amount` is populated
- * (the common case). Fallback only fires when `amount` has been
- * zeroed by an edit. NEVER sums — first match wins, no double-
- * counting risk by construction.
- *
- * Sub-rule (#119 sub-rule): when a single column's null-vs-populated
- * state determines whether cash math fires, that column must be
- * either (a) NOT NULL by schema, (b) protected by UI guardrails, or
- * (c) made fallback-tolerant in code. v27ai chooses option (c).
- *
- * ───────────────────────────────────────────────────────────────────
- * v27ah change (preserved): BUY/SELL cash math corrected. The v27ag
- * implementation trusted `gross_value` as a post-fee net amount, but
- * in this schema the importer populates `gross_value` as the PRE-fee
- * principal (= quantity × price). The trade fees live in a separate
- * `fees` column (or in the breakdown columns: fee_commission,
- * fee_vat, fee_exchange, fee_clearing, fee_sec, fee_contract_stamp,
- * fee_sms).
- *
- * Concrete failure on DON-C:
- *   App cash post-v27ag:          ₦11,805,017.13
- *   Canonical broker statement:   ₦ 7,439,622.43
- *   Overstatement:                ₦ 4,365,394.70
- *
- * Decomposition of the gap:
- *   - SELL fees not deducted:     ₦1,970,330.54
- *   - BUY  fees not added:        ₦1,433,196.50
- *   - NIBSS pass-through debit:   ₦  961,867.66  (parser fix in v27aj)
- *
- * Symmetric corrected rule:
- *   BUY  → cash -= principal + fees   (pay for shares, plus pay broker)
- *   SELL → cash += principal − fees   (receive proceeds, less broker fees)
- *   where principal = qty × price (or gross_value if non-zero — they
- *   are equal in this schema, gross_value being qty × price by
- *   importer convention)
- *
- * THE IN-KIND RULE (preserved from v27ag)
- * ────────────────────────────────────────
- *   instrument_id IS NULL              → real cash event
- *   instrument_id = 'CASH_NGN'         → real cash event (legacy import)
- *   instrument_id is anything else     → in-kind shares, no cash impact
- *
- * (CASH_NGN BUY/SELL paths preserved for the legacy DON-C-style
- *  importer pattern — when CASH_NGN is the instrument the row is a
- *  cash deposit/withdrawal recorded as a trade, and the principal IS
- *  the cash amount with no separate broker fees.)
- *
- * ACTION-BY-ACTION (post-v27ai)
- * ─────────────────────────────
- *
- *   BUY (non-CASH_NGN):
- *     cash -= principal + fees    [v27ah]
- *
- *   BUY of CASH_NGN (cash deposit recorded as BUY):
- *     cash += principal           [no fees on cash deposits]
- *
- *   SELL (non-CASH_NGN):
- *     cash += principal − fees    [v27ah]
- *
- *   SELL of CASH_NGN (cash withdrawal recorded as SELL):
- *     cash -= principal           [no fees on cash withdrawals]
- *
- *   FEE: cash -= feeAmount        [v27ai: fallback chain
- *                                  amount → fees → fee_management
- *                                  → fee_other → gross_value]
- *
- *   TRANSFER_IN with cash-eligible instrument_id:
- *     cash += amount              [unchanged]
- *
- *   TRANSFER_IN with share instrument_id:
- *     cash impact = 0             [unchanged — in-kind rule]
- *
- *   TRANSFER_OUT mirrors TRANSFER_IN.
- *
+ * Sign convention by action:
+ *   BUY:          cash -= (principal + fees)        [v27ah]
+ *   SELL:         cash += (principal - fees)        [v27ah]
+ *   FEE:          cash -= feeAmount                 [v27ai column-fallback]
+ *   TRANSFER_IN:  cash += amount  if cash-eligible  [v27ag in-kind rule]
+ *   TRANSFER_OUT: cash -= amount  if cash-eligible  [v27ag in-kind rule]
  *   INCOME: cash += amount        [unchanged]
  */
 
@@ -105,6 +22,18 @@ export interface CashTxnLike {
   gross_value?:   number | string | null
   amount?:        number | string | null
   fees?:          number | string | null
+}
+
+/**
+ * v27ak: Component breakdown of cash-aware NAV. Allows callsites to
+ * display Securities NAV and Cash NAV as first-class panels rather
+ * than only the combined total. Total field stays bit-identical to
+ * the legacy `computeNAVWithCash` return value.
+ */
+export interface NAVComponents {
+  shareValue: number  // value of non-cash holdings (excludes legacy CASH_NGN row)
+  cash:       number  // cash balance derived from transaction series
+  total:      number  // shareValue + cash; same as computeNAVWithCash()
 }
 
 const num = (v: unknown): number => {
@@ -200,16 +129,36 @@ export function computeCashBalance(transactions: CashTxnLike[] | null | undefine
 }
 
 /**
+ * v27ak: Component breakdown of cash-aware NAV.
+ *
+ * Returns share value, cash balance, and combined total as discrete fields.
+ * Use this when the UI needs to display Securities and Cash as separate panels.
+ *
+ * Total is bit-identical to computeNAVWithCash() return — same filter, same math.
+ */
+export function computeNAVComponents(
+  holdings: Holding[],
+  transactions: CashTxnLike[] | null | undefined
+): NAVComponents {
+  const realHoldings = (holdings ?? []).filter(h => h.instrument_id !== 'CASH_NGN')
+  const shareValue   = computeNAV(realHoldings)
+  const cash         = computeCashBalance(transactions)
+  return { shareValue, cash, total: shareValue + cash }
+}
+
+/**
  * Cash-aware NAV: share value (excluding the legacy CASH_NGN holding)
  * plus cash balance derived from the transaction series.
  *
  * Drop-in replacement for computeNAV(holdings) at any callsite that
  * should display the TRUE portfolio NAV including cash.
+ *
+ * v27ak: refactored to a thin wrapper around computeNAVComponents.
+ * Behaviour bit-identical to the v27ai implementation across all 5 callsites.
  */
 export function computeNAVWithCash(
   holdings: Holding[],
   transactions: CashTxnLike[] | null | undefined
 ): number {
-  const realHoldings = (holdings ?? []).filter(h => h.instrument_id !== 'CASH_NGN')
-  return computeNAV(realHoldings) + computeCashBalance(transactions)
+  return computeNAVComponents(holdings, transactions).total
 }
