@@ -29,11 +29,14 @@ function fmtPct(v: number, dp = 1): string {
 
 function statusPill(status: FeeStatus): { label: string; cls: string } {
   switch (status) {
-    case 'beating':   return { label: 'Beating',   cls: 'pill-ok' }
-    case 'on_track':  return { label: 'On track',  cls: 'pill-ok' }
-    case 'at_risk':   return { label: 'At risk',   cls: 'pill-warn' }
-    case 'below':     return { label: 'Below',     cls: 'pill-breach' }
-    case 'no_basis':  return { label: 'No basis',  cls: 'pill-hold' }
+    case 'beating':       return { label: 'Beating',     cls: 'pill-ok' }
+    case 'on_track':      return { label: 'On track',    cls: 'pill-ok' }
+    case 'at_risk':       return { label: 'At risk',     cls: 'pill-warn' }
+    case 'below':         return { label: 'Below',       cls: 'pill-breach' }
+    case 'no_basis':      return { label: 'No basis',    cls: 'pill-hold' }
+    // v27ao: fee-architecture-aware statuses
+    case 'fixed_annual':  return { label: 'Fixed fee',   cls: 'pill-ok' }
+    case 'no_fee':        return { label: 'No fee',      cls: 'pill-hold' }
   }
 }
 
@@ -72,6 +75,8 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
           const sp = statusPill(row.status)
           const excessColor = row.excess_ngn >= 0 ? 'var(--pos)' : 'var(--neg)'
           const opacity = row.is_internal ? 0.5 : 1
+          // v27ao: noMath = true when no performance math applies to this row
+          const noMath = !!row.is_fixed_annual || row.status === 'no_fee'
           return (
             <tr key={row.portfolio_id} style={{ opacity }}>
               <td>
@@ -100,17 +105,31 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
                 </Link>
               </td>
               <td className="num num-serif">{fmtNgnM(row.current_nav)}</td>
+              {/* v27ao: target/excess/excess% are meaningless for fixed-annual and no-fee */}
               <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
-                {fmtNgnM(row.target_nav)}
+                {noMath ? '—' : fmtNgnM(row.target_nav)}
               </td>
-              <td className="num num-serif" style={{ color: excessColor }}>
-                {fmtNgnM(row.excess_ngn)}
+              <td className="num num-serif" style={{ color: noMath ? 'var(--text-3)' : excessColor }}>
+                {noMath ? '—' : fmtNgnM(row.excess_ngn)}
               </td>
-              <td className="num" style={{ fontFamily: 'var(--font-mono)', color: excessColor }}>
-                {fmtPct(row.excess_pct)}
+              <td className="num" style={{ fontFamily: 'var(--font-mono)', color: noMath ? 'var(--text-3)' : excessColor }}>
+                {noMath ? '—' : fmtPct(row.excess_pct)}
               </td>
-              <td className="num num-serif" style={{ color: row.projected_annual_fee > 0 ? 'var(--gold)' : 'var(--text-3)' }}>
-                {row.projected_annual_fee > 0 ? fmtNgnM(row.projected_annual_fee) : '—'}
+              <td className="num num-serif">
+                {row.is_fixed_annual ? (
+                  <div>
+                    <div style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_annual_fee)}</div>
+                    <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                      YTD {fmtNgnM(row.pro_rata_ytd_fee ?? 0)}
+                    </div>
+                  </div>
+                ) : row.status === 'no_fee' ? (
+                  <span style={{ color: 'var(--text-3)' }}>—</span>
+                ) : row.projected_annual_fee > 0 ? (
+                  <span style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_annual_fee)}</span>
+                ) : (
+                  <span style={{ color: 'var(--text-3)' }}>—</span>
+                )}
               </td>
               <td>
                 <span className={'pill ' + sp.cls}>{sp.label}</span>

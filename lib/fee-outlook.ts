@@ -35,14 +35,19 @@ export interface FeeOutlookPortfolio {
   start_date: string
   client?: { name: string; code: string; type?: string }
   // v27am: optional fee architecture fields. When undefined, falls back
-  // to legacy client.type detection. Cockpit routes will be updated to
-  // pass these in v27ao+.
+  // to legacy client.type detection.
+  // v27ao: target_return and performance_fee_split decommission the
+  // hardcoded 15%/30% constants in computeFeeOutlook.
   fee_model?: 'none' | 'performance_excess' | 'performance_hwm' | 'performance_combined' | 'fixed_annual' | null
   fixed_annual_fee_ngn?: number | null
+  target_return?: number | null
+  performance_fee_split?: number | null
 }
 
 // ─── Types ─────────────────────────────────────────────────────
-export type FeeStatus = 'beating' | 'on_track' | 'at_risk' | 'below' | 'no_basis'
+// v27ao: extended with 'fixed_annual' and 'no_fee' for fee-architecture
+// awareness. Performance modes still use the original 5 values.
+export type FeeStatus = 'beating' | 'on_track' | 'at_risk' | 'below' | 'no_basis' | 'fixed_annual' | 'no_fee'
 
 export interface FeeOutlook {
   portfolio_id:   string
@@ -53,8 +58,10 @@ export interface FeeOutlook {
   // v27am: fee architecture awareness. Optional so existing return
   // statements compile unchanged. Consumers that branch on these
   // get full differentiation; legacy consumers ignore them.
+  // v27ao: pro_rata_ytd_fee added for fixed-annual panel rendering.
   is_fixed_annual?: boolean
   fixed_annual_fee_ngn?: number | null
+  pro_rata_ytd_fee?: number
 
   year_start_basis: 'jan_1' | 'mandate_start'
   effective_year_start_date: string  // ISO yyyy-mm-dd
@@ -81,9 +88,13 @@ const numOrNull = (v: unknown): number | null => {
 }
 const num = (v: unknown, fallback = 0): number => numOrNull(v) ?? fallback
 
-// ─── DMA constants ─────────────────────────────────────────────
-const ANNUAL_TARGET = 0.15
-const TRANSWORLD_SHARE = 0.30   // Transworld gets 30% of excess
+// ─── DMA defaults (v27ao: per-portfolio overrides honored) ─────
+// Defaults for performance-mode portfolios when target_return or
+// performance_fee_split is null. Live data has both columns populated
+// for all six performance-fee mandates (15% target / 20% split), so
+// these defaults are defensive backstops only.
+const ANNUAL_TARGET_DEFAULT = 0.15
+const FIRM_SHARE_DEFAULT_DECIMAL = 0.20
 
 // ─── Year boundary helpers ─────────────────────────────────────
 function yearStartOf(date: Date): Date {
@@ -142,6 +153,80 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
   const daysElapsed   = Math.max(1, daysBetween(effectiveYearStart, today))
   const daysRemaining = Math.max(0, daysBetween(today, yEnd))
 
+  // ─── v27ao: fee-architecture dispatcher ──────────────────────
+  // Branches BEFORE the legacy performance math so internal and fixed-fee
+  // mandates produce honest results rather than running a 15%/20%
+  // performance projection that doesn't apply to them.
+
+  // No-fee branch: fee_model='none' OR legacy client.type='internal'.
+  // Engine returns a structurally complete result with all fee math zeroed
+  // and status='no_fee'.
+  if (isInternal) {
+    return {
+      portfolio_id:   portfolio.id,
+      portfolio_name: portfolio.name,
+      client_name:    portfolio.client?.name ?? '—',
+      client_code:    portfolio.client?.code ?? '—',
+      is_internal:    true,
+
+      year_start_basis:           basis,
+      effective_year_start_date:  isoDate(effectiveYearStart),
+      days_elapsed:               daysElapsed,
+      days_remaining:             daysRemaining,
+      days_in_year:               daysInYear,
+
+      current_nav: totalNAV,
+      target_nav:  0,
+      excess_ngn:  0,
+      excess_pct:  0,
+
+      projected_year_end_excess_ngn: 0,
+      projected_annual_fee:          0,
+      status: 'no_fee',
+    }
+  }
+
+  // Fixed-annual branch: flat NGN per year, time-pro-rated YTD value.
+  // projected_annual_fee = full annual amount (the headline fee).
+  // pro_rata_ytd_fee = annual × (daysElapsed / daysInYear) — what's
+  // accrued so far for the panel's secondary line.
+  if (portfolio.fee_model === 'fixed_annual') {
+    const annualFee = num(portfolio.fixed_annual_fee_ngn, 0)
+    const ytdProRata = annualFee * (daysElapsed / Math.max(1, daysInYear))
+    return {
+      portfolio_id:   portfolio.id,
+      portfolio_name: portfolio.name,
+      client_name:    portfolio.client?.name ?? '—',
+      client_code:    portfolio.client?.code ?? '—',
+      is_internal:    false,
+      is_fixed_annual: true,
+      fixed_annual_fee_ngn: annualFee,
+      pro_rata_ytd_fee: ytdProRata,
+
+      year_start_basis:           basis,
+      effective_year_start_date:  isoDate(effectiveYearStart),
+      days_elapsed:               daysElapsed,
+      days_remaining:             daysRemaining,
+      days_in_year:               daysInYear,
+
+      current_nav: totalNAV,
+      target_nav:  0,
+      excess_ngn:  0,
+      excess_pct:  0,
+
+      projected_year_end_excess_ngn: 0,
+      projected_annual_fee:          annualFee,
+      status: 'fixed_annual',
+    }
+  }
+
+  // Performance modes (performance_excess, performance_hwm,
+  // performance_combined) fall through to compound-target math below,
+  // parameterised with per-portfolio target_return and
+  // performance_fee_split. HWM and combined modes use the same forward
+  // projection as performance_excess; fee_periods written by hwm-engine
+  // remains the authoritative source for crystallised fees.
+
   // Initial cashflow at effective year start
   const initialBasis = startedThisYear
     ? num(portfolio.starting_nav, 0)
@@ -191,10 +276,14 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
     }
   }
 
-  // Compound each cashflow forward to today at 15% per annum
+  // v27ao: per-portfolio target_return (decimal) drives compounding.
+  // Falls back to 15% default if column is null.
+  const annualTarget = num(portfolio.target_return, ANNUAL_TARGET_DEFAULT)
+
+  // Compound each cashflow forward to today at the portfolio's target rate
   const targetNav = flows.reduce((sum, f) => {
     const yearsFromFlow = (today.getTime() - f.date.getTime()) / (365.25 * 86_400_000)
-    return sum + f.amount * Math.pow(1 + ANNUAL_TARGET, yearsFromFlow)
+    return sum + f.amount * Math.pow(1 + annualTarget, yearsFromFlow)
   }, 0)
 
   const excessNgn = totalNAV - targetNav
@@ -204,7 +293,10 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
   // Extrapolation factor scales the excess to a full year horizon
   const extrapolationFactor = daysInYear / Math.max(1, daysElapsed)
   const projectedExcess = excessNgn * extrapolationFactor
-  const projectedFee = Math.max(0, projectedExcess) * TRANSWORLD_SHARE
+  // v27ao: per-portfolio performance_fee_split (stored as percent, e.g. 20.0)
+  // drives the firm share. Divide by 100 for decimal. Falls back to 20%.
+  const splitPct = num(portfolio.performance_fee_split, FIRM_SHARE_DEFAULT_DECIMAL * 100)
+  const projectedFee = Math.max(0, projectedExcess) * (splitPct / 100)
 
   const status = classifyStatus(excessNgn, totalNAV, projectedExcess)
 

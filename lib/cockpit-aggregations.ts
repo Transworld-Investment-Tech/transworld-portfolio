@@ -57,6 +57,12 @@ export interface PortfolioWithMeta {
   client_code:   string
   client_type:   string         // 'discretionary' | 'advisory' | 'internal'
   is_internal:   boolean
+  // v27ao: fee architecture pass-through. Optional so consumers
+  // that don't need them stay unchanged.
+  fee_model?:              'none' | 'performance_excess' | 'performance_hwm' | 'performance_combined' | 'fixed_annual' | null
+  fixed_annual_fee_ngn?:   number | null
+  target_return?:          number | null
+  performance_fee_split?:  number | null
 }
 
 export interface AUMTrendPoint {
@@ -193,6 +199,7 @@ export async function fetchAllActivePortfolios(
     .select(`
       id, name, label, client_id, starting_nav, start_date, status,
       income_target, liq_min, dd_alert, dd_action, max_eq_single, max_eq_sleeve,
+      fee_model, fixed_annual_fee_ngn, target_return, performance_fee_split,
       client:clients(name, code, type)
     `)
     .eq('status', 'active')
@@ -234,7 +241,12 @@ export async function fetchAllActivePortfolios(
     client_name:   p.client?.name ?? '—',
     client_code:   p.client?.code ?? '—',
     client_type:   p.client?.type ?? 'discretionary',
-    is_internal:   p.client?.type === 'internal',
+    // v27ao: is_internal honors both legacy client.type and new fee_model='none'
+    is_internal:   p.client?.type === 'internal' || p.fee_model === 'none',
+    fee_model:              p.fee_model ?? null,
+    fixed_annual_fee_ngn:   numOrNull(p.fixed_annual_fee_ngn),
+    target_return:          numOrNull(p.target_return),
+    performance_fee_split:  numOrNull(p.performance_fee_split),
   }))
 }
 

@@ -40,6 +40,11 @@ export async function GET(_req: NextRequest) {
           starting_nav: p.starting_nav,
           start_date: p.start_date,
           client: { name: p.client_name, code: p.client_code, type: p.client_type },
+          // v27ao: pass-through fee-architecture columns
+          fee_model: p.fee_model,
+          fixed_annual_fee_ngn: p.fixed_annual_fee_ngn,
+          target_return: p.target_return,
+          performance_fee_split: p.performance_fee_split,
         },
         totalNAV,
         navAtYearStart: inputs.navAtYearStart,
