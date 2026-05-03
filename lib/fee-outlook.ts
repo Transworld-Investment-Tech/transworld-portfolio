@@ -34,6 +34,11 @@ export interface FeeOutlookPortfolio {
   starting_nav: number
   start_date: string
   client?: { name: string; code: string; type?: string }
+  // v27am: optional fee architecture fields. When undefined, falls back
+  // to legacy client.type detection. Cockpit routes will be updated to
+  // pass these in v27ao+.
+  fee_model?: 'none' | 'performance_excess' | 'performance_hwm' | 'performance_combined' | 'fixed_annual' | null
+  fixed_annual_fee_ngn?: number | null
 }
 
 // ─── Types ─────────────────────────────────────────────────────
@@ -45,6 +50,11 @@ export interface FeeOutlook {
   client_name:    string
   client_code:    string
   is_internal:    boolean
+  // v27am: fee architecture awareness. Optional so existing return
+  // statements compile unchanged. Consumers that branch on these
+  // get full differentiation; legacy consumers ignore them.
+  is_fixed_annual?: boolean
+  fixed_annual_fee_ngn?: number | null
 
   year_start_basis: 'jan_1' | 'mandate_start'
   effective_year_start_date: string  // ISO yyyy-mm-dd
@@ -117,7 +127,7 @@ export interface FeeOutlookInput {
 export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
   const { portfolio, totalNAV, navAtYearStart, yearlyCashflows } = input
 
-  const isInternal = portfolio.client?.type === 'internal'
+  const isInternal = portfolio.fee_model === 'none' || portfolio.client?.type === 'internal'
   const today = new Date()
   const yStart = yearStartOf(today)
   const yEnd   = yearEndOf(today)

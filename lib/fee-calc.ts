@@ -199,3 +199,183 @@ export function fmtSignedNGN(n: number): string {
   const abs = Math.abs(n)
   return `${sign}₦${abs.toLocaleString('en-GB', { maximumFractionDigits: 0 })}`
 }
+
+// ═══════════════════════════════════════════════════════════════
+// v27am: Fee architecture dispatcher
+// ═══════════════════════════════════════════════════════════════
+//
+// Per-period fee calculator. Called by lib/hwm-engine.ts for each
+// fee period of every portfolio with fee_model != 'none' and
+// fee_relationship_start_date set.
+//
+// Branches on portfolio.fee_model:
+//   'fixed_annual'         → fee_earned = fixed_annual_fee_ngn × period_days/365
+//   'performance_excess'   → fee on period TWR above (target_return × period_days/365) × split
+//   'performance_hwm'      → fee on period_high above adjusted opening HWM × split
+//   'performance_combined' → fee on min(period_excess, hwm_excess) × split
+//
+// Snapshot fields populated to preserve audit trail: when a client
+// renegotiates (e.g. switches from performance_excess 15%/20% to
+// performance_combined 12%/25%), historical fee_periods retain their
+// original calc inputs.
+//
+// Returns null on coherence failure (e.g. performance_fee_split is null
+// for a performance_* mode). Caller logs the reason and skips writing
+// the period row.
+//
+// Coexists with legacy computeFeeMetrics (XIRR-style face-value sum
+// preserved unchanged for analytics route + Overview Performance fee
+// panel). v27an UI work surfaces dispatcher output in the Overview.
+// ═══════════════════════════════════════════════════════════════
+
+export type FeeModel =
+  | 'none'
+  | 'performance_excess'
+  | 'performance_hwm'
+  | 'performance_combined'
+  | 'fixed_annual'
+
+export interface PeriodFeeInput {
+  portfolio: {
+    fee_model: FeeModel
+    target_return: number              // annualised, decimal (0.15 = 15%)
+    performance_fee_split: number | null  // %, e.g. 20 for 20%
+    fixed_annual_fee_ngn: number | null
+    fee_year_end_md: string
+  }
+  period_start: Date
+  period_end: Date
+  opening_nav: number
+  closing_nav: number
+  contributions: number
+  withdrawals: number
+  cwa_factor: number | null         // null for non-HWM models
+  opening_hwm: number | null        // post-flow-adjustment (HWM-1 applied by engine)
+  period_high_nav: number | null    // null for non-HWM models
+}
+
+export interface PeriodFeeOutput {
+  fee_model_used: FeeModel
+  period_days: number
+  gross_period_return_pct: number | null
+  excess_above_threshold: number | null   // % decimal
+  hwm_excess_amount: number | null        // NGN
+  qualifying_excess: number | null        // NGN, base for fee × split
+  fee_earned: number                       // NGN
+  // Snapshots written into fee_periods row for audit trail
+  fee_model_snapshot: FeeModel
+  performance_fee_threshold_snapshot: number | null
+  performance_fee_split_snapshot: number | null
+  fixed_annual_fee_ngn_snapshot: number | null
+}
+
+const V27AM_MS_PER_DAY = 24 * 3600 * 1000
+
+function v27amPeriodDays(start: Date, end: Date): number {
+  // Inclusive both ends. Same-day period = 1 day.
+  return Math.max(1, Math.round((end.getTime() - start.getTime()) / V27AM_MS_PER_DAY) + 1)
+}
+
+export function computePeriodFee(input: PeriodFeeInput): PeriodFeeOutput | null {
+  const { portfolio } = input
+  const days = v27amPeriodDays(input.period_start, input.period_end)
+
+  // Snapshots populated regardless of branch
+  const baseSnapshot = {
+    fee_model_used: portfolio.fee_model,
+    period_days: days,
+    fee_model_snapshot: portfolio.fee_model,
+    performance_fee_threshold_snapshot: portfolio.target_return,
+    performance_fee_split_snapshot: portfolio.performance_fee_split,
+    fixed_annual_fee_ngn_snapshot: portfolio.fixed_annual_fee_ngn,
+  }
+
+  // ─── 'none' ─────────────────────────────────────────────────
+  if (portfolio.fee_model === 'none') {
+    // Engine should skip 'none' portfolios before calling. Defensive null.
+    return null
+  }
+
+  // ─── 'fixed_annual' ─────────────────────────────────────────
+  if (portfolio.fee_model === 'fixed_annual') {
+    if (portfolio.fixed_annual_fee_ngn == null) return null
+    const annualFee = portfolio.fixed_annual_fee_ngn
+    const feeEarned = annualFee * (days / 365)
+    return {
+      ...baseSnapshot,
+      gross_period_return_pct: null,
+      excess_above_threshold: null,
+      hwm_excess_amount: null,
+      qualifying_excess: null,
+      fee_earned: feeEarned,
+    }
+  }
+
+  // ─── Performance modes: coherence + common math ─────────────
+  if (portfolio.performance_fee_split == null) return null
+  const splitFraction = portfolio.performance_fee_split / 100
+
+  // Period TWR (simple, flow-adjusted): (closing − opening − net_flows) / opening
+  // For full TWR with sub-period chaining, use lib/analytics.ts. For fee_periods
+  // the simple form is acceptable per the locked architecture decisions; a
+  // future v27 may upgrade to chained TWR if a client mandate demands it.
+  const netFlows = input.contributions - input.withdrawals
+  const grossReturnPct = input.opening_nav > 0
+    ? (input.closing_nav - input.opening_nav - netFlows) / input.opening_nav
+    : 0
+
+  // Pro-rate annual threshold to actual period length
+  const periodThresholdPct = portfolio.target_return * (days / 365)
+
+  // ─── 'performance_excess' ───────────────────────────────────
+  if (portfolio.fee_model === 'performance_excess') {
+    const excessPct = Math.max(0, grossReturnPct - periodThresholdPct)
+    const qualifyingExcess = excessPct > 0 ? input.opening_nav * excessPct : 0
+    const feeEarned = qualifyingExcess * splitFraction
+    return {
+      ...baseSnapshot,
+      gross_period_return_pct: grossReturnPct,
+      excess_above_threshold: excessPct,
+      hwm_excess_amount: null,
+      qualifying_excess: qualifyingExcess,
+      fee_earned: feeEarned,
+    }
+  }
+
+  // ─── 'performance_hwm' ──────────────────────────────────────
+  if (portfolio.fee_model === 'performance_hwm') {
+    if (input.opening_hwm == null || input.period_high_nav == null) return null
+    const hwmExcessAmount = Math.max(0, input.period_high_nav - input.opening_hwm)
+    const feeEarned = hwmExcessAmount * splitFraction
+    return {
+      ...baseSnapshot,
+      gross_period_return_pct: grossReturnPct,
+      excess_above_threshold: null,
+      hwm_excess_amount: hwmExcessAmount,
+      qualifying_excess: hwmExcessAmount,
+      fee_earned: feeEarned,
+    }
+  }
+
+  // ─── 'performance_combined' ─────────────────────────────────
+  if (portfolio.fee_model === 'performance_combined') {
+    if (input.opening_hwm == null || input.period_high_nav == null) return null
+    // Both gates must pass; fee on the smaller qualifying base
+    const excessPct = Math.max(0, grossReturnPct - periodThresholdPct)
+    const periodExcessNgn = excessPct > 0 ? input.opening_nav * excessPct : 0
+    const hwmExcessAmount = Math.max(0, input.period_high_nav - input.opening_hwm)
+    const qualifying = Math.min(periodExcessNgn, hwmExcessAmount)
+    const feeEarned = qualifying * splitFraction
+    return {
+      ...baseSnapshot,
+      gross_period_return_pct: grossReturnPct,
+      excess_above_threshold: excessPct,
+      hwm_excess_amount: hwmExcessAmount,
+      qualifying_excess: qualifying,
+      fee_earned: feeEarned,
+    }
+  }
+
+  // Unknown / unhandled fee_model
+  return null
+}
