@@ -163,11 +163,17 @@ export async function recomputeFeePeriodsForPortfolio(
   const earliestStart = periods[0].period_start
   const cutoff = asOf.toISOString().slice(0, 10)
 
+  // v27am-fix1: nav_log fetch loads from inception. The engine needs the
+  // latest row AT OR BEFORE the first period_start to resolve opening NAV.
+  // The previous lower-bound filter excluded pre-period rows, leaving
+  // opening_nav=0 for portfolios whose nav_log lacked an exact match on
+  // period_start. For performance-fee portfolios this silently zeroed fees
+  // (div-by-zero defensive guard). For fixed-annual portfolios the column
+  // was wrong but fee math was unaffected (time-only). Now no lower bound.
   const { data: navLogData, error: nErr } = await supabase
     .from('nav_log')
     .select('nav_date, nav_value')
     .eq('portfolio_id', portfolioId)
-    .gte('nav_date', earliestStart)
     .lte('nav_date', cutoff)
     .order('nav_date', { ascending: true })
     .limit(50000)
