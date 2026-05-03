@@ -201,6 +201,35 @@ export async function recomputeFeePeriodsForPortfolio(
     amount: numOrNull(r.amount),
   }))
 
+  // ─── 5b. v27am-fix2: opening NAV coherence guard ──────────
+  // For performance-fee modes, the engine cannot compute without a
+  // positive opening NAV at the first period start. If nav_log lacks
+  // coverage at-or-before fee_relationship_start_date, opening_nav
+  // resolves to 0 → div-by-zero defensive guard returns gross_return=0
+  // → fees zero silently. Detect early and refuse to write rather than
+  // silently underbill. Operator must either backfill nav_log to cover
+  // the anchor date, or push the anchor forward to the earliest entry.
+  // Fixed-annual mode is unaffected (fee math is time-only).
+  if (feeModel.startsWith('performance_') && periods.length > 0) {
+    const firstPeriodStart = periods[0].period_start
+    let seedNav = 0
+    for (let k = navRows.length - 1; k >= 0; k--) {
+      if (navRows[k].nav_date <= firstPeriodStart) {
+        seedNav = navRows[k].nav_value
+        break
+      }
+    }
+    if (seedNav <= 0) {
+      return fail(
+        portfolioId,
+        `opening_nav resolves to 0 at first period_start (${firstPeriodStart}). ` +
+        `Performance-fee modes require a positive opening NAV. Verify nav_log ` +
+        `coverage at-or-before fee_relationship_start_date, or push the anchor ` +
+        `to the earliest nav_log entry.`
+      )
+    }
+  }
+
   // ─── 6. Load preserved rows BEFORE wiping ─────────────────
   // Preserved = fee_status IN ('paid','invoiced','waived'). Skip these periods
   // in the recompute loop and use their closing_hwm to roll runningHwm forward.
