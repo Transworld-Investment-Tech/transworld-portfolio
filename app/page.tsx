@@ -291,16 +291,16 @@ export default function CockpitPage() {
           <div className="panel" style={{ marginBottom: 20 }}>
             <div className="panel-header">
               <div>
-                <div className="panel-title">Watchlist Pulse — unheld movers today</div>
+                <div className="panel-title">Watchlist Pulse — unheld movers</div>
                 <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
-                  Active equity-watchlist tickers no mandate currently holds, moving ±2% or more today
+                  Active equity-watchlist tickers no mandate currently holds · day / week / month / quarter · per-window threshold
                 </div>
               </div>
               <div className="panel-meta">
                 {pulseLoading
                   ? 'Loading…'
                   : pulse
-                    ? `${pulse.rows.length} above threshold`
+                    ? `${pulse.day.rows.length} above ±2% today`
                     : '—'}
               </div>
             </div>

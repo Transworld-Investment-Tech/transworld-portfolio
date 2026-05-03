@@ -191,24 +191,46 @@ export interface HouseViewsData {
   total_unique:      number   // distinct equity tickers held firm-wide (incl. ≥1 mandate)
 }
 
-// v27d — Watchlist Pulse types
+// v27d → v27aq — Watchlist Pulse types (windowed)
+//
+// WatchlistPulseRow: one unheld-watchlist ticker's move over a window.
+//   change_pct = (latest_price - lookback_price) / lookback_price × 100
+// For 'day' window, lookback equals latest and change_pct sources from
+// market_prices.day_change directly. For week/month/quarter, lookback
+// = closest price ≤ today − N days (same algo as Top Movers windowed).
+//
+// Threshold scales with window: ±2% day, ±5% week, ±10% month, ±20% quarter.
+// Cap: 20 rows per window, sorted by |change_pct| descending.
 export interface WatchlistPulseRow {
   ticker:         string
   name:           string
   section:        string
   sector:         string | null
-  day_change_pct: number     // signed
+  change_pct:     number     // signed percent over the window
   latest_price:   number
-  price_date:     string
+  latest_date:    string
+  lookback_price: number     // for 'day' window equals latest_price
+  lookback_date:  string     // for 'day' window equals latest_date
 }
 
+// One window's worth of pulse data
+export interface WindowPulse {
+  rows:                   WatchlistPulseRow[]
+  threshold_pct:          number       // 2.0 | 5.0 | 10.0 | 20.0
+  lookback_target_days:   number       // 0 | 7 | 30 | 90
+  as_of_date:             string | null
+  watchlist_size:         number       // active equity watchlist universe size
+  unheld_count:           number       // unheld active equity watchlist size
+  instruments_with_data:  number       // unheld tickers that produced a usable result
+  below_threshold_count:  number       // unheld watchlist movers that didn't clear threshold
+}
+
+// Pulse across all four rolling windows (v27aq)
 export interface WatchlistPulseData {
-  rows:           WatchlistPulseRow[]
-  threshold_pct:  number       // |day_change| threshold used (e.g. 2.0)
-  as_of_date:     string | null
-  watchlist_size: number       // active equity watchlist universe size
-  unheld_count:   number       // unheld active equity watchlist size (denom for pulse)
-  below_threshold_count: number // unheld watchlist movers that didn't clear threshold
+  day:     WindowPulse
+  week:    WindowPulse
+  month:   WindowPulse
+  quarter: WindowPulse
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1390,38 +1412,66 @@ export async function buildHouseViews(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 19. v27d — buildWatchlistPulse
+// 19. v27d → v27aq — buildWatchlistPulse (windowed)
 //
 // Tickers in the active equity watchlist that:
 //   - are NOT held by any active portfolio
-//   - have |day_change_pct| ≥ thresholdPct today
+//   - have |change_pct| ≥ per-window threshold over the rolling window
 //
-// Surfaces "missed opportunities" — names the firm has researched
-// but isn't currently expressing in any client mandate, that moved
-// today.
+// Surfaces "missed opportunities" — names the firm has researched but
+// isn't currently expressing in any client mandate, that moved.
 //
-// Sort: |day_change_pct| descending, capped at maxRows.
-// thresholdPct default 2.0% (NGX equity meaningful-move threshold).
-// as_of_date = max price_date observed across the unheld watchlist.
+// Per-window thresholds (calibrated to NGX equity volatility):
+//   - day:     ±2.0%   (current-day move; routine NGX threshold)
+//   - week:    ±5.0%   (7-day rolling)
+//   - month:   ±10.0%  (30-day rolling)
+//   - quarter: ±20.0%  (90-day rolling)
 //
-// Returns metadata fields (watchlist_size, unheld_count,
-// below_threshold_count) for the panel footer to give context on
-// what fraction of the universe is moving.
+// Lookback math: latest price minus closest available price ≤ N days
+// ago. Handles weekend/non-trading-day gaps. Same algo as Top Movers.
+//
+// Each window self-reports instruments_with_data + unheld_count so the
+// panel can render data-sufficiency banners. Month/quarter populate
+// naturally as NGX price history accumulates.
+//
+// Sort: |change_pct| descending. Cap: 20 rows per window.
 // ═══════════════════════════════════════════════════════════════
+
+const WP_WINDOW_DAYS = { day: 0, week: 7, month: 30, quarter: 90 } as const
+type WPWindowKey = keyof typeof WP_WINDOW_DAYS
+const WP_THRESHOLDS: Record<WPWindowKey, number> = {
+  day: 2.0, week: 5.0, month: 10.0, quarter: 20.0,
+}
+const WP_MAX_ROWS = 20
+
+function emptyWindowPulse(
+  targetDays: number,
+  threshold: number,
+  watchlistSize: number,
+  unheldCount: number,
+): WindowPulse {
+  return {
+    rows: [],
+    threshold_pct:         threshold,
+    lookback_target_days:  targetDays,
+    as_of_date:            null,
+    watchlist_size:        watchlistSize,
+    unheld_count:          unheldCount,
+    instruments_with_data: 0,
+    below_threshold_count: 0,
+  }
+}
+
 export async function buildWatchlistPulse(
   db: SupabaseClient,
   portfolios: PortfolioWithMeta[],
-  thresholdPct: number = 2.0,
-  maxRows: number = 10
 ): Promise<WatchlistPulseData> {
-  const empty: WatchlistPulseData = {
-    rows:                  [],
-    threshold_pct:         thresholdPct,
-    as_of_date:            null,
-    watchlist_size:        0,
-    unheld_count:          0,
-    below_threshold_count: 0,
-  }
+  const buildEmpty = (watchlistSize: number, unheldCount: number): WatchlistPulseData => ({
+    day:     emptyWindowPulse(WP_WINDOW_DAYS.day,     WP_THRESHOLDS.day,     watchlistSize, unheldCount),
+    week:    emptyWindowPulse(WP_WINDOW_DAYS.week,    WP_THRESHOLDS.week,    watchlistSize, unheldCount),
+    month:   emptyWindowPulse(WP_WINDOW_DAYS.month,   WP_THRESHOLDS.month,   watchlistSize, unheldCount),
+    quarter: emptyWindowPulse(WP_WINDOW_DAYS.quarter, WP_THRESHOLDS.quarter, watchlistSize, unheldCount),
+  })
 
   // Pull active equity-section watchlist
   const { data: watchData } = await db
@@ -1440,9 +1490,9 @@ export async function buildWatchlistPulse(
     }))
 
   const watchlistSize = watchTickers.length
-  if (watchlistSize === 0) return empty
+  if (watchlistSize === 0) return buildEmpty(0, 0)
 
-  // Build set of held instrument_ids across all active portfolios
+  // Held set across all active portfolios
   const portfolioIds = portfolios.map(p => p.id)
   const heldSet = new Set<string>()
   if (portfolioIds.length > 0) {
@@ -1458,36 +1508,38 @@ export async function buildWatchlistPulse(
 
   const unheldTickers = watchTickers.filter(w => !heldSet.has(w.ticker))
   const unheldCount = unheldTickers.length
-  if (unheldCount === 0) {
-    return { ...empty, watchlist_size: watchlistSize, unheld_count: 0 }
-  }
+  if (unheldCount === 0) return buildEmpty(watchlistSize, 0)
 
   const tickerIds = unheldTickers.map(w => w.ticker)
 
-  // Latest price per ticker (with day_change)
+  // Fetch 90-day price history (with 14-day buffer for non-trading-day baselines)
+  const today = new Date()
+  const oldestNeededMs = today.getTime() - (WP_WINDOW_DAYS.quarter + 14) * 86_400_000
+  const oldestIso = new Date(oldestNeededMs).toISOString().slice(0, 10)
+
   const { data: prices } = await db
     .from('market_prices')
     .select('instrument_id, price, price_date, day_change')
     .in('instrument_id', tickerIds)
+    .gte('price_date', oldestIso)
     .order('price_date', { ascending: false })
     .limit(50000)
 
-  const latestByInstr = new Map<string, { price: number; day_change: number; price_date: string }>()
-  let maxPriceDate: string | null = null
+  // Group by instrument (already date-desc)
+  const priceHistByInstr = new Map<string, Array<{ price: number; price_date: string; day_change: number | null }>>()
   for (const p of (prices ?? []) as any[]) {
-    if (latestByInstr.has(p.instrument_id)) continue
-    const px  = numOrNull(p.price)
-    const chg = numOrNull(p.day_change)
-    if (px === null || chg === null) continue
-    latestByInstr.set(p.instrument_id, {
-      price: px,
-      day_change: chg,
+    const px = numOrNull(p.price)
+    if (px === null) continue
+    const arr = priceHistByInstr.get(p.instrument_id) ?? []
+    arr.push({
+      price:      px,
       price_date: p.price_date,
+      day_change: numOrNull(p.day_change),
     })
-    if (!maxPriceDate || p.price_date > maxPriceDate) maxPriceDate = p.price_date
+    priceHistByInstr.set(p.instrument_id, arr)
   }
 
-  // Sector lookup from instruments
+  // Sector lookup
   const { data: instrs } = await db
     .from('instruments')
     .select('instrument_id, sector')
@@ -1498,36 +1550,105 @@ export async function buildWatchlistPulse(
     sectorMap.set(i.instrument_id, (i.sector ?? '').trim() || null)
   }
 
-  // Walk unheld tickers, classify above / below threshold
-  const aboveThreshold: WatchlistPulseRow[] = []
-  let belowThresholdCount = 0
+  const cutoffIso = (days: number): string => {
+    const d = new Date(today.getTime() - days * 86_400_000)
+    return d.toISOString().slice(0, 10)
+  }
+
+  // Per-window state
+  const rowsByWindow: Record<WPWindowKey, WatchlistPulseRow[]> = {
+    day: [], week: [], month: [], quarter: [],
+  }
+  const instrumentsWithData: Record<WPWindowKey, number> = {
+    day: 0, week: 0, month: 0, quarter: 0,
+  }
+  const belowThresholdCount: Record<WPWindowKey, number> = {
+    day: 0, week: 0, month: 0, quarter: 0,
+  }
+  const maxDateByWindow: Record<WPWindowKey, string | null> = {
+    day: null, week: null, month: null, quarter: null,
+  }
+
   for (const w of unheldTickers) {
-    const latest = latestByInstr.get(w.ticker)
-    if (!latest) continue   // no price data — neither above nor below; just skip
-    const absChange = Math.abs(latest.day_change)
-    if (absChange < thresholdPct) {
-      if (absChange > 0) belowThresholdCount++
-      continue
+    const hist = priceHistByInstr.get(w.ticker)
+    if (!hist || hist.length === 0) continue
+
+    const latest = hist[0]
+    const sector = sectorMap.get(w.ticker) ?? null
+
+    // Day window — uses feed-supplied day_change column directly
+    if (latest.day_change !== null) {
+      instrumentsWithData.day++
+      const absChg = Math.abs(latest.day_change)
+      if (absChg >= WP_THRESHOLDS.day) {
+        rowsByWindow.day.push({
+          ticker:         w.ticker,
+          name:           w.name,
+          section:        w.section,
+          sector,
+          change_pct:     latest.day_change,
+          latest_price:   latest.price,
+          latest_date:    latest.price_date,
+          lookback_price: latest.price,
+          lookback_date:  latest.price_date,
+        })
+        if (!maxDateByWindow.day || latest.price_date > maxDateByWindow.day) {
+          maxDateByWindow.day = latest.price_date
+        }
+      } else if (absChg > 0) {
+        belowThresholdCount.day++
+      }
     }
-    aboveThreshold.push({
-      ticker:         w.ticker,
-      name:           w.name,
-      section:        w.section,
-      sector:         sectorMap.get(w.ticker) ?? null,
-      day_change_pct: latest.day_change,
-      latest_price:   latest.price,
-      price_date:     latest.price_date,
-    })
+
+    // Week / month / quarter — find lookback = first row with date ≤ cutoff
+    for (const wkey of (['week', 'month', 'quarter'] as WPWindowKey[])) {
+      const days = WP_WINDOW_DAYS[wkey]
+      const cutoff = cutoffIso(days)
+      const lookback = hist.find(p => p.price_date <= cutoff)
+      if (!lookback) continue
+      if (lookback.price <= 0) continue
+      instrumentsWithData[wkey]++
+      const changePct = ((latest.price - lookback.price) / lookback.price) * 100
+      const absChg = Math.abs(changePct)
+      if (absChg >= WP_THRESHOLDS[wkey]) {
+        rowsByWindow[wkey].push({
+          ticker:         w.ticker,
+          name:           w.name,
+          section:        w.section,
+          sector,
+          change_pct:     changePct,
+          latest_price:   latest.price,
+          latest_date:    latest.price_date,
+          lookback_price: lookback.price,
+          lookback_date:  lookback.price_date,
+        })
+        const cur = maxDateByWindow[wkey]
+        if (!cur || latest.price_date > cur) {
+          maxDateByWindow[wkey] = latest.price_date
+        }
+      } else if (absChg > 0) {
+        belowThresholdCount[wkey]++
+      }
+    }
   }
 
-  aboveThreshold.sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct))
-
-  return {
-    rows:                  aboveThreshold.slice(0, maxRows),
-    threshold_pct:         thresholdPct,
-    as_of_date:            maxPriceDate,
-    watchlist_size:        watchlistSize,
-    unheld_count:          unheldCount,
-    below_threshold_count: belowThresholdCount,
+  // Build result — sort each window by |change_pct| desc, cap at WP_MAX_ROWS
+  const result: WatchlistPulseData = buildEmpty(watchlistSize, unheldCount)
+  for (const wkey of (['day', 'week', 'month', 'quarter'] as WPWindowKey[])) {
+    const rows = rowsByWindow[wkey]
+      .sort((a, b) => Math.abs(b.change_pct) - Math.abs(a.change_pct))
+      .slice(0, WP_MAX_ROWS)
+    result[wkey] = {
+      rows,
+      threshold_pct:         WP_THRESHOLDS[wkey],
+      lookback_target_days:  WP_WINDOW_DAYS[wkey],
+      as_of_date:            maxDateByWindow[wkey],
+      watchlist_size:        watchlistSize,
+      unheld_count:          unheldCount,
+      instruments_with_data: instrumentsWithData[wkey],
+      below_threshold_count: belowThresholdCount[wkey],
+    }
   }
+
+  return result
 }
