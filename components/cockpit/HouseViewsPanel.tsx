@@ -130,7 +130,8 @@ export default function HouseViewsPanel({ loading, data }: Props): ReactElement 
                         opacity: m.is_internal ? 0.7 : 1,
                       }}
                     >
-                      {m.client_code}
+                      {/* v27ap: chip = client_code-portfolio_label so A/B/C/D are distinguishable */}
+                      {m.client_code}{m.portfolio_label ? `-${m.portfolio_label}` : ''}
                     </Link>
                   ))}
                 </div>

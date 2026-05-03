@@ -1,15 +1,20 @@
 'use client'
 
+import { useState } from 'react'
 import type { ReactElement } from 'react'
 import { TrendingUp, TrendingDown, AlertCircle } from 'lucide-react'
-import type { TopMoversData, MoverRow } from '@/lib/cockpit-aggregations'
+import type { TopMoversData, MoverRow, WindowMovers } from '@/lib/cockpit-aggregations'
 
-// v27c — Top Movers panel
+// v27c → v27ap — Top Movers panel (windowed)
 //
-// Two-column layout: top 5 gainers / top 5 losers.
-// Sorted by NGN impact (firm_exposure × day_change/100), so a 2% move in
-// a large position outranks a 9% move in a tiny one. Surfaces real-money
-// moves across the firm book today rather than just biggest-percent flyers.
+// Tabs: Day / Week / Month / Quarter. Each tab renders top 5 gainers and
+// top 5 losers within that rolling window, sorted by NGN impact (firm
+// exposure × change pct).
+//
+// Per-window data sufficiency banners surface "insufficient" or "limited"
+// states honestly — month/quarter are empty until ≥30/≥90 days of NGX
+// price history accumulate, and the panel says so explicitly rather than
+// rendering misleading partial results.
 
 interface Props {
   loading: boolean
@@ -115,7 +120,7 @@ function MoverList({ rows, kind }: { rows: MoverRow[]; kind: 'gain' | 'loss' }):
               textAlign: 'right',
               whiteSpace: 'nowrap',
             }}>
-              {fmtPctSigned(r.day_change_pct, 2)}
+              {fmtPctSigned(r.change_pct, 2)}
             </div>
             <div style={{
               fontFamily: 'var(--font-serif)',
@@ -135,8 +140,20 @@ function MoverList({ rows, kind }: { rows: MoverRow[]; kind: 'gain' | 'loss' }):
   )
 }
 
+// v27ap — Window keys & metadata
+type WindowKey = 'day' | 'week' | 'month' | 'quarter'
+
+const WINDOW_META: Record<WindowKey, { label: string; sub: string }> = {
+  day:     { label: 'Day',     sub: 'today' },
+  week:    { label: 'Week',    sub: '7-day' },
+  month:   { label: 'Month',   sub: '30-day' },
+  quarter: { label: 'Quarter', sub: '90-day' },
+}
+
 // ─── Main component ─────────────────────────────────────────────
 export default function TopMoversPanel({ loading, data }: Props): ReactElement {
+  const [activeWindow, setActiveWindow] = useState<WindowKey>('day')
+
   if (loading) {
     return (
       <div style={{ padding: 24, textAlign: 'center', color: 'var(--text-3)', fontSize: 12 }}>
@@ -152,12 +169,106 @@ export default function TopMoversPanel({ loading, data }: Props): ReactElement {
     )
   }
 
-  const { gainers, losers, as_of_date } = data
+  // v27ap — active window selection
+  const w: WindowMovers = data[activeWindow]
+  const { gainers, losers, as_of_date } = w
   const totalImpact = [...gainers, ...losers].reduce((s, m) => s + m.ngn_impact, 0)
   const asOfLabel = fmtAsOf(as_of_date)
+  const meta = WINDOW_META[activeWindow]
+
+  // Sufficiency classification per tab — drives the small dot indicator
+  const sufficiency = (key: WindowKey): 'full' | 'partial' | 'empty' => {
+    const win = data[key]
+    if (win.total_held_instruments === 0) return 'empty'
+    if (win.instruments_with_data === 0) return 'empty'
+    if (win.instruments_with_data < win.total_held_instruments * 0.5) return 'partial'
+    return 'full'
+  }
 
   return (
     <div>
+      {/* v27ap — Tab strip */}
+      <div style={{
+        display: 'flex',
+        gap: 0,
+        marginBottom: 14,
+        borderBottom: '1px solid var(--border-soft)',
+      }}>
+        {(Object.keys(WINDOW_META) as WindowKey[]).map(key => {
+          const isActive = activeWindow === key
+          const suff = sufficiency(key)
+          return (
+            <button
+              key={key}
+              onClick={() => setActiveWindow(key)}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                borderBottom: isActive ? '2px solid var(--gold)' : '2px solid transparent',
+                padding: '8px 16px',
+                cursor: 'pointer',
+                color: isActive ? 'var(--text)' : 'var(--text-3)',
+                fontSize: 11,
+                fontWeight: 600,
+                letterSpacing: '0.08em',
+                textTransform: 'uppercase',
+                display: 'flex',
+                alignItems: 'center',
+                gap: 6,
+                position: 'relative',
+                top: 1,
+              }}
+            >
+              {WINDOW_META[key].label}
+              {suff === 'empty' && (
+                <span title="Insufficient history" style={{
+                  width: 5, height: 5, borderRadius: '50%',
+                  background: 'var(--text-3)', opacity: 0.6,
+                }} />
+              )}
+              {suff === 'partial' && (
+                <span title="Limited data" style={{
+                  width: 5, height: 5, borderRadius: '50%',
+                  background: 'var(--gold)', opacity: 0.7,
+                }} />
+              )}
+            </button>
+          )
+        })}
+      </div>
+
+      {/* v27ap — Sufficiency banners */}
+      {w.total_held_instruments > 0 && w.instruments_with_data === 0 && (
+        <div style={{
+          padding: '12px 14px',
+          background: 'rgba(176, 139, 62, 0.06)',
+          border: '1px solid rgba(176, 139, 62, 0.20)',
+          borderRadius: 4,
+          fontSize: 11,
+          color: 'var(--text-2)',
+          marginBottom: 12,
+          lineHeight: 1.5,
+        }}>
+          <strong style={{ color: 'var(--text)' }}>Insufficient history.</strong>
+          {' '}Backfilling — none of the {w.total_held_instruments} held equities have NGX price data ≥ {meta.sub} old yet. This window will populate as price history accumulates.
+        </div>
+      )}
+      {w.total_held_instruments > 0
+        && w.instruments_with_data > 0
+        && w.instruments_with_data < w.total_held_instruments * 0.5 && (
+        <div style={{
+          padding: '10px 12px',
+          background: 'rgba(176, 139, 62, 0.04)',
+          borderRadius: 4,
+          fontSize: 10,
+          color: 'var(--text-2)',
+          marginBottom: 12,
+        }}>
+          Limited data: showing {w.instruments_with_data} of {w.total_held_instruments} held equities with {meta.sub} history.
+        </div>
+      )}
+
+      {/* Gainers/losers two-column grid */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: '1fr 1fr',
@@ -241,12 +352,12 @@ export default function TopMoversPanel({ loading, data }: Props): ReactElement {
       }}>
         {asOfLabel && (
           <span>
-            Prices as of <strong style={{ color: 'var(--text)' }}>{asOfLabel}</strong>
+            Latest as of <strong style={{ color: 'var(--text)' }}>{asOfLabel}</strong>
           </span>
         )}
         {(gainers.length > 0 || losers.length > 0) && (
           <span>
-            Net firm impact (top 10):
+            Net firm impact ({meta.sub}, top 10):
             {' '}
             <strong style={{
               color: totalImpact >= 0 ? 'var(--pos)' : 'var(--neg)',
@@ -257,14 +368,14 @@ export default function TopMoversPanel({ loading, data }: Props): ReactElement {
             </strong>
           </span>
         )}
-        {gainers.length === 0 && losers.length === 0 && (
+        {gainers.length === 0 && losers.length === 0 && w.instruments_with_data > 0 && (
           <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
             <AlertCircle size={11} />
-            No price-change data on file. Run a Live prices refresh from any portfolio overview.
+            No movers in this window — held equities flat over {meta.sub}.
           </span>
         )}
         <span style={{ marginLeft: 'auto', fontStyle: 'italic' }}>
-          Equity-only · ranked by NGN impact, not headline %
+          Equity-only · price-based returns · dividends & corp actions excluded
         </span>
       </div>
     </div>

@@ -235,9 +235,9 @@ export default function CockpitPage() {
           <div className="panel" style={{ marginBottom: 20 }}>
             <div className="panel-header">
               <div>
-                <div className="panel-title">Fee Outlook — 15% benchmark</div>
+                <div className="panel-title">Fee Outlook</div>
                 <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
-                  Calendar-year basis · pro-rated for mid-year starters · 30% of excess
+                  Per-mandate target & split · calendar-year basis · pro-rated for mid-year starters
                 </div>
               </div>
               <div className="panel-meta">
@@ -251,16 +251,16 @@ export default function CockpitPage() {
           <div className="panel" style={{ marginBottom: 20 }}>
             <div className="panel-header">
               <div>
-                <div className="panel-title">Top Movers — firm book today</div>
+                <div className="panel-title">Top Movers — firm book</div>
                 <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
-                  Equities ranked by NGN impact (exposure × day-change) · top 5 each side
+                  Equities ranked by NGN impact (exposure × period change) · day / week / month / quarter · top 5 each side
                 </div>
               </div>
               <div className="panel-meta">
                 {moversLoading
                   ? 'Loading…'
                   : movers
-                    ? `${movers.gainers.length} gainers · ${movers.losers.length} losers`
+                    ? `${movers.day.gainers.length} gainers · ${movers.day.losers.length} losers today`
                     : '—'}
               </div>
             </div>

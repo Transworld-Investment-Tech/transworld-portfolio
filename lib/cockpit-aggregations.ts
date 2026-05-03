@@ -114,23 +114,44 @@ export interface SectorExposureData {
   portfolios:   SectorExposureRow[]         // sorted desc by total_equity_nav
 }
 
-// v27c — Top movers types
+// v27c → v27ap — Top movers types (windowed)
+//
+// MoverRow: one instrument's price change over a window.
+//   change_pct = (latest_price - lookback_price) / lookback_price × 100
+// For the 'day' window, lookback equals latest and change_pct is sourced
+// from market_prices.day_change directly (preserving feed semantics).
+// For week/month/quarter, lookback = closest price ≤ today − N days.
+// Instruments with no usable lookback price are skipped from that window.
 export interface MoverRow {
   instrument_id:     string
   name:              string
   sector:            string | null
-  day_change_pct:    number     // signed percent (e.g. 7.24, -9.92)
+  change_pct:        number     // signed percent over the window
   latest_price:      number
-  price_date:        string
-  firm_exposure_ngn: number     // aggregate NGN held across firm
-  mandate_count:     number     // distinct portfolios holding
-  ngn_impact:        number     // signed = firm_exposure × day_change / 100
+  latest_date:       string
+  lookback_price:    number     // for 'day' window equals latest_price
+  lookback_date:     string     // for 'day' window equals latest_date
+  firm_exposure_ngn: number
+  mandate_count:     number
+  ngn_impact:        number     // signed = firm_exposure × change_pct/100
 }
 
+// One window's worth of mover analysis
+export interface WindowMovers {
+  gainers:                MoverRow[]
+  losers:                 MoverRow[]
+  as_of_date:             string | null   // max latest_date observed
+  lookback_target_days:   number          // 0 (day) | 7 (week) | 30 (month) | 90 (quarter)
+  instruments_with_data:  number          // held equities that produced a row
+  total_held_instruments: number          // total equities held firm-wide
+}
+
+// Top movers across all four rolling windows (v27ap)
 export interface TopMoversData {
-  gainers:     MoverRow[]
-  losers:      MoverRow[]
-  as_of_date:  string | null   // most recent price_date observed
+  day:     WindowMovers
+  week:    WindowMovers
+  month:   WindowMovers
+  quarter: WindowMovers
 }
 
 // v27c — Firm-wide FI holdings (for YieldCurvePanel firm overlay)
@@ -144,11 +165,14 @@ export interface FirmFIHolding {
 
 // v27d — House Views types
 export interface HouseViewMandatePosition {
-  portfolio_id:   string
-  portfolio_name: string
-  client_code:    string
-  is_internal:    boolean
-  ngn:            number
+  portfolio_id:    string
+  portfolio_name:  string
+  // v27ap: portfolio_label disambiguates clients with multiple mandates
+  // (e.g., CKNET-A vs CKNET-B). Chip renders as client_code-portfolio_label.
+  portfolio_label: string
+  client_code:     string
+  is_internal:     boolean
+  ngn:             number
 }
 
 export interface HouseViewRow {
@@ -950,23 +974,48 @@ export async function buildSectorExposureGrid(
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 15. v27c — buildTopMovers
+// 15. v27c → v27ap — buildTopMovers (windowed)
 //
-// Top 5 gainers / losers across firm holdings today, weighted by
-// aggregate NGN exposure. Equity-only — bonds don't have meaningful
-// daily price movement on NGX.
+// Returns top 5 gainers / losers across firm equity holdings in each of
+// four rolling windows: day (0d), week (7d), month (30d), quarter (90d).
 //
-// Sort: |ngn_impact| descending, where ngn_impact = firm_exposure × day_change/100
-//   - gainers: positive day_change, sorted desc
-//   - losers:  negative day_change, sorted asc (most negative first)
+// Lookback math: latest price minus closest available price ≤ N days ago,
+// over latest. Handles weekend gaps and NGX trading-day sparsity by
+// taking the most-recent price_date that is still at-or-before the
+// target lookback date. Instruments with no usable baseline are skipped
+// from that window only — other windows continue unaffected.
 //
-// as_of_date = max price_date observed (used for staleness display).
+// Each window self-reports instruments_with_data + total_held_instruments
+// so the panel can render data-sufficiency banners ("insufficient",
+// "limited", or fully populated) honestly without code-side suppression.
+//
+// Equity-only — NGX bonds aren't priced daily.
 // ═══════════════════════════════════════════════════════════════
+
+const WINDOW_DAYS = { day: 0, week: 7, month: 30, quarter: 90 } as const
+type WindowKey = keyof typeof WINDOW_DAYS
+
+function emptyWindow(targetDays: number, totalHeld: number): WindowMovers {
+  return {
+    gainers: [],
+    losers: [],
+    as_of_date: null,
+    lookback_target_days: targetDays,
+    instruments_with_data: 0,
+    total_held_instruments: totalHeld,
+  }
+}
+
 export async function buildTopMovers(
   db: SupabaseClient,
   portfolios: PortfolioWithMeta[],
 ): Promise<TopMoversData> {
-  const empty: TopMoversData = { gainers: [], losers: [], as_of_date: null }
+  const empty: TopMoversData = {
+    day:     emptyWindow(WINDOW_DAYS.day,     0),
+    week:    emptyWindow(WINDOW_DAYS.week,    0),
+    month:   emptyWindow(WINDOW_DAYS.month,   0),
+    quarter: emptyWindow(WINDOW_DAYS.quarter, 0),
+  }
   if (portfolios.length === 0) return empty
 
   const portfolioIds = portfolios.map(p => p.id)
@@ -978,10 +1027,10 @@ export async function buildTopMovers(
     .in('portfolio_id', portfolioIds)
     .limit(50000)
 
-  // Aggregate quantity per instrument across firm
-  const qtyByInstr  = new Map<string, number>()
+  // Aggregate qty/portfolios/meta per instrument across firm
+  const qtyByInstr        = new Map<string, number>()
   const portfoliosByInstr = new Map<string, Set<string>>()
-  const metaByInstr = new Map<string, { name: string; sector: string | null }>()
+  const metaByInstr       = new Map<string, { name: string; sector: string | null }>()
 
   for (const h of (holds ?? []) as any[]) {
     const sleeve = h.instrument?.sleeve_id
@@ -1001,75 +1050,134 @@ export async function buildTopMovers(
     }
   }
 
-  if (qtyByInstr.size === 0) return empty
+  const totalHeld = qtyByInstr.size
+  if (totalHeld === 0) return empty
 
-  // Latest price per instrument (with day_change)
+  // Fetch prices over the longest window we need (90 days back, plus a 14-day
+  // buffer for non-trading-day baseline lookups).
+  const today = new Date()
+  const oldestNeededMs = today.getTime() - (WINDOW_DAYS.quarter + 14) * 86_400_000
+  const oldestIso = new Date(oldestNeededMs).toISOString().slice(0, 10)
+
   const instrIds = Array.from(qtyByInstr.keys())
   const { data: prices } = await db
     .from('market_prices')
     .select('instrument_id, price, price_date, day_change')
     .in('instrument_id', instrIds)
+    .gte('price_date', oldestIso)
     .order('price_date', { ascending: false })
     .limit(50000)
 
-  // First-seen wins (rows are date-desc) → latest price per instrument
-  const latestByInstr = new Map<string, { price: number; day_change: number; price_date: string }>()
-  let maxPriceDate: string | null = null
+  // Group prices by instrument (already date-desc sorted from query)
+  const priceHistByInstr = new Map<string, Array<{ price: number; price_date: string; day_change: number | null }>>()
   for (const p of (prices ?? []) as any[]) {
-    if (latestByInstr.has(p.instrument_id)) continue
-    const px  = numOrNull(p.price)
-    const chg = numOrNull(p.day_change)
-    if (px === null || chg === null) continue
-    latestByInstr.set(p.instrument_id, {
+    const px = numOrNull(p.price)
+    if (px === null) continue
+    const arr = priceHistByInstr.get(p.instrument_id) ?? []
+    arr.push({
       price:      px,
-      day_change: chg,
       price_date: p.price_date,
+      day_change: numOrNull(p.day_change),
     })
-    if (!maxPriceDate || p.price_date > maxPriceDate) maxPriceDate = p.price_date
+    priceHistByInstr.set(p.instrument_id, arr)
   }
 
-  // Build mover rows
-  const movers: MoverRow[] = []
+  const cutoffIso = (days: number): string => {
+    const d = new Date(today.getTime() - days * 86_400_000)
+    return d.toISOString().slice(0, 10)
+  }
+
+  const moversByWindow: Record<WindowKey, MoverRow[]> = {
+    day: [], week: [], month: [], quarter: [],
+  }
+
   for (const [instrId, qty] of qtyByInstr) {
-    const latest = latestByInstr.get(instrId)
-    if (!latest) continue
-    if (latest.day_change === 0) continue   // not a mover
+    const hist = priceHistByInstr.get(instrId)
+    if (!hist || hist.length === 0) continue
 
     const meta     = metaByInstr.get(instrId)!
+    const latest   = hist[0]
     const exposure = qty * latest.price
     if (exposure <= 0) continue
 
-    const ngnImpact = exposure * (latest.day_change / 100)
+    // Day window: use feed-supplied day_change column directly
+    if (latest.day_change !== null && latest.day_change !== 0) {
+      const ngnImpact = exposure * (latest.day_change / 100)
+      moversByWindow.day.push({
+        instrument_id:     instrId,
+        name:              meta.name,
+        sector:            meta.sector,
+        change_pct:        latest.day_change,
+        latest_price:      latest.price,
+        latest_date:       latest.price_date,
+        lookback_price:    latest.price,
+        lookback_date:     latest.price_date,
+        firm_exposure_ngn: exposure,
+        mandate_count:     portfoliosByInstr.get(instrId)?.size ?? 0,
+        ngn_impact:        ngnImpact,
+      })
+    }
 
-    movers.push({
-      instrument_id:     instrId,
-      name:              meta.name,
-      sector:            meta.sector,
-      day_change_pct:    latest.day_change,
-      latest_price:      latest.price,
-      price_date:        latest.price_date,
-      firm_exposure_ngn: exposure,
-      mandate_count:     portfoliosByInstr.get(instrId)?.size ?? 0,
-      ngn_impact:        ngnImpact,
-    })
+    // Week / month / quarter: find lookback = first row with date ≤ cutoff
+    for (const [wkey, days] of Object.entries(WINDOW_DAYS) as [WindowKey, number][]) {
+      if (wkey === 'day') continue
+      const cutoff = cutoffIso(days)
+      const lookback = hist.find(p => p.price_date <= cutoff)
+      if (!lookback) continue   // not enough history for this window
+      if (lookback.price <= 0) continue
+      const changePct = ((latest.price - lookback.price) / lookback.price) * 100
+      if (changePct === 0) continue
+      const ngnImpact = exposure * (changePct / 100)
+      moversByWindow[wkey].push({
+        instrument_id:     instrId,
+        name:              meta.name,
+        sector:            meta.sector,
+        change_pct:        changePct,
+        latest_price:      latest.price,
+        latest_date:       latest.price_date,
+        lookback_price:    lookback.price,
+        lookback_date:     lookback.price_date,
+        firm_exposure_ngn: exposure,
+        mandate_count:     portfoliosByInstr.get(instrId)?.size ?? 0,
+        ngn_impact:        ngnImpact,
+      })
+    }
   }
 
-  // Split + sort + slice top 5 each
-  const gainers = movers
-    .filter(m => m.day_change_pct > 0)
-    .sort((a, b) => b.ngn_impact - a.ngn_impact)
-    .slice(0, 5)
-
-  const losers = movers
-    .filter(m => m.day_change_pct < 0)
-    .sort((a, b) => a.ngn_impact - b.ngn_impact)   // most negative first
-    .slice(0, 5)
-
-  return {
-    gainers,
-    losers,
-    as_of_date: maxPriceDate,
+  // Build each window's result with sort, slice, and as_of_date
+  const result: TopMoversData = {
+    day:     emptyWindow(WINDOW_DAYS.day,     totalHeld),
+    week:    emptyWindow(WINDOW_DAYS.week,    totalHeld),
+    month:   emptyWindow(WINDOW_DAYS.month,   totalHeld),
+    quarter: emptyWindow(WINDOW_DAYS.quarter, totalHeld),
   }
+
+  for (const wkey of Object.keys(WINDOW_DAYS) as WindowKey[]) {
+    const movers = moversByWindow[wkey]
+    if (movers.length === 0) continue
+    const gainers = movers
+      .filter(m => m.change_pct > 0)
+      .sort((a, b) => b.ngn_impact - a.ngn_impact)
+      .slice(0, 5)
+    const losers = movers
+      .filter(m => m.change_pct < 0)
+      .sort((a, b) => a.ngn_impact - b.ngn_impact)
+      .slice(0, 5)
+    const asOfDate = movers.reduce<string | null>((acc, m) => {
+      if (!acc || m.latest_date > acc) return m.latest_date
+      return acc
+    }, null)
+    result[wkey] = {
+      gainers,
+      losers,
+      as_of_date:             asOfDate,
+      lookback_target_days:   WINDOW_DAYS[wkey],
+      instruments_with_data:  movers.length,
+      total_held_instruments: totalHeld,
+    }
+  }
+
+  return result
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1242,10 +1350,11 @@ export async function buildHouseViews(
       byInstr.set(h.instrument_id, entry)
     }
     entry.positions.push({
-      portfolio_id:   meta.id,
-      portfolio_name: meta.name,
-      client_code:    meta.client_code,
-      is_internal:    meta.is_internal,
+      portfolio_id:    meta.id,
+      portfolio_name:  meta.name,
+      portfolio_label: meta.label,   // v27ap: chip disambiguation
+      client_code:     meta.client_code,
+      is_internal:     meta.is_internal,
       ngn,
     })
     firmEquityTotal += ngn
