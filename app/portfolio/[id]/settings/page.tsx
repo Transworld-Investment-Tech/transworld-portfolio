@@ -5,6 +5,17 @@ import { supabase } from '@/lib/supabase'
 import { fmt } from '@/lib/portfolio'
 import { Save, Plus, Trash2, AlertTriangle, Copy, Check } from 'lucide-react'
 
+// v27an: fee architecture options (mirrors DB CHECK constraints)
+const FEE_MODEL_OPTIONS = ['none', 'performance_excess', 'performance_hwm', 'performance_combined', 'fixed_annual']
+const FEE_MODEL_LABELS: Record<string, string> = {
+  none:                 'None - no fees accrued',
+  performance_excess:   'Performance - excess return',
+  performance_hwm:      'Performance - high-water mark',
+  performance_combined: 'Performance + fixed annual',
+  fixed_annual:         'Fixed annual fee',
+}
+const FEE_BILLING_OPTIONS = ['annual', 'quarterly', 'monthly']
+
 // v20d: Hybrid rewrite.
 // Sidebar rendered by app/portfolio/[id]/layout.tsx — do NOT render here.
 // PageActions dropped; inline hybrid Copy button wired to getSettingsText().
@@ -61,7 +72,33 @@ export default function PortfolioSettingsPage() {
       setSaving(false)
       return
     }
+    // v27an: fee architecture validation (mirrors DB CHECK constraints)
+    const feeModel = portfolio.fee_model || 'none'
+    if (!FEE_MODEL_OPTIONS.includes(feeModel)) {
+      flash(`Invalid fee model: ${feeModel}`, true)
+      setSaving(false)
+      return
+    }
+    if (feeModel === 'fixed_annual' && !portfolio.fixed_annual_fee_ngn) {
+      flash('Fixed annual fee (NGN) is required when fee model is Fixed Annual', true)
+      setSaving(false)
+      return
+    }
+    if (feeModel !== 'none' && portfolio.fee_year_end_md && !/^[0-1][0-9]-[0-3][0-9]$/.test(portfolio.fee_year_end_md)) {
+      flash(`Fee year-end must be MM-DD format (e.g. 12-31). Got: ${portfolio.fee_year_end_md}`, true)
+      setSaving(false)
+      return
+    }
+    const billingFreq = portfolio.fee_billing_frequency || 'annual'
+    if (!FEE_BILLING_OPTIONS.includes(billingFreq)) {
+      flash(`Invalid billing frequency: ${billingFreq}`, true)
+      setSaving(false)
+      return
+    }
     // v21j: starting_nav and start_date included in save payload
+    // v27an: fee architecture fields included in save payload
+    const isPerformance = feeModel.startsWith('performance')
+    const isFixedOrCombined = feeModel === 'fixed_annual' || feeModel === 'performance_combined'
     const { error: pe } = await supabase.from('portfolios').update({
       name:           portfolio.name,
       starting_nav:   Number(portfolio.starting_nav) || 0,
@@ -76,6 +113,12 @@ export default function PortfolioSettingsPage() {
       max_eq_sleeve:  Number(portfolio.max_eq_sleeve),
       valuation_date: portfolio.valuation_date,
       notes:          portfolio.notes,
+      fee_model:                   feeModel,
+      performance_fee_split:       isPerformance && portfolio.performance_fee_split !== '' && portfolio.performance_fee_split != null ? Number(portfolio.performance_fee_split) : null,
+      fixed_annual_fee_ngn:        isFixedOrCombined && portfolio.fixed_annual_fee_ngn !== '' && portfolio.fixed_annual_fee_ngn != null ? Number(portfolio.fixed_annual_fee_ngn) : null,
+      fee_billing_frequency:       billingFreq,
+      fee_year_end_md:             feeModel !== 'none' ? (portfolio.fee_year_end_md || '12-31') : (portfolio.fee_year_end_md || '12-31'),
+      fee_relationship_start_date: portfolio.fee_relationship_start_date || null,
     }).eq('id', portfolioId)
     if (!pe) {
       for (const sl of sleeves) {
@@ -85,7 +128,27 @@ export default function PortfolioSettingsPage() {
           max_pct:    sl.max_pct,
         }).match({ portfolio_id: portfolioId, sleeve_id: sl.sleeve_id })
       }
-      flash('Settings saved ✓')
+      // v27an: trigger fee_periods recompute for anchored fee-bearing portfolios
+      if (feeModel !== 'none' && portfolio.fee_relationship_start_date) {
+        try {
+          const recRes = await fetch('/api/admin/recompute-fee-periods', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ portfolio_id: portfolioId }),
+          })
+          const recJson = await recRes.json().catch(() => ({}))
+          if (recRes.ok && recJson.ok !== false) {
+            const inserted = typeof recJson.inserted === 'number' ? ` (${recJson.inserted} pending periods)` : ''
+            flash(`Settings saved & fee periods recomputed${inserted} ✓`)
+          } else {
+            flash(`Settings saved — recompute failed: ${recJson.error || recJson.reason || 'unknown'}`, true)
+          }
+        } catch (err: any) {
+          flash(`Settings saved — recompute network error: ${err?.message || 'unknown'}`, true)
+        }
+      } else {
+        flash('Settings saved ✓')
+      }
     } else {
       flash(pe.message, true)
     }
@@ -147,6 +210,30 @@ export default function PortfolioSettingsPage() {
     sleeves.forEach(s => {
       lines.push(`${s.name}: ${(s.target_pct*100).toFixed(0)}% target (${(s.min_pct*100).toFixed(0)}%–${(s.max_pct*100).toFixed(0)}% range)`)
     })
+    // v27an: include fee architecture in copyable settings
+    if (portfolio.fee_model && portfolio.fee_model !== 'none') {
+      lines.push('')
+      lines.push('── FEE ARCHITECTURE ────────────────────────────────────')
+      lines.push(`Fee model:              ${FEE_MODEL_LABELS[portfolio.fee_model] || portfolio.fee_model}`)
+      if (portfolio.fee_relationship_start_date) {
+        lines.push(`Mandate inception:      ${portfolio.fee_relationship_start_date}`)
+      } else {
+        lines.push(`Mandate inception:      (not yet anchored)`)
+      }
+      if (portfolio.fee_model.startsWith('performance')) {
+        lines.push(`Performance hurdle:     ${pct(portfolio.target_return)} p.a.`)
+        if (portfolio.performance_fee_split != null) {
+          lines.push(`Performance fee split:  ${Number(portfolio.performance_fee_split).toFixed(1)}% (Transworld share above hurdle)`)
+        }
+      }
+      if (portfolio.fee_model === 'fixed_annual' || portfolio.fee_model === 'performance_combined') {
+        if (portfolio.fixed_annual_fee_ngn) {
+          lines.push(`Fixed annual fee:       ₦${(Number(portfolio.fixed_annual_fee_ngn) / 1e6).toFixed(2)}M / year`)
+        }
+        lines.push(`Billing frequency:      ${portfolio.fee_billing_frequency || 'annual'}`)
+      }
+      lines.push(`Fee year-end:           ${portfolio.fee_year_end_md || '12-31'}`)
+    }
     if (navLog.length > 0) {
       lines.push('')
       lines.push('── NAV HISTORY ──────────────────────────────────────')
@@ -319,6 +406,148 @@ export default function PortfolioSettingsPage() {
               </div>
             ))}
           </div>
+        </div>
+
+        {/* v27an: Fee architecture */}
+        <div className="panel">
+          <div className="panel-header">
+            <div className="panel-title">Fee architecture</div>
+            {portfolio.fee_model && portfolio.fee_model !== 'none' && (
+              <div className="panel-meta" style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-3)' }}>
+                Hurdle: {((Number(portfolio.target_return) || 0) * 100).toFixed(1)}% (set in Return targets)
+              </div>
+            )}
+          </div>
+
+          {/* Fee model dropdown - always shown */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+            <div>
+              <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                Fee model
+              </label>
+              <select
+                value={portfolio.fee_model || 'none'}
+                onChange={e => updateField('fee_model', e.target.value)}
+                className="input-h"
+              >
+                {FEE_MODEL_OPTIONS.map(opt => (
+                  <option key={opt} value={opt}>{FEE_MODEL_LABELS[opt]}</option>
+                ))}
+              </select>
+            </div>
+
+            {/* Mandate inception date - shown when fee_model != 'none' */}
+            {portfolio.fee_model && portfolio.fee_model !== 'none' && (
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Mandate inception date
+                </label>
+                <input
+                  type="date"
+                  value={portfolio.fee_relationship_start_date || ''}
+                  onChange={e => updateField('fee_relationship_start_date', e.target.value)}
+                  className="input-h"
+                />
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                  When fee accrual begins. Reset this when the mandate is renegotiated.
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Performance fee split - shown when fee_model contains 'performance' */}
+          {portfolio.fee_model && portfolio.fee_model.startsWith('performance') && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Performance fee split (%)
+                </label>
+                <div style={{ position: 'relative' }}>
+                  <input
+                    type="number"
+                    step="0.1"
+                    min="0"
+                    max="100"
+                    value={portfolio.performance_fee_split ?? ''}
+                    onChange={e => updateField('performance_fee_split', e.target.value === '' ? null : Number(e.target.value))}
+                    className="input-h input-h-mono"
+                    style={{ paddingRight: 28 }}
+                    placeholder="20.0"
+                  />
+                  <span style={{ position: 'absolute', right: 10, top: '50%', transform: 'translateY(-50%)', fontSize: 11, color: 'var(--text-3)' }}>%</span>
+                </div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                  Transworld share of performance above the hurdle.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Fixed annual fee + billing - shown for fixed_annual or performance_combined */}
+          {(portfolio.fee_model === 'fixed_annual' || portfolio.fee_model === 'performance_combined') && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Fixed annual fee (NGN)
+                </label>
+                <input
+                  type="number"
+                  step="1000"
+                  min="0"
+                  value={portfolio.fixed_annual_fee_ngn ?? ''}
+                  onChange={e => updateField('fixed_annual_fee_ngn', e.target.value === '' ? null : Number(e.target.value))}
+                  className="input-h input-h-mono"
+                  placeholder="1000000"
+                />
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                  Flat naira amount per year.
+                </div>
+              </div>
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Billing frequency
+                </label>
+                <select
+                  value={portfolio.fee_billing_frequency || 'annual'}
+                  onChange={e => updateField('fee_billing_frequency', e.target.value)}
+                  className="input-h"
+                >
+                  {FEE_BILLING_OPTIONS.map(opt => (
+                    <option key={opt} value={opt}>{opt.charAt(0).toUpperCase() + opt.slice(1)}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+          )}
+
+          {/* Fee year-end - shown when fee_model != 'none' */}
+          {portfolio.fee_model && portfolio.fee_model !== 'none' && (
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16 }}>
+              <div>
+                <label style={{ display: 'block', fontSize: 11, color: 'var(--text-2)', marginBottom: 6 }}>
+                  Fee year-end (MM-DD)
+                </label>
+                <input
+                  type="text"
+                  value={portfolio.fee_year_end_md || '12-31'}
+                  onChange={e => updateField('fee_year_end_md', e.target.value)}
+                  className="input-h input-h-mono"
+                  placeholder="12-31"
+                  pattern="[0-1][0-9]-[0-3][0-9]"
+                />
+                <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 4, lineHeight: 1.4 }}>
+                  End of fee year. Default: 12-31.
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Recompute hint banner */}
+          {portfolio.fee_model && portfolio.fee_model !== 'none' && portfolio.fee_relationship_start_date && (
+            <div style={{ marginTop: 16, padding: '10px 12px', background: 'rgba(166, 124, 42, 0.08)', border: '1px solid rgba(166, 124, 42, 0.2)', borderRadius: 4, fontSize: 11, color: 'var(--text-2)', lineHeight: 1.5 }}>
+              Saving will recompute pending fee periods. Paid/invoiced periods are preserved (snapshot-frozen).
+            </div>
+          )}
         </div>
 
         {/* Sleeve allocation targets */}
