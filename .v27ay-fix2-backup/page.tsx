@@ -15,8 +15,6 @@ import WatchlistPulsePanel from '@/components/cockpit/WatchlistPulsePanel'
 import SignalsPanel from '@/components/cockpit/SignalsPanel'
 import type { Signal } from '@/lib/cockpit-signals'
 import type { NarratedSignal } from '@/lib/cockpit-narrator'
-import type { Disposition, DispositionMap } from '@/lib/cockpit-signal-dispositions'
-import { todayIsoDate } from '@/lib/cockpit-signal-dispositions'
 import type { MandateHealth } from '@/lib/mandate-health'
 import type { FeeOutlook } from '@/lib/fee-outlook'
 import type {
@@ -93,9 +91,6 @@ export default function CockpitPage() {
   const [signals, setSignals]               = useState<SignalEnvelope[]>([])
   const [signalsLoading, setSignalsLoading] = useState(true)
 
-  // v27ay-fix2: per-signal dispositions (dismiss / acted-on, day-scoped)
-  const [dispositions, setDispositions]     = useState<DispositionMap>({})
-
   const [refreshing, setRefreshing]         = useState(false)
 
   const loadAll = useCallback(async (forceRefresh: boolean = false) => {
@@ -127,13 +122,7 @@ export default function CockpitPage() {
       ? Promise.resolve(_v27axFix4_cachedSignals)
       : fetch('/api/cockpit/signals').then(r => r.json())
 
-    // v27ay-fix2: dispositions always fetched fresh (no client cache); they
-    // toggle frequently and Supabase is the source of truth.
-    const _v27ayFix2_dispoFetch = fetch(
-      '/api/cockpit/signal-dispositions?as_of_date=' + todayIsoDate()
-    ).then(r => r.json())
-
-    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes, dispoRes] = await Promise.allSettled([
+    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
       fetch('/api/cockpit/health').then(r => r.json()),
       fetch('/api/cockpit/fee-outlook').then(r => r.json()),
@@ -142,7 +131,6 @@ export default function CockpitPage() {
       fetch('/api/cockpit/house-views').then(r => r.json()),
       fetch('/api/cockpit/watchlist-pulse').then(r => r.json()),
       _v27axFix4_signalsFetch,
-      _v27ayFix2_dispoFetch,
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -182,51 +170,8 @@ export default function CockpitPage() {
     }
     setSignalsLoading(false)
 
-    // v27ay-fix2: apply dispositions response (silent fallback to empty)
-    if (dispoRes.status === 'fulfilled' && !dispoRes.value.error
-        && dispoRes.value.dispositions
-        && typeof dispoRes.value.dispositions === 'object') {
-      setDispositions(dispoRes.value.dispositions as DispositionMap)
-    }
-
     setRefreshing(false)
   }, [])
-
-  // v27ay-fix2: optimistic disposition toggle. UI updates immediately;
-  // POST persists to Supabase. On error, reverts and console.errors.
-  const handleDispositionChange = useCallback(
-    async (signalId: string, disposition: Disposition | null) => {
-      const prev = dispositions[signalId]
-      setDispositions(curr => {
-        const next = { ...curr }
-        if (disposition === null) delete next[signalId]
-        else next[signalId] = disposition
-        return next
-      })
-      try {
-        const r = await fetch('/api/cockpit/signal-dispositions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            signal_id:   signalId,
-            as_of_date:  todayIsoDate(),
-            disposition: disposition,
-          }),
-        })
-        const json = await r.json()
-        if (!r.ok || json.error) throw new Error(json.error || 'POST failed')
-      } catch (err) {
-        console.error('[v27ay-fix2] disposition POST failed, reverting:', err)
-        setDispositions(curr => {
-          const next = { ...curr }
-          if (prev === undefined) delete next[signalId]
-          else next[signalId] = prev
-          return next
-        })
-      }
-    },
-    [dispositions],
-  )
 
   useEffect(() => { loadAll() }, [loadAll])
 
@@ -272,13 +217,7 @@ export default function CockpitPage() {
           </div>
 
           {/* v27ax: signals — what demands attention today */}
-          {/* v27ay-fix2: + per-signal disposition toggle (dismiss / acted-on) */}
-          <SignalsPanel
-            signals={signals}
-            loading={signalsLoading}
-            dispositions={dispositions}
-            onDispositionChange={handleDispositionChange}
-          />
+          <SignalsPanel signals={signals} loading={signalsLoading} />
 
           {/* KPI strip */}
           <CockpitKPIStrip

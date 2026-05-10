@@ -15,8 +15,6 @@ import WatchlistPulsePanel from '@/components/cockpit/WatchlistPulsePanel'
 import SignalsPanel from '@/components/cockpit/SignalsPanel'
 import type { Signal } from '@/lib/cockpit-signals'
 import type { NarratedSignal } from '@/lib/cockpit-narrator'
-import type { Disposition, DispositionMap } from '@/lib/cockpit-signal-dispositions'
-import { todayIsoDate } from '@/lib/cockpit-signal-dispositions'
 import type { MandateHealth } from '@/lib/mandate-health'
 import type { FeeOutlook } from '@/lib/fee-outlook'
 import type {
@@ -93,47 +91,16 @@ export default function CockpitPage() {
   const [signals, setSignals]               = useState<SignalEnvelope[]>([])
   const [signalsLoading, setSignalsLoading] = useState(true)
 
-  // v27ay-fix2: per-signal dispositions (dismiss / acted-on, day-scoped)
-  const [dispositions, setDispositions]     = useState<DispositionMap>({})
-
   const [refreshing, setRefreshing]         = useState(false)
 
-  const loadAll = useCallback(async (forceRefresh: boolean = false) => {
+  const loadAll = useCallback(async () => {
     setRefreshing(true)
     setSummaryLoading(true); setHealthLoading(true); setFeeLoading(true)
     setSectorLoading(true); setMoversLoading(true)
     setHouseViewsLoading(true); setPulseLoading(true)
     setSignalsLoading(true)
 
-    // v27ax-fix4: localStorage cache for signals — once-per-day per browser
-    // unless the Refresh button passes forceRefresh=true. Bypassed if cache
-    // is corrupt, expired, or absent.
-    const _v27axFix4_todayIso = new Date().toISOString().slice(0, 10)
-    const _v27axFix4_cacheKey = 'cockpit-signals-cache-v1'
-    let _v27axFix4_cachedSignals: any = null
-    if (!forceRefresh) {
-      try {
-        const raw = localStorage.getItem(_v27axFix4_cacheKey)
-        if (raw) {
-          const parsed = JSON.parse(raw)
-          if (parsed && parsed.as_of_date === _v27axFix4_todayIso
-              && Array.isArray(parsed.signals)) {
-            _v27axFix4_cachedSignals = parsed
-          }
-        }
-      } catch { /* corrupt cache — ignore, fetch fresh */ }
-    }
-    const _v27axFix4_signalsFetch = _v27axFix4_cachedSignals
-      ? Promise.resolve(_v27axFix4_cachedSignals)
-      : fetch('/api/cockpit/signals').then(r => r.json())
-
-    // v27ay-fix2: dispositions always fetched fresh (no client cache); they
-    // toggle frequently and Supabase is the source of truth.
-    const _v27ayFix2_dispoFetch = fetch(
-      '/api/cockpit/signal-dispositions?as_of_date=' + todayIsoDate()
-    ).then(r => r.json())
-
-    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes, dispoRes] = await Promise.allSettled([
+    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
       fetch('/api/cockpit/health').then(r => r.json()),
       fetch('/api/cockpit/fee-outlook').then(r => r.json()),
@@ -141,8 +108,7 @@ export default function CockpitPage() {
       fetch('/api/cockpit/top-movers').then(r => r.json()),
       fetch('/api/cockpit/house-views').then(r => r.json()),
       fetch('/api/cockpit/watchlist-pulse').then(r => r.json()),
-      _v27axFix4_signalsFetch,
-      _v27ayFix2_dispoFetch,
+      fetch('/api/cockpit/signals').then(r => r.json()),
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -169,64 +135,11 @@ export default function CockpitPage() {
     if (sigRes.status === 'fulfilled' && !sigRes.value.error
         && Array.isArray(sigRes.value.signals)) {
       setSignals(sigRes.value.signals as SignalEnvelope[])
-      // v27ax-fix4: persist to cache only if this was a fresh fetch
-      // (not from cache, no error, signals array present)
-      if (!_v27axFix4_cachedSignals) {
-        try {
-          localStorage.setItem(_v27axFix4_cacheKey, JSON.stringify({
-            as_of_date: _v27axFix4_todayIso,
-            signals: sigRes.value.signals,
-          }))
-        } catch { /* localStorage full or disabled — silently ignore */ }
-      }
     }
     setSignalsLoading(false)
 
-    // v27ay-fix2: apply dispositions response (silent fallback to empty)
-    if (dispoRes.status === 'fulfilled' && !dispoRes.value.error
-        && dispoRes.value.dispositions
-        && typeof dispoRes.value.dispositions === 'object') {
-      setDispositions(dispoRes.value.dispositions as DispositionMap)
-    }
-
     setRefreshing(false)
   }, [])
-
-  // v27ay-fix2: optimistic disposition toggle. UI updates immediately;
-  // POST persists to Supabase. On error, reverts and console.errors.
-  const handleDispositionChange = useCallback(
-    async (signalId: string, disposition: Disposition | null) => {
-      const prev = dispositions[signalId]
-      setDispositions(curr => {
-        const next = { ...curr }
-        if (disposition === null) delete next[signalId]
-        else next[signalId] = disposition
-        return next
-      })
-      try {
-        const r = await fetch('/api/cockpit/signal-dispositions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            signal_id:   signalId,
-            as_of_date:  todayIsoDate(),
-            disposition: disposition,
-          }),
-        })
-        const json = await r.json()
-        if (!r.ok || json.error) throw new Error(json.error || 'POST failed')
-      } catch (err) {
-        console.error('[v27ay-fix2] disposition POST failed, reverting:', err)
-        setDispositions(curr => {
-          const next = { ...curr }
-          if (prev === undefined) delete next[signalId]
-          else next[signalId] = prev
-          return next
-        })
-      }
-    },
-    [dispositions],
-  )
 
   useEffect(() => { loadAll() }, [loadAll])
 
@@ -264,7 +177,7 @@ export default function CockpitPage() {
               <span className="btn-h" style={{ pointerEvents: 'none', opacity: 0.85 }}>
                 {today}
               </span>
-              <button className="btn-h" onClick={() => loadAll(true)} disabled={refreshing}>
+              <button className="btn-h" onClick={loadAll} disabled={refreshing}>
                 <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
                 {refreshing ? 'Refreshing…' : 'Refresh'}
               </button>
@@ -272,13 +185,7 @@ export default function CockpitPage() {
           </div>
 
           {/* v27ax: signals — what demands attention today */}
-          {/* v27ay-fix2: + per-signal disposition toggle (dismiss / acted-on) */}
-          <SignalsPanel
-            signals={signals}
-            loading={signalsLoading}
-            dispositions={dispositions}
-            onDispositionChange={handleDispositionChange}
-          />
+          <SignalsPanel signals={signals} loading={signalsLoading} />
 
           {/* KPI strip */}
           <CockpitKPIStrip
