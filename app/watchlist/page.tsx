@@ -9,6 +9,13 @@ import {
 } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
 
+// v27ax-fix5: opt out of static pre-rendering. useSearchParams (added in
+// fix4) requires either a <Suspense> wrapper or this directive, otherwise
+// `next build` fails during static page generation. The watchlist page
+// is a fully client-side admin surface with no SEO benefit, so dynamic
+// rendering is the right call.
+export const dynamic = 'force-dynamic'
+
 // v20e: Hybrid rewrite of NGX Master Watchlist.
 // Preserves:
 //   • Internal two-pane layout (section tabs left · items right)
