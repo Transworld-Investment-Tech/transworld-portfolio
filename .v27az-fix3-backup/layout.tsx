@@ -1,12 +1,13 @@
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/layout.tsx (v27az-fix3)
+// app/instrument/[ticker]/layout.tsx (v27az)
 // ═══════════════════════════════════════════════════════════════
 //
-// v27az-fix3: the outer flex container now explicitly sets
-// `background: var(--bg)` (cream parchment from the hybrid design
-// v3 lock). v27az-fix1 left the bg unset, assuming the body bg
-// would propagate — in production the body bg is dark navy and
-// shows through unless each route explicitly paints over it.
+// Mirrors app/portfolio/[id]/layout.tsx pattern: server component
+// that mounts the Sidebar. Sidebar.tsx is itself a client component
+// that self-fetches its own data (latest price date, etc.), so we
+// just render it without props. The instrument route is not tied
+// to a single portfolio, so portfolio-scoped sidebar props are
+// intentionally absent.
 // ═══════════════════════════════════════════════════════════════
 
 import Sidebar from '@/components/shared/Sidebar'
@@ -17,17 +18,9 @@ export default function InstrumentLayout({
   children: React.ReactNode
 }) {
   return (
-    <div style={{
-      display: 'flex',
-      minHeight: '100vh',
-      background: 'var(--bg)',
-    }}>
+    <div style={{ display: 'flex', minHeight: '100vh' }}>
       <Sidebar />
-      <div style={{
-        flex: 1,
-        overflow: 'auto',
-        background: 'var(--bg)',
-      }}>
+      <div style={{ flex: 1, overflow: 'auto' }}>
         {children}
       </div>
     </div>

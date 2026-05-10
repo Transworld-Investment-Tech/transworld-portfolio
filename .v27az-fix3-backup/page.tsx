@@ -6,44 +6,36 @@ import Link from 'next/link'
 import { RefreshCw, ArrowLeft, Star } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27az-fix3)
+// app/instrument/[ticker]/page.tsx (v27az)
 // ═══════════════════════════════════════════════════════════════
 //
 // Per-instrument detail page. Canonical landing target for any
-// ticker click-through (cockpit panels, holdings tables, etc.).
+// ticker click-through in the app (cockpit panels, holdings tables,
+// transactions tables, future searches, etc.).
 //
-// v27az-fix3 visual fixes:
-//   1. <main> now explicitly sets `background: var(--bg)` — v27az
-//      page rendered on a dark navy bg in production because the
-//      route inherited body bg and never painted cream over it.
-//   2. Panel/KPI cards now use the real hybrid-design CSS vars
-//      ('--card' for fill, '--border' for outline). v27az-fix1 used
-//      a non-existent var name whose fallback color was close-but-wrong.
-//   3. KPI cards now have the 32px × 2px gold accent bar at top-left
-//      that the hybrid design v3 reference specifies.
-//   4. Panel titles now italic Cormorant, matching design v3.
-//   5. Border-radius standardised to 5px (design v3 spec).
-//   6. Panel header pattern aligned: 14px bottom padding on header,
-//      18px margin-bottom, border-bottom var(--border-soft).
-//
-// Surfaces unchanged:
-//   • Instrument metadata + price + day change in header
-//   • Watchlist status chip
+// Surfaces:
+//   • Instrument metadata + latest price + day change
+//   • Watchlist status badge (positive/neutral chip)
 //   • 4-card KPI strip
-//   • Holders table
-//   • Recent Transactions table
-//   • Friendly empty state for unknown tickers
+//   • Holders table (every active portfolio holding this instrument)
+//   • Recent transactions firm-wide (last 20 non-FEE)
 //
-// Deferred to v27ba/v27bb unchanged.
+// Deferred to v27ba:
+//   12mo price chart, dividend history, FI metadata block, peer
+//   sector context, yield curve placement, watchlist row + portfolio
+//   Holdings/Transactions row rewires.
+//
+// Deferred to v27bb:
+//   Claude-powered commentary panel, sidebar "Focus list" nav addition.
 // ═══════════════════════════════════════════════════════════════
 
 interface InstrumentResp {
   instrument?: {
     instrument_id: string
     name:          string
-    sleeve_id:     string | null
-    asset_class:   string | null
-    type:          string | null
+    sleeve_id:     string
+    asset_class:   string
+    type:          string
     sector:        string | null
     ngx_symbol:    string | null
     ngx_market:    string | null
@@ -107,7 +99,7 @@ interface InstrumentResp {
   ticker?: string
 }
 
-// ─── Formatting helpers ─────────────────────────────────────────
+// ─── Formatting helpers (pitfall #73) ───────────────────────────
 
 function fmtNgnM(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
@@ -192,7 +184,7 @@ export default function InstrumentPage() {
   // ─── Loading state ────────────────────────────────────────────
   if (loading) {
     return (
-      <main style={mainStyle}>
+      <main style={{ padding: '32px 44px 64px', maxWidth: '100%' }}>
         <div style={{ color: 'var(--text-3)', fontSize: 12 }}>Loading {ticker}…</div>
       </main>
     )
@@ -201,24 +193,30 @@ export default function InstrumentPage() {
   // ─── Not-found state ──────────────────────────────────────────
   if (data?.error === 'not_found' || !data?.instrument) {
     return (
-      <main style={mainStyle}>
-        <div style={crumbStyle}>Transworld Investment and Securities</div>
+      <main style={{ padding: '32px 44px 64px', maxWidth: '100%' }}>
+        <div className="eyebrow" style={{
+          marginBottom: 10,
+          fontSize: 10,
+          letterSpacing: '0.18em',
+          textTransform: 'uppercase',
+          color: 'var(--gold)',
+          fontWeight: 600,
+        }}>
+          Transworld Investment and Securities
+        </div>
         <h1 style={{
-          fontFamily: '"Cormorant Garamond", Georgia, serif',
+          fontFamily: 'var(--font-serif, "Cormorant Garamond", Georgia, serif)',
           fontWeight: 500,
           fontSize: 36,
-          letterSpacing: '-0.005em',
-          lineHeight: 1,
-          color: 'var(--text)',
           marginBottom: 24,
         }}>
           {ticker}
         </h1>
         <div style={{
           padding: 32,
-          background: 'var(--card)',
-          border: '1px solid var(--border)',
-          borderRadius: 5,
+          background: 'var(--panel-bg, #fcfaf5)',
+          border: '1px solid var(--border, rgba(0,0,0,0.08))',
+          borderRadius: 6,
           textAlign: 'center',
           color: 'var(--text-2)',
         }}>
@@ -255,21 +253,30 @@ export default function InstrumentPage() {
   const totalCostBasis = holders.reduce((s, h) => s + (h.cost_basis_ngn ?? 0), 0)
 
   return (
-    <main style={mainStyle}>
+    <main style={{ padding: '32px 44px 64px', maxWidth: '100%' }}>
 
-      {/* ─── Page header (matches hybrid design v3 portfolio header) ── */}
+      {/* ─── Page header ──────────────────────────────────────── */}
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
         alignItems: 'flex-end',
-        paddingBottom: 22,
-        borderBottom: '1px solid var(--border)',
-        marginBottom: 28,
+        paddingBottom: 24,
+        borderBottom: '1px solid var(--border, rgba(0,0,0,0.08))',
+        marginBottom: 24,
       }}>
         <div>
-          <div style={crumbStyle}>Transworld Investment and Securities</div>
+          <div style={{
+            marginBottom: 10,
+            fontSize: 10,
+            letterSpacing: '0.18em',
+            textTransform: 'uppercase',
+            color: 'var(--gold)',
+            fontWeight: 600,
+          }}>
+            Transworld Investment and Securities
+          </div>
           <h1 style={{
-            fontFamily: '"Cormorant Garamond", Georgia, serif',
+            fontFamily: 'var(--font-serif, "Cormorant Garamond", Georgia, serif)',
             fontSize: 36,
             fontWeight: 500,
             letterSpacing: '-0.005em',
@@ -302,90 +309,92 @@ export default function InstrumentPage() {
             onClick={() => load()}
             disabled={refreshing}
             style={{
-              padding: '8px 14px',
-              fontSize: 12,
+              padding: '7px 12px',
+              fontSize: 11,
               fontWeight: 500,
               background: 'transparent',
-              border: '1px solid var(--border-strong, rgba(15,41,71,0.22))',
+              border: '1px solid var(--border, rgba(0,0,0,0.15))',
               color: 'var(--text)',
-              borderRadius: 3,
+              borderRadius: 4,
               cursor: refreshing ? 'wait' : 'pointer',
               display: 'inline-flex',
               alignItems: 'center',
               gap: 6,
-              fontFamily: '"DM Sans", system-ui, sans-serif',
             }}
           >
             <RefreshCw
               size={12}
-              style={refreshing ? { animation: 'spin-instrument 1s linear infinite' } : undefined}
+              style={refreshing ? { animation: 'spin 1s linear infinite' } : undefined}
             />
             {refreshing ? 'Refreshing…' : 'Refresh'}
           </button>
         </div>
       </div>
 
-      {/* ─── KPI strip with gold accent bars ────────────────────── */}
+      {/* ─── KPI strip ────────────────────────────────────────── */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
-        gap: 14,
-        marginBottom: 28,
+        gap: 12,
+        marginBottom: 20,
       }}>
-        <KpiCard label="Current Price" value={fmtPrice(price.current_price)}>
+        <div style={kpiCardStyle}>
+          <div style={kpiLabelStyle}>Current Price</div>
+          <div style={kpiValueStyle}>{fmtPrice(price.current_price)}</div>
           <div style={{ fontSize: 11, color: dayChangeColor, marginTop: 4 }}>
             {fmtPctSigned(dayChangePct)} ({fmtNgn(dayChangeNgn)})
           </div>
           <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
             as of {fmtDate(price.price_date)}
           </div>
-        </KpiCard>
+        </div>
 
-        <KpiCard
-          label="Held By"
-          value={
-            <>
-              {concentration.mandate_count}
-              <span style={{ fontSize: 14, color: 'var(--text-2)', marginLeft: 6 }}>
-                {concentration.mandate_count === 1 ? 'mandate' : 'mandates'}
-              </span>
-            </>
-          }
-        >
+        <div style={kpiCardStyle}>
+          <div style={kpiLabelStyle}>Held By</div>
+          <div style={kpiValueStyle}>
+            {concentration.mandate_count}
+            <span style={{ fontSize: 14, color: 'var(--text-2)', marginLeft: 6 }}>
+              {concentration.mandate_count === 1 ? 'mandate' : 'mandates'}
+            </span>
+          </div>
           <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
             {fmtQty(concentration.total_qty)} shares firm-wide
           </div>
-        </KpiCard>
+        </div>
 
-        <KpiCard label="Firm NGN Exposure" value={fmtNgnM(concentration.firm_value_ngn)}>
+        <div style={kpiCardStyle}>
+          <div style={kpiLabelStyle}>Firm NGN Exposure</div>
+          <div style={kpiValueStyle}>{fmtNgnM(concentration.firm_value_ngn)}</div>
           <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
             cost {fmtNgnM(totalCostBasis)}
           </div>
-        </KpiCard>
+        </div>
 
-        <KpiCard label="% of Firm AUM" value={fmtPct(concentration.pct_of_firm_aum)}>
+        <div style={kpiCardStyle}>
+          <div style={kpiLabelStyle}>% of Firm AUM</div>
+          <div style={kpiValueStyle}>{fmtPct(concentration.pct_of_firm_aum)}</div>
           <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
             {fmtPct(concentration.pct_of_firm_sleeve_exposure)} of firm {concentration.sleeve_label}
           </div>
-        </KpiCard>
+        </div>
       </div>
 
       {/* ─── Watchlist chip ──────────────────────────────────── */}
-      <div style={{ marginBottom: 20 }}>
+      <div style={{ marginBottom: 24 }}>
         {wl.is_watchlisted ? (
           <span style={{
             display: 'inline-flex',
             alignItems: 'center',
-            padding: '4px 10px',
-            background: 'rgba(45, 110, 78, 0.12)',
+            padding: '6px 12px',
+            background: 'rgba(45, 110, 78, 0.10)',
             color: 'var(--pos)',
-            borderRadius: 2,
-            fontSize: 9,
-            fontWeight: 600,
-            letterSpacing: '0.14em',
-            textTransform: 'uppercase',
+            border: '1px solid rgba(45, 110, 78, 0.25)',
+            borderRadius: 4,
+            fontSize: 12,
+            fontWeight: 500,
+            letterSpacing: '0.04em',
           }}>
-            <Star size={9} fill="currentColor" stroke="currentColor" style={{ marginRight: 6 }} />
+            <Star size={11} fill="currentColor" stroke="currentColor" style={{ marginRight: 6 }} />
             On watchlist
             {wl.section ? ' · ' + wl.section : ''}
             {wl.sub_type ? ' / ' + wl.sub_type : ''}
@@ -394,14 +403,14 @@ export default function InstrumentPage() {
           <span style={{
             display: 'inline-flex',
             alignItems: 'center',
-            padding: '4px 10px',
-            background: 'rgba(15, 41, 71, 0.04)',
+            padding: '6px 12px',
+            background: 'rgba(0,0,0,0.04)',
             color: 'var(--text-3)',
-            borderRadius: 2,
-            fontSize: 9,
-            fontWeight: 600,
-            letterSpacing: '0.14em',
-            textTransform: 'uppercase',
+            border: '1px solid var(--border, rgba(0,0,0,0.08))',
+            borderRadius: 4,
+            fontSize: 12,
+            fontWeight: 500,
+            letterSpacing: '0.04em',
           }}>
             Not on watchlist
           </span>
@@ -409,15 +418,17 @@ export default function InstrumentPage() {
       </div>
 
       {/* ─── Holders panel ───────────────────────────────────── */}
-      <Panel
-        title={`Holders (${holders.length})`}
-        meta={holders.length > 0
-          ? `${fmtQty(concentration.total_qty)} shares · ${fmtNgnM(concentration.firm_value_ngn)}`
-          : null
-        }
-      >
+      <div style={panelStyle}>
+        <div style={panelHeaderStyle}>
+          <div style={panelTitleStyle}>Holders ({holders.length})</div>
+          {holders.length > 0 ? (
+            <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+              {fmtQty(concentration.total_qty)} shares · {fmtNgnM(concentration.firm_value_ngn)}
+            </div>
+          ) : null}
+        </div>
         {holders.length === 0 ? (
-          <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0' }}>
+          <div style={{ padding: 18, color: 'var(--text-3)', fontSize: 12 }}>
             No active mandates currently hold {inst.instrument_id}.
           </div>
         ) : (
@@ -453,10 +464,9 @@ export default function InstrumentPage() {
                     <td style={tdRight}>{fmtPrice(h.latest_price)}</td>
                     <td style={{
                       ...tdRight,
-                      fontFamily: '"Cormorant Garamond", Georgia, serif',
-                      fontSize: 16,
+                      fontFamily: 'var(--font-serif, "Cormorant Garamond", Georgia, serif)',
+                      fontSize: 14,
                       fontWeight: 500,
-                      letterSpacing: '-0.005em',
                     }}>
                       {fmtNgnM(h.market_value_ngn)}
                     </td>
@@ -473,81 +483,82 @@ export default function InstrumentPage() {
             </tbody>
           </table>
         )}
-      </Panel>
+      </div>
 
       {/* ─── Recent transactions panel ───────────────────────── */}
-      <div style={{ marginTop: 20 }}>
-        <Panel
-          title={`Recent Transactions (${transactions.length})`}
-          meta="Last 20 firm-wide · excludes fees"
-        >
-          {transactions.length === 0 ? (
-            <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0' }}>
-              No transactions on record for {inst.instrument_id}.
-            </div>
-          ) : (
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={thLeft}>Date</th>
-                  <th style={thLeft}>Action</th>
-                  <th style={thLeft}>Mandate</th>
-                  <th style={thRight}>Qty</th>
-                  <th style={thRight}>Price</th>
-                  <th style={thRight}>NGN Value</th>
-                  <th style={thLeft}>Narration</th>
+      <div style={{ ...panelStyle, marginTop: 16 }}>
+        <div style={panelHeaderStyle}>
+          <div style={panelTitleStyle}>Recent Transactions ({transactions.length})</div>
+          <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+            Last 20 firm-wide · excludes fees
+          </div>
+        </div>
+        {transactions.length === 0 ? (
+          <div style={{ padding: 18, color: 'var(--text-3)', fontSize: 12 }}>
+            No transactions on record for {inst.instrument_id}.
+          </div>
+        ) : (
+          <table style={tableStyle}>
+            <thead>
+              <tr>
+                <th style={thLeft}>Date</th>
+                <th style={thLeft}>Action</th>
+                <th style={thLeft}>Mandate</th>
+                <th style={thRight}>Qty</th>
+                <th style={thRight}>Price</th>
+                <th style={thRight}>NGN Value</th>
+                <th style={thLeft}>Narration</th>
+              </tr>
+            </thead>
+            <tbody>
+              {transactions.map((t, idx) => (
+                <tr key={idx}>
+                  <td style={tdLeft}>{fmtDate(t.trade_date)}</td>
+                  <td style={tdLeft}>
+                    <span style={{
+                      fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                      fontSize: 10,
+                      fontWeight: 600,
+                      letterSpacing: '0.04em',
+                      color: ACTION_COLOR[t.action] ?? 'var(--text-2)',
+                      padding: '2px 6px',
+                      background: 'rgba(0,0,0,0.03)',
+                      borderRadius: 3,
+                    }}>
+                      {t.action}
+                    </span>
+                  </td>
+                  <td style={tdLeft}>
+                    <Link
+                      href={`/portfolio/${t.portfolio_id}`}
+                      style={{ color: 'var(--gold)', textDecoration: 'none' }}
+                    >
+                      {t.mandate_label}
+                    </Link>
+                  </td>
+                  <td style={tdRight}>{fmtQty(t.qty)}</td>
+                  <td style={tdRight}>{fmtPrice(t.price)}</td>
+                  <td style={tdRight}>{fmtNgn(t.amount)}</td>
+                  <td style={{
+                    ...tdLeft,
+                    color: 'var(--text-2)',
+                    fontSize: 11,
+                    maxWidth: 300,
+                    overflow: 'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace: 'nowrap',
+                  }} title={t.narration}>
+                    {t.narration || '—'}
+                  </td>
                 </tr>
-              </thead>
-              <tbody>
-                {transactions.map((t, idx) => (
-                  <tr key={idx}>
-                    <td style={tdLeft}>{fmtDate(t.trade_date)}</td>
-                    <td style={tdLeft}>
-                      <span style={{
-                        fontFamily: 'var(--font-mono, ui-monospace, monospace)',
-                        fontSize: 10,
-                        fontWeight: 600,
-                        letterSpacing: '0.04em',
-                        color: ACTION_COLOR[t.action] ?? 'var(--text-2)',
-                        padding: '2px 6px',
-                        background: 'rgba(15,41,71,0.04)',
-                        borderRadius: 2,
-                      }}>
-                        {t.action}
-                      </span>
-                    </td>
-                    <td style={tdLeft}>
-                      <Link
-                        href={`/portfolio/${t.portfolio_id}`}
-                        style={{ color: 'var(--gold)', textDecoration: 'none' }}
-                      >
-                        {t.mandate_label}
-                      </Link>
-                    </td>
-                    <td style={tdRight}>{fmtQty(t.qty)}</td>
-                    <td style={tdRight}>{fmtPrice(t.price)}</td>
-                    <td style={tdRight}>{fmtNgn(t.amount)}</td>
-                    <td style={{
-                      ...tdLeft,
-                      color: 'var(--text-2)',
-                      fontSize: 11,
-                      maxWidth: 300,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }} title={t.narration}>
-                      {t.narration || '—'}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
 
       <style jsx>{`
-        @keyframes spin-instrument {
+        @keyframes spin {
           from { transform: rotate(0deg); }
           to { transform: rotate(360deg); }
         }
@@ -556,129 +567,49 @@ export default function InstrumentPage() {
   )
 }
 
-// ─── Sub-components ─────────────────────────────────────────────
+// ─── Style constants ────────────────────────────────────────────
 
-function KpiCard({
-  label,
-  value,
-  children,
-}: {
-  label:    string
-  value:    React.ReactNode
-  children?: React.ReactNode
-}) {
-  return (
-    <div style={{
-      background: 'var(--card)',
-      border: '1px solid var(--border)',
-      borderRadius: 5,
-      padding: '20px 22px',
-      position: 'relative',
-      overflow: 'hidden',
-    }}>
-      {/* 32px × 2px gold accent bar at top-left — design v3 hallmark */}
-      <div style={{
-        position: 'absolute',
-        top: 0,
-        left: 0,
-        width: 32,
-        height: 2,
-        background: 'var(--gold)',
-      }} />
-      <div style={{
-        fontSize: 10,
-        letterSpacing: '0.16em',
-        fontWeight: 600,
-        color: 'var(--text-3)',
-        textTransform: 'uppercase',
-        marginBottom: 14,
-      }}>
-        {label}
-      </div>
-      <div style={{
-        fontFamily: '"Cormorant Garamond", Georgia, serif',
-        fontSize: 36,
-        fontWeight: 500,
-        letterSpacing: '-0.015em',
-        lineHeight: 1,
-        color: 'var(--text)',
-        marginBottom: 10,
-      }}>
-        {value}
-      </div>
-      {children}
-    </div>
-  )
+const kpiCardStyle: React.CSSProperties = {
+  background: 'var(--panel-bg, #fcfaf5)',
+  border: '1px solid var(--border, rgba(0,0,0,0.08))',
+  borderRadius: 6,
+  padding: 18,
 }
-
-function Panel({
-  title,
-  meta,
-  children,
-}: {
-  title:    string
-  meta?:    string | null
-  children?: React.ReactNode
-}) {
-  return (
-    <div style={{
-      background: 'var(--card)',
-      border: '1px solid var(--border)',
-      borderRadius: 5,
-      padding: '24px 26px',
-    }}>
-      <div style={{
-        display: 'flex',
-        alignItems: 'baseline',
-        justifyContent: 'space-between',
-        paddingBottom: 14,
-        marginBottom: 18,
-        borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
-      }}>
-        <div style={{
-          fontFamily: '"Cormorant Garamond", Georgia, serif',
-          fontStyle: 'italic',
-          fontSize: 18,
-          fontWeight: 500,
-          color: 'var(--text)',
-        }}>
-          {title}
-        </div>
-        {meta ? (
-          <div style={{
-            fontSize: 10,
-            letterSpacing: '0.12em',
-            color: 'var(--text-3)',
-            textTransform: 'uppercase',
-            fontWeight: 600,
-          }}>
-            {meta}
-          </div>
-        ) : null}
-      </div>
-      {children}
-    </div>
-  )
-}
-
-// ─── Shared styles ──────────────────────────────────────────────
-
-const mainStyle: React.CSSProperties = {
-  flex: 1,
-  padding: '32px 44px 64px',
-  maxWidth: '100%',
-  overflowX: 'hidden',
-  background: 'var(--bg)',
-  minHeight: '100vh',
-}
-
-const crumbStyle: React.CSSProperties = {
+const kpiLabelStyle: React.CSSProperties = {
   fontSize: 10,
-  letterSpacing: '0.18em',
   fontWeight: 600,
-  color: 'var(--gold)',
+  letterSpacing: '0.12em',
   textTransform: 'uppercase',
-  marginBottom: 10,
+  color: 'var(--text-3)',
+  marginBottom: 6,
+}
+const kpiValueStyle: React.CSSProperties = {
+  fontFamily: 'var(--font-serif, "Cormorant Garamond", Georgia, serif)',
+  fontSize: 28,
+  fontWeight: 500,
+  letterSpacing: '-0.01em',
+  color: 'var(--text)',
+}
+
+const panelStyle: React.CSSProperties = {
+  background: 'var(--panel-bg, #fcfaf5)',
+  border: '1px solid var(--border, rgba(0,0,0,0.08))',
+  borderRadius: 6,
+  overflow: 'hidden',
+}
+const panelHeaderStyle: React.CSSProperties = {
+  padding: '14px 18px',
+  borderBottom: '1px solid var(--border, rgba(0,0,0,0.08))',
+  display: 'flex',
+  justifyContent: 'space-between',
+  alignItems: 'baseline',
+}
+const panelTitleStyle: React.CSSProperties = {
+  fontFamily: 'var(--font-serif, "Cormorant Garamond", Georgia, serif)',
+  fontSize: 18,
+  fontWeight: 500,
+  letterSpacing: '-0.005em',
+  color: 'var(--text)',
 }
 
 const tableStyle: React.CSSProperties = {
@@ -686,21 +617,21 @@ const tableStyle: React.CSSProperties = {
   borderCollapse: 'collapse',
 }
 const thLeft: React.CSSProperties = {
-  padding: '10px 12px',
+  padding: '10px 14px',
   textAlign: 'left',
-  fontSize: 10,
+  fontSize: 9,
   fontWeight: 600,
   textTransform: 'uppercase',
-  letterSpacing: '0.14em',
+  letterSpacing: '0.12em',
   color: 'var(--text-3)',
-  borderBottom: '1px solid var(--border)',
+  borderBottom: '1px solid var(--border, rgba(0,0,0,0.08))',
 }
 const thRight: React.CSSProperties = { ...thLeft, textAlign: 'right' }
 const tdLeft: React.CSSProperties = {
-  padding: '12px 12px',
+  padding: '10px 14px',
   textAlign: 'left',
   fontSize: 13,
   color: 'var(--text)',
-  borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+  borderBottom: '1px solid var(--border, rgba(0,0,0,0.04))',
 }
-const tdRight: React.CSSProperties = { ...tdLeft, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
+const tdRight: React.CSSProperties = { ...tdLeft, textAlign: 'right' }
