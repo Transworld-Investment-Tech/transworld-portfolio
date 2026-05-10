@@ -29,6 +29,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 import type { SupabaseClient } from '@supabase/supabase-js'
+import { computeCashBalance } from './cash'  // v27aw-fix4: cash-aware cockpit NAV
 
 const numOrNull = (v: unknown): number | null => {
   if (v === null || v === undefined) return null
@@ -305,13 +306,19 @@ export async function computeAllPortfolioNAVs(
 ): Promise<Map<string, number>> {
   if (portfolioIds.length === 0) return new Map()
 
+  // ─── Holdings (securities) ───────────────────────────────────
   const { data: holds } = await db
     .from('holdings')
     .select('portfolio_id, instrument_id, quantity, avg_cost')
     .in('portfolio_id', portfolioIds)
     .limit(50000)
 
-  const allInstr = Array.from(new Set((holds ?? []).map((h: any) => h.instrument_id)))
+  // v27aw-fix4: exclude legacy CASH_NGN holding rows from the securities
+  // sum. Cash is computed from the transaction series below; counting a
+  // CASH_NGN holding here too would double-count for portfolios that
+  // carry both representations.
+  const realHoldings = (holds ?? []).filter((h: any) => h.instrument_id !== 'CASH_NGN')
+  const allInstr = Array.from(new Set(realHoldings.map((h: any) => h.instrument_id)))
 
   const priceMap = new Map<string, number>()
   if (allInstr.length > 0) {
@@ -329,12 +336,47 @@ export async function computeAllPortfolioNAVs(
     }
   }
 
-  const navByPortfolio = new Map<string, number>()
-  for (const h of (holds ?? []) as any[]) {
+  const securitiesByPortfolio = new Map<string, number>()
+  for (const h of realHoldings as any[]) {
     const qty = num(h.quantity)
     const px = priceMap.get(h.instrument_id) ?? num(h.avg_cost)
     const v = qty * px
-    navByPortfolio.set(h.portfolio_id, (navByPortfolio.get(h.portfolio_id) ?? 0) + v)
+    securitiesByPortfolio.set(h.portfolio_id, (securitiesByPortfolio.get(h.portfolio_id) ?? 0) + v)
+  }
+
+  // ─── v27aw-fix4: cash-aware NAV ──────────────────────────────
+  // Pre-fix4 the cockpit Current NAV column showed securities-only.
+  // Cockpit and per-portfolio Overview pages diverged for every
+  // portfolio with a non-zero cash balance — most visibly TRIL-A
+  // (cockpit ₦135.10M vs Overview ₦221.30M, ₦86.20M cash hidden), but
+  // also DON-C (+₦7.44M), CDOO-A (+₦2.12M), CMFB-A (+₦0.30M), etc.
+  // Firmwide AUM was understated by the sum of those gaps.
+  // Bulk-fetch transactions, group by portfolio, run the same
+  // computeCashBalance reducer the per-portfolio surfaces use. The notes
+  // column is included so the v27aw-fix3 in-kind detection operates
+  // here too (otherwise CKNET-A would re-acquire its phantom −₦10.40M
+  // cash debit on the cockpit alone).
+  const { data: txns } = await db
+    .from('transactions')
+    .select('portfolio_id, action, instrument_id, quantity, price, gross_value, amount, fees, fee_management, fee_other, notes')
+    .in('portfolio_id', portfolioIds)
+    .limit(50000)
+
+  const txByPortfolio = new Map<string, any[]>()
+  for (const t of (txns ?? []) as any[]) {
+    const arr = txByPortfolio.get(t.portfolio_id) ?? []
+    arr.push(t)
+    txByPortfolio.set(t.portfolio_id, arr)
+  }
+
+  // Combine: securities + cash per portfolio. Every requested portfolioId
+  // gets an entry (defaulting to 0 + 0) so consumers' `.get(pid) ?? 0`
+  // patterns and `.get(pid)` patterns both behave correctly.
+  const navByPortfolio = new Map<string, number>()
+  for (const pid of portfolioIds) {
+    const securities = securitiesByPortfolio.get(pid) ?? 0
+    const cash = computeCashBalance(txByPortfolio.get(pid) ?? [])
+    navByPortfolio.set(pid, securities + cash)
   }
   return navByPortfolio
 }
