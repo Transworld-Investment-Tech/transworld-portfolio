@@ -22,6 +22,7 @@ export interface CashTxnLike {
   gross_value?:   number | string | null
   amount?:        number | string | null
   fees?:          number | string | null
+  notes?:         string | null  // v27aw-fix3: in-kind detection via marker string
 }
 
 /**
@@ -67,6 +68,18 @@ export function applyCashEvent(currentCash: number, t: CashTxnLike): number {
         // Cash deposit recorded as BUY — no broker fees, principal is the cash credit
         const credit = grossValue > 0 ? grossValue : (amount > 0 ? amount : qty * price)
         return currentCash + credit
+      }
+      // v27aw-fix3: in-kind seed positions added via the Holdings page
+      // "Add Position" UI must NOT debit cash. Those rows represent in-kind
+      // transfers (the security existed before; we're recording it for
+      // tracking), not cash purchases. Pre-fix3 the cash equation counted
+      // them as cash debits, leaving portfolios seeded entirely in-kind
+      // (CKNET-A, CKNET-B) with cash = −starting_nav permanently. The
+      // Holdings page writes a stable notes marker; detect via that string.
+      // No schema change required.
+      const notes = (t.notes ?? '').toString()
+      if (notes.includes('Added via Holdings page')) {
+        return currentCash
       }
       // v27ah: principal + fees. principal = qty × price (= gross_value
       // by importer convention). Trust gross_value when present, fall
