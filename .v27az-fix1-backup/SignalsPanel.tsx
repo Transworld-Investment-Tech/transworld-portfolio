@@ -265,10 +265,11 @@ export default function SignalsPanel({
       return
     }
     if (signal.primary_subject_kind === 'ticker') {
-      // v27az: route to per-instrument detail page (replaces the
-      // v27ax-fix4 /watchlist?ticker= deep-link as the canonical target).
-      // The watchlist deep-link still works as a search shortcut.
-      router.push('/instrument/' + encodeURIComponent(signal.primary_subject))
+      // v27ax-fix4: route to NGX Watchlist with ticker as search param.
+      // The watchlist page (also patched in fix4) reads ?ticker= and
+      // pre-fills its search input so the row is visible on land. A
+      // future per-instrument page (v27ay scope item 3) will replace this.
+      router.push('/watchlist?ticker=' + encodeURIComponent(signal.primary_subject))
       return
     }
   }

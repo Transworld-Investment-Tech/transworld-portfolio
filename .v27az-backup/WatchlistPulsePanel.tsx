@@ -1,7 +1,6 @@
 'use client'
 
 import { useState } from 'react'
-import Link from 'next/link'
 import type { ReactElement, CSSProperties } from 'react'
 import type { WatchlistPulseData, WindowPulse } from '@/lib/cockpit-aggregations'
 
@@ -232,20 +231,15 @@ export default function WatchlistPulsePanel({ loading, data }: Props): ReactElem
             return (
               <tr key={row.ticker}>
                 <td style={tdLeft}>
-                  <Link
-                    href={`/instrument/${row.ticker}`}
-                    title={`Open ${row.ticker} detail`}
-                    style={{
-                      fontFamily: 'var(--font-mono, ui-monospace, monospace)',
-                      color: 'var(--gold)',
-                      fontWeight: 600,
-                      fontSize: 12,
-                      letterSpacing: '0.02em',
-                      textDecoration: 'none',
-                    }}
-                  >
+                  <span style={{
+                    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                    color: 'var(--gold)',
+                    fontWeight: 600,
+                    fontSize: 12,
+                    letterSpacing: '0.02em',
+                  }}>
                     {row.ticker}
-                  </Link>
+                  </span>
                 </td>
                 <td style={tdLeft}>
                   <span style={{ color: 'var(--text)' }}>{row.name}</span>

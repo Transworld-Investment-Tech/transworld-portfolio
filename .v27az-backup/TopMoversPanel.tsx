@@ -1,7 +1,6 @@
 'use client'
 
 import { useState } from 'react'
-import Link from 'next/link'
 import type { ReactElement } from 'react'
 import { TrendingUp, TrendingDown, AlertCircle } from 'lucide-react'
 import type { TopMoversData, MoverRow, WindowMovers } from '@/lib/cockpit-aggregations'
@@ -82,20 +81,15 @@ function MoverList({ rows, kind }: { rows: MoverRow[]; kind: 'gain' | 'loss' }):
             }}
           >
             <div style={{ minWidth: 0 }}>
-              <Link
-              href={`/instrument/${r.instrument_id}`}
-              title={`Open ${r.instrument_id} detail`}
-              style={{
+              <div style={{
                 fontFamily: 'var(--font-mono)',
                 fontSize: 12,
                 fontWeight: 600,
                 color: 'var(--gold)',
                 letterSpacing: '0.02em',
-                textDecoration: 'none',
-                display: 'block',
               }}>
                 {r.instrument_id}
-              </Link>
+              </div>
               <div style={{
                 fontSize: 11,
                 color: 'var(--text-2)',

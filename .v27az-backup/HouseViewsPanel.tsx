@@ -62,20 +62,15 @@ export default function HouseViewsPanel({ loading, data }: Props): ReactElement 
           {data.rows.map(row => (
             <tr key={row.instrument_id}>
               <td style={tdLeft}>
-                <Link
-                  href={`/instrument/${row.instrument_id}`}
-                  title={`Open ${row.instrument_id} detail`}
-                  style={{
-                    fontFamily: 'var(--font-mono, ui-monospace, monospace)',
-                    color: 'var(--gold)',
-                    fontWeight: 600,
-                    fontSize: 12,
-                    letterSpacing: '0.02em',
-                    textDecoration: 'none',
-                  }}
-                >
+                <span style={{
+                  fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                  color: 'var(--gold)',
+                  fontWeight: 600,
+                  fontSize: 12,
+                  letterSpacing: '0.02em',
+                }}>
                   {row.instrument_id}
-                </Link>
+                </span>
               </td>
               <td style={tdLeft}>
                 <span style={{ color: 'var(--text)' }}>{row.name}</span>
