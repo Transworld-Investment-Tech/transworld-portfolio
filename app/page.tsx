@@ -93,12 +93,34 @@ export default function CockpitPage() {
 
   const [refreshing, setRefreshing]         = useState(false)
 
-  const loadAll = useCallback(async () => {
+  const loadAll = useCallback(async (forceRefresh: boolean = false) => {
     setRefreshing(true)
     setSummaryLoading(true); setHealthLoading(true); setFeeLoading(true)
     setSectorLoading(true); setMoversLoading(true)
     setHouseViewsLoading(true); setPulseLoading(true)
     setSignalsLoading(true)
+
+    // v27ax-fix4: localStorage cache for signals — once-per-day per browser
+    // unless the Refresh button passes forceRefresh=true. Bypassed if cache
+    // is corrupt, expired, or absent.
+    const _v27axFix4_todayIso = new Date().toISOString().slice(0, 10)
+    const _v27axFix4_cacheKey = 'cockpit-signals-cache-v1'
+    let _v27axFix4_cachedSignals: any = null
+    if (!forceRefresh) {
+      try {
+        const raw = localStorage.getItem(_v27axFix4_cacheKey)
+        if (raw) {
+          const parsed = JSON.parse(raw)
+          if (parsed && parsed.as_of_date === _v27axFix4_todayIso
+              && Array.isArray(parsed.signals)) {
+            _v27axFix4_cachedSignals = parsed
+          }
+        }
+      } catch { /* corrupt cache — ignore, fetch fresh */ }
+    }
+    const _v27axFix4_signalsFetch = _v27axFix4_cachedSignals
+      ? Promise.resolve(_v27axFix4_cachedSignals)
+      : fetch('/api/cockpit/signals').then(r => r.json())
 
     const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
@@ -108,7 +130,7 @@ export default function CockpitPage() {
       fetch('/api/cockpit/top-movers').then(r => r.json()),
       fetch('/api/cockpit/house-views').then(r => r.json()),
       fetch('/api/cockpit/watchlist-pulse').then(r => r.json()),
-      fetch('/api/cockpit/signals').then(r => r.json()),
+      _v27axFix4_signalsFetch,
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -135,6 +157,16 @@ export default function CockpitPage() {
     if (sigRes.status === 'fulfilled' && !sigRes.value.error
         && Array.isArray(sigRes.value.signals)) {
       setSignals(sigRes.value.signals as SignalEnvelope[])
+      // v27ax-fix4: persist to cache only if this was a fresh fetch
+      // (not from cache, no error, signals array present)
+      if (!_v27axFix4_cachedSignals) {
+        try {
+          localStorage.setItem(_v27axFix4_cacheKey, JSON.stringify({
+            as_of_date: _v27axFix4_todayIso,
+            signals: sigRes.value.signals,
+          }))
+        } catch { /* localStorage full or disabled — silently ignore */ }
+      }
     }
     setSignalsLoading(false)
 
@@ -177,7 +209,7 @@ export default function CockpitPage() {
               <span className="btn-h" style={{ pointerEvents: 'none', opacity: 0.85 }}>
                 {today}
               </span>
-              <button className="btn-h" onClick={loadAll} disabled={refreshing}>
+              <button className="btn-h" onClick={() => loadAll(true)} disabled={refreshing}>
                 <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
                 {refreshing ? 'Refreshing…' : 'Refresh'}
               </button>

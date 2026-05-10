@@ -413,8 +413,8 @@ function fireWatchlistOpportunity(input: SignalsInput): Signal[] {
         is_unheld:               true,
       },
       suggested_action: direction === 'up'
-        ? 'Confirm thesis on ' + row.ticker + ' — rally on conviction or chase risk'
-        : 'Confirm thesis on ' + row.ticker + ' — entry opportunity or signal to skip',
+        ? row.ticker + ' rallied ' + fmtSignedPct(change) + ' today. Decide whether the thesis still supports adding here, or treat as priced-in and skip'
+        : row.ticker + ' fell ' + fmtSignedPct(change) + ' today. Decide whether this is a buyable dislocation or a thesis-breaking signal',
       ranking_score: Math.abs(change) * (corroboratorA && corroboratorB ? 2 : 1),
     })
   }

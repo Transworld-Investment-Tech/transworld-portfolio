@@ -1,4 +1,6 @@
 'use client'
+
+import { useSearchParams } from 'next/navigation'
 import { useEffect, useState, useCallback, useMemo } from 'react'
 import {
   Search, Plus, Trash2, Edit3, Save, X, Eye, BookOpen,
@@ -157,6 +159,15 @@ export default function WatchlistPage() {
   const [loading,     setLoading]     = useState(true)
   const [section,     setSection]     = useState<Section>('all')
   const [search,      setSearch]      = useState('')
+
+  // v27ax-fix4: deep-link from cockpit signals — ?ticker=ARADEL pre-fills
+  // the search input so the row is visible on land. Effect runs once on
+  // mount (or when params change in-tab navigation).
+  const _v27axFix4_searchParams = useSearchParams()
+  useEffect(() => {
+    const tickerParam = _v27axFix4_searchParams?.get('ticker')
+    if (tickerParam) setSearch(tickerParam)
+  }, [_v27axFix4_searchParams])
   const [subFilter,   setSubFilter]   = useState('')
   const [expanded,    setExpanded]    = useState<string | null>(null)
   const [editingId,   setEditingId]   = useState<string | null>(null)

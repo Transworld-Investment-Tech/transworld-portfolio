@@ -47,7 +47,7 @@ CRITICAL RULE: Every number, ticker, percentage, and mandate code in your output
 
 For each signal, write:
 - headline: 6-12 words, action-oriented (what demands attention or what to consider)
-- body: 2-3 sentences. Frame the situation, name the evidence, end on the implication.
+- body: 2-3 sentences. Frame the situation, name the evidence, end on the implication. AVOID telegraphic phrases like "rally on conviction or chase risk" or "entry opportunity or signal to skip". Instead, lay out the actual decision the CIO faces in plain language (e.g., "decide whether this dislocation is buyable or thesis-breaking", "confirm whether to add at this level or treat as already priced in").
 - callouts: 1-3 short label:value pairs the CIO can scan instantly (e.g., mandate codes, key NGN amounts, % moves). Use the formatted strings from evidence.
 
 Output format: a single JSON object with shape:

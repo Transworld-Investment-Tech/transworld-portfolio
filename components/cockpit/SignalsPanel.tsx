@@ -156,11 +156,11 @@ export default function SignalsPanel({ signals, loading }: SignalsPanelProps) {
       return
     }
     if (signal.primary_subject_kind === 'ticker') {
-      // Best-effort: route to instrument page if it exists; otherwise
-      // do nothing visible. The cockpit page surfaces tickers in many
-      // panels — over time the canonical ticker landing page can be
-      // wired here.
-      router.push('/admin/instruments/' + signal.primary_subject)
+      // v27ax-fix4: route to NGX Watchlist with ticker as search param.
+      // The watchlist page (also patched in fix4) reads ?ticker= and
+      // pre-fills its search input so the row is visible on land. A
+      // future per-instrument page (v27ay scope) will replace this.
+      router.push('/watchlist?ticker=' + encodeURIComponent(signal.primary_subject))
       return
     }
   }
