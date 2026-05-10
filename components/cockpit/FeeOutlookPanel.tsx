@@ -4,10 +4,21 @@ import Link from 'next/link'
 import type { ReactElement } from 'react'
 import type { FeeOutlook, FeeStatus } from '@/lib/fee-outlook'
 
-// v27 — Fee Outlook table
+// v27aw — Fee Outlook table
 //
 // Sorted by excess_ngn ASC (most-at-risk-of-zero-fee first). Internal
 // portfolios sink to the bottom and are visually de-emphasised.
+//
+// Year-end fee column shows TWO numbers stacked:
+//   - Primary (gold):  projected_year_end_fee  → what fee crystallises at
+//                      fee_year_end if NAV is held flat from today
+//   - Secondary (gray): "of ₦X crystallised"   → engine ground truth from
+//                      fee_periods.fee_earned (latest pending row)
+//
+// The CIO sees "fee tracking to be billed Dec 31" alongside "fee that would be
+// billable today if billed today". Gap between them tells the threshold-vs-NAV
+// dynamic — if projection > crystallised, NAV is racing the threshold; if
+// crystallised > projection, the threshold is catching up faster than NAV.
 
 interface Props {
   loading: boolean
@@ -34,9 +45,10 @@ function statusPill(status: FeeStatus): { label: string; cls: string } {
     case 'at_risk':       return { label: 'At risk',     cls: 'pill-warn' }
     case 'below':         return { label: 'Below',       cls: 'pill-breach' }
     case 'no_basis':      return { label: 'No basis',    cls: 'pill-hold' }
-    // v27ao: fee-architecture-aware statuses
     case 'fixed_annual':  return { label: 'Fixed fee',   cls: 'pill-ok' }
     case 'no_fee':        return { label: 'No fee',      cls: 'pill-hold' }
+    // v27aw: unanchored fee-bearing portfolios
+    case 'unanchored':    return { label: 'Unanchored',  cls: 'pill-hold' }
   }
 }
 
@@ -65,7 +77,13 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
           <th className="num">Target NAV</th>
           <th className="num">Excess</th>
           <th className="num">Excess %</th>
-          <th className="num">Projected fee</th>
+          <th className="num">
+            Year-end fee
+            <br />
+            <span style={{ fontWeight: 400, color: 'var(--text-3)', fontSize: 10 }}>
+              (NAV held flat)
+            </span>
+          </th>
           <th>Status</th>
           <th className="num">Days left</th>
         </tr>
@@ -75,8 +93,39 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
           const sp = statusPill(row.status)
           const excessColor = row.excess_ngn >= 0 ? 'var(--pos)' : 'var(--neg)'
           const opacity = row.is_internal ? 0.5 : 1
-          // v27ao: noMath = true when no performance math applies to this row
-          const noMath = !!row.is_fixed_annual || row.status === 'no_fee'
+          // noMath = true when no performance metrics apply to this row
+          const noMath = !!row.is_fixed_annual
+            || row.status === 'no_fee'
+            || row.status === 'unanchored'
+
+          // Year-end fee column rendering: stacked display
+          let yearEndFeeCell: ReactElement
+          if (row.is_fixed_annual) {
+            yearEndFeeCell = (
+              <div>
+                <div style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_year_end_fee)}</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                  YTD {fmtNgnM(row.crystallised_ytd_fee)}
+                </div>
+              </div>
+            )
+          } else if (row.status === 'no_fee' || row.status === 'unanchored') {
+            yearEndFeeCell = <span style={{ color: 'var(--text-3)' }}>—</span>
+          } else if (row.projected_year_end_fee > 0 || row.crystallised_ytd_fee > 0) {
+            yearEndFeeCell = (
+              <div>
+                <div style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_year_end_fee)}</div>
+                <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
+                  {row.crystallised_ytd_fee > 0
+                    ? `of ${fmtNgnM(row.crystallised_ytd_fee)} crystallised`
+                    : 'no crystallised'}
+                </div>
+              </div>
+            )
+          } else {
+            yearEndFeeCell = <span style={{ color: 'var(--text-3)' }}>—</span>
+          }
+
           return (
             <tr key={row.portfolio_id} style={{ opacity }}>
               <td>
@@ -88,15 +137,15 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
                     {row.client_code} — {row.portfolio_name}
                     {row.is_internal && (
                       <span style={{
-                        fontSize: 9,
-                        color: 'var(--gold)',
-                        fontWeight: 600,
-                        letterSpacing: '0.1em',
-                        marginLeft: 6,
-                        textTransform: 'uppercase',
-                      }}>
-                        Internal
-                      </span>
+                        fontSize: 9, color: 'var(--gold)', fontWeight: 600,
+                        letterSpacing: '0.1em', marginLeft: 6, textTransform: 'uppercase',
+                      }}>Internal</span>
+                    )}
+                    {row.is_unanchored && (
+                      <span style={{
+                        fontSize: 9, color: 'var(--text-3)', fontWeight: 600,
+                        letterSpacing: '0.1em', marginLeft: 6, textTransform: 'uppercase',
+                      }}>Unanchored</span>
                     )}
                   </div>
                   <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
@@ -105,7 +154,6 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
                 </Link>
               </td>
               <td className="num num-serif">{fmtNgnM(row.current_nav)}</td>
-              {/* v27ao: target/excess/excess% are meaningless for fixed-annual and no-fee */}
               <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
                 {noMath ? '—' : fmtNgnM(row.target_nav)}
               </td>
@@ -115,22 +163,7 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
               <td className="num" style={{ fontFamily: 'var(--font-mono)', color: noMath ? 'var(--text-3)' : excessColor }}>
                 {noMath ? '—' : fmtPct(row.excess_pct)}
               </td>
-              <td className="num num-serif">
-                {row.is_fixed_annual ? (
-                  <div>
-                    <div style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_annual_fee)}</div>
-                    <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
-                      YTD {fmtNgnM(row.pro_rata_ytd_fee ?? 0)}
-                    </div>
-                  </div>
-                ) : row.status === 'no_fee' ? (
-                  <span style={{ color: 'var(--text-3)' }}>—</span>
-                ) : row.projected_annual_fee > 0 ? (
-                  <span style={{ color: 'var(--gold)' }}>{fmtNgnM(row.projected_annual_fee)}</span>
-                ) : (
-                  <span style={{ color: 'var(--text-3)' }}>—</span>
-                )}
-              </td>
+              <td className="num num-serif">{yearEndFeeCell}</td>
               <td>
                 <span className={'pill ' + sp.cls}>{sp.label}</span>
               </td>

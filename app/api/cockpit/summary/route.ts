@@ -7,13 +7,13 @@ import {
   buildFirmAllocationRollup,
   buildIdleCashFlags,
   buildStaleReports,
-  fetchFeeOutlookInputs,
 } from '@/lib/cockpit-aggregations'
 import { computeFeeOutlook } from '@/lib/fee-outlook'
+import { fetchFeeOutlookEngineInputs } from '@/lib/fee-outlook-fetchers'
 
 export const maxDuration = 60
 
-// v27 — Cockpit summary endpoint
+// v27aw — Cockpit summary endpoint
 //
 // Returns a single fat JSON payload powering:
 //   - KPI strip (Total AUM, Active Mandates, Projected Annual Fees, Stale Reports)
@@ -25,6 +25,11 @@ export const maxDuration = 60
 // Mandate Health and Fee Outlook tables are split into their own endpoints
 // (/api/cockpit/health, /api/cockpit/fee-outlook) so the cockpit page can
 // stagger loading.
+//
+// v27aw: switched to fetchFeeOutlookEngineInputs (anchor-aware bulk fetcher).
+// computeFeeOutlook now sources crystallised fees from fee_periods directly
+// and computes year-end projection via walker hold-flat. The summary KPI
+// reads `fo.projected_annual_fee` (backwards-compat alias = projected_year_end_fee).
 
 export async function GET(_req: NextRequest) {
   try {
@@ -43,11 +48,11 @@ export async function GET(_req: NextRequest) {
       })
     }
 
-    const [navMap, aumTrend, allocationRollup, feeInputsMap] = await Promise.all([
+    const [navMap, aumTrend, allocationRollup, engineInputsMap] = await Promise.all([
       computeAllPortfolioNAVs(db, portfolioIds),
       buildFirmAUMTrend(db, 12),
       buildFirmAllocationRollup(db, portfolioIds),
-      fetchFeeOutlookInputs(db, portfolios),
+      fetchFeeOutlookEngineInputs(db, portfolioIds),
     ])
 
     const idleCash    = await buildIdleCashFlags(db, portfolios, navMap)
@@ -58,7 +63,7 @@ export async function GET(_req: NextRequest) {
     let mandatesEarningFee = 0
     for (const p of portfolios) {
       if (p.is_internal) continue
-      const inputs = feeInputsMap.get(p.id) ?? { navAtYearStart: null, yearlyCashflows: [] }
+      const inputs = engineInputsMap.get(p.id)
       const totalNAV = navMap.get(p.id) ?? 0
       const fo = computeFeeOutlook({
         portfolio: {
@@ -67,16 +72,21 @@ export async function GET(_req: NextRequest) {
           starting_nav: p.starting_nav,
           start_date: p.start_date,
           client: { name: p.client_name, code: p.client_code, type: p.client_type },
-          // v27ao: pass-through fee-architecture columns
           fee_model: p.fee_model,
           fixed_annual_fee_ngn: p.fixed_annual_fee_ngn,
           target_return: p.target_return,
           performance_fee_split: p.performance_fee_split,
+          fee_year_end_md: inputs?.feeYearEndMd ?? null,
+          fee_relationship_start_date: inputs?.feeRelationshipStartDate ?? null,
         },
         totalNAV,
-        navAtYearStart: inputs.navAtYearStart,
-        yearlyCashflows: inputs.yearlyCashflows,
+        navRows: inputs?.navRows ?? [],
+        txRows: inputs?.txRows ?? [],
+        preservedRows: inputs?.preservedRows ?? [],
+        crystallisedYtdFee: inputs?.crystallisedYtdFee ?? 0,
+        todaysPending: inputs?.todaysPending ?? null,
       })
+      // Reads backwards-compat alias projected_annual_fee = projected_year_end_fee
       projectedFees += fo.projected_annual_fee
       if (fo.projected_annual_fee > 0) mandatesEarningFee++
     }
