@@ -12,6 +12,9 @@ import SectorExposureGrid from '@/components/cockpit/SectorExposureGrid'
 import TopMoversPanel from '@/components/cockpit/TopMoversPanel'
 import HouseViewsPanel from '@/components/cockpit/HouseViewsPanel'
 import WatchlistPulsePanel from '@/components/cockpit/WatchlistPulsePanel'
+import SignalsPanel from '@/components/cockpit/SignalsPanel'
+import type { Signal } from '@/lib/cockpit-signals'
+import type { NarratedSignal } from '@/lib/cockpit-narrator'
 import type { MandateHealth } from '@/lib/mandate-health'
 import type { FeeOutlook } from '@/lib/fee-outlook'
 import type {
@@ -41,6 +44,9 @@ import type {
 const FirmAUMTrend         = dynamic(() => import('@/components/cockpit/FirmAUMTrend'),         { ssr: false })
 const FirmAllocationDonut  = dynamic(() => import('@/components/cockpit/FirmAllocationDonut'),  { ssr: false })
 const YieldCurvePanel      = dynamic(() => import('@/components/admin/YieldCurvePanel'),        { ssr: false })
+
+// v27ax: envelope returned by /api/cockpit/signals (Signal + narrated)
+type SignalEnvelope = Signal & { narrated: NarratedSignal }
 
 interface SummaryPayload {
   kpis: {
@@ -81,6 +87,10 @@ export default function CockpitPage() {
   const [pulse, setPulse]                   = useState<WatchlistPulseData | null>(null)
   const [pulseLoading, setPulseLoading]     = useState(true)
 
+  // v27ax: cockpit signals (force-investigation layer)
+  const [signals, setSignals]               = useState<SignalEnvelope[]>([])
+  const [signalsLoading, setSignalsLoading] = useState(true)
+
   const [refreshing, setRefreshing]         = useState(false)
 
   const loadAll = useCallback(async () => {
@@ -88,8 +98,9 @@ export default function CockpitPage() {
     setSummaryLoading(true); setHealthLoading(true); setFeeLoading(true)
     setSectorLoading(true); setMoversLoading(true)
     setHouseViewsLoading(true); setPulseLoading(true)
+    setSignalsLoading(true)
 
-    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes] = await Promise.allSettled([
+    const [sRes, hRes, fRes, secRes, movRes, hvRes, plRes, sigRes] = await Promise.allSettled([
       fetch('/api/cockpit/summary').then(r => r.json()),
       fetch('/api/cockpit/health').then(r => r.json()),
       fetch('/api/cockpit/fee-outlook').then(r => r.json()),
@@ -97,6 +108,7 @@ export default function CockpitPage() {
       fetch('/api/cockpit/top-movers').then(r => r.json()),
       fetch('/api/cockpit/house-views').then(r => r.json()),
       fetch('/api/cockpit/watchlist-pulse').then(r => r.json()),
+      fetch('/api/cockpit/signals').then(r => r.json()),
     ])
 
     if (sRes.status === 'fulfilled' && !sRes.value.error) setSummary(sRes.value)
@@ -119,6 +131,12 @@ export default function CockpitPage() {
 
     if (plRes.status === 'fulfilled' && !plRes.value.error) setPulse(plRes.value)
     setPulseLoading(false)
+
+    if (sigRes.status === 'fulfilled' && !sigRes.value.error
+        && Array.isArray(sigRes.value.signals)) {
+      setSignals(sigRes.value.signals as SignalEnvelope[])
+    }
+    setSignalsLoading(false)
 
     setRefreshing(false)
   }, [])
@@ -165,6 +183,9 @@ export default function CockpitPage() {
               </button>
             </div>
           </div>
+
+          {/* v27ax: signals — what demands attention today */}
+          <SignalsPanel signals={signals} loading={signalsLoading} />
 
           {/* KPI strip */}
           <CockpitKPIStrip
