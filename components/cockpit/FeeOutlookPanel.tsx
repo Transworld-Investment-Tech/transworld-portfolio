@@ -73,6 +73,7 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
       <thead>
         <tr>
           <th>Mandate</th>
+          <th className="num">Starting NAV</th>
           <th className="num">Current NAV</th>
           <th className="num">Target NAV</th>
           <th className="num">Excess</th>
@@ -152,6 +153,9 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
                     {row.client_name} · basis {row.year_start_basis === 'jan_1' ? 'Jan 1' : 'mandate start'}
                   </div>
                 </Link>
+              </td>
+              <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
+                {row.starting_nav_at_anchor != null ? fmtNgnM(row.starting_nav_at_anchor) : '—'}
               </td>
               <td className="num num-serif">{fmtNgnM(row.current_nav)}</td>
               <td className="num num-serif" style={{ color: 'var(--text-2)' }}>

@@ -87,6 +87,9 @@ export interface FeeOutlook {
   // v27aw
   is_unanchored?:        boolean
 
+  // v27aw-fix1: NAV at fee_relationship_start_date (performance modes only)
+  starting_nav_at_anchor?: number | null
+
   year_start_basis:           'jan_1' | 'mandate_start'
   effective_year_start_date:  string
   days_elapsed:               number
@@ -150,12 +153,17 @@ function computeFeeYearEnd(asOf: Date, feeYearEndMD: string): Date {
 }
 
 // ─── Status classification ────────────────────────────────────
-function classifyStatus(excess: number, currentNAV: number, projected: number): FeeStatus {
-  if (currentNAV <= 0) return 'no_basis'
-  const excessRatio = excess / currentNAV
-  if (excess >= 0 && projected > 0) return 'beating'
-  if (excessRatio >= -0.02) return 'on_track'
-  if (excessRatio >= -0.05) return 'at_risk'
+// v27aw-fix1: rebased on Current vs Target (operator semantic). Pre-fix1
+// triggered on the engine's excess_above_threshold column, which is null for
+// performance_hwm and performance_combined modes (pitfall #138). Switching to
+// a direct current-vs-target comparison sidesteps the column-dispatch issue
+// and gives a uniform, mode-independent reading.
+function classifyStatus(currentNAV: number, targetNAV: number): FeeStatus {
+  if (currentNAV <= 0 || targetNAV <= 0) return 'no_basis'
+  if (currentNAV >= targetNAV) return 'beating'
+  const gap = (targetNAV - currentNAV) / targetNAV
+  if (gap <= 0.02) return 'on_track'
+  if (gap <= 0.05) return 'at_risk'
   return 'below'
 }
 
@@ -343,30 +351,49 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
     }
   }
 
-  // "As of today" metrics: prefer engine ground truth (latest pending row).
-  // Falls back to first-principles approximation if engine has no row yet
-  // (i.e. recompute hasn't run since anchoring — should be rare in practice).
-  let targetNav = 0
-  let excessNgn = 0
-  let excessPct = 0
-  if (todaysPending) {
-    const closingNav = num(todaysPending.closing_nav, totalNAV)
-    const excess = num(todaysPending.excess_above_threshold, 0)
-    targetNav = closingNav - excess
-    excessNgn = excess
-    excessPct = targetNav > 0 ? excessNgn / targetNav : 0
+  // v27aw-fix1: simple, self-consistent display semantics independent of
+  // engine ground-truth column dispatch (pitfall #138 sidestep).
+  //   Starting NAV  = nav_log at-or-before fee_relationship_start_date
+  //   Target NAV    = Starting × (1 + target_return × yearFraction)
+  //   Excess (NGN)  = Current - Starting (growth since anchor)
+  //   Excess %      = (Current - Starting) / Starting
+  //   Status        = Current vs Target (see classifyStatus)
+  // todaysPending is no longer read for these metrics; engine ground truth
+  // remains in crystallised_ytd_fee (the YTD fee from fee_periods).
+  const targetReturn = num(portfolio.target_return, ANNUAL_TARGET_DEFAULT)
+  const anchorIso = portfolio.fee_relationship_start_date as string
+
+  // Resolve starting NAV: latest nav_log row at-or-before anchor
+  let startingNavAtAnchor: number | null = null
+  for (let i = navRows.length - 1; i >= 0; i--) {
+    if (navRows[i].nav_date <= anchorIso) {
+      startingNavAtAnchor = navRows[i].nav_value
+      break
+    }
+  }
+
+  const yearFraction = daysElapsed / Math.max(1, daysInYear)
+
+  let targetNav: number
+  let excessNgn: number
+  let excessPct: number
+  if (startingNavAtAnchor !== null && startingNavAtAnchor > 0) {
+    targetNav = startingNavAtAnchor * (1 + targetReturn * yearFraction)
+    excessNgn = totalNAV - startingNavAtAnchor
+    excessPct = (totalNAV - startingNavAtAnchor) / startingNavAtAnchor
   } else {
-    targetNav = totalNAV
+    // No nav_log row at-or-before anchor — degraded display, no metrics
+    targetNav = 0
     excessNgn = 0
     excessPct = 0
   }
 
-  // Legacy field — current excess linearly extrapolated to year-end. Kept
-  // defined for any older consumer; no longer drives the projected fee.
+  // Legacy field — kept defined for any older consumer; semantic preserved
+  // as the linear extrapolation of NGN excess to year-end.
   const extrapolationFactor = daysInYear / Math.max(1, daysElapsed)
   const projectedYearEndExcess = excessNgn * extrapolationFactor
 
-  const status = classifyStatus(excessNgn, totalNAV, projectedYearEndFee)
+  const status = classifyStatus(totalNAV, targetNav)
 
   return {
     portfolio_id:   portfolio.id,
@@ -385,6 +412,7 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
     target_nav:  targetNav,
     excess_ngn:  excessNgn,
     excess_pct:  excessPct,
+    starting_nav_at_anchor: startingNavAtAnchor,
 
     crystallised_ytd_fee:           crystallisedYtdFee,
     projected_year_end_fee:         projectedYearEndFee,
