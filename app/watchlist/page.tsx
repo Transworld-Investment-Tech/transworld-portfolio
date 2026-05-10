@@ -1,7 +1,7 @@
 'use client'
 
 import { useSearchParams } from 'next/navigation'
-import { useEffect, useState, useCallback, useMemo } from 'react'
+import { Suspense, useEffect, useState, useCallback, useMemo } from 'react'
 import {
   Search, Plus, Trash2, Edit3, Save, X, Eye, BookOpen,
   TrendingUp, Shield, BarChart3, RefreshCw,
@@ -161,20 +161,32 @@ function inferSubType(i: InstrumentRow, section: string): string {
 
 // ------------------------------------------------------------------------
 
+// v27ax-fix6: child component owning the useSearchParams call. Returns null —
+// its only job is to read ?ticker= once and call onTicker. Wrapped in a
+// Suspense boundary in the page JSX so Next.js's static generation
+// pass bails out cleanly on this subtree without affecting the rest of the
+// page. v27ax-fix5's `force-dynamic` directive proved insufficient in
+// Next 16 / Turbopack — the canonical fix is the Suspense boundary.
+function TickerDeepLinkSync({ onTicker }: { onTicker: (s: string) => void }) {
+  const searchParams = useSearchParams()
+  useEffect(() => {
+    const ticker = searchParams?.get('ticker')
+    if (ticker) onTicker(ticker)
+  }, [searchParams, onTicker])
+  return null
+}
+
 export default function WatchlistPage() {
   const [items,       setItems]       = useState<WatchItem[]>([])
   const [loading,     setLoading]     = useState(true)
   const [section,     setSection]     = useState<Section>('all')
   const [search,      setSearch]      = useState('')
 
-  // v27ax-fix4: deep-link from cockpit signals — ?ticker=ARADEL pre-fills
-  // the search input so the row is visible on land. Effect runs once on
-  // mount (or when params change in-tab navigation).
-  const _v27axFix4_searchParams = useSearchParams()
-  useEffect(() => {
-    const tickerParam = _v27axFix4_searchParams?.get('ticker')
-    if (tickerParam) setSearch(tickerParam)
-  }, [_v27axFix4_searchParams])
+  // v27ax-fix6: deep-link logic moved into <TickerDeepLinkSync /> defined
+  // above the page component, mounted inside <Suspense> in the JSX below.
+  // setSearch is passed in as a callback. Refactor was forced by Next 16 /
+  // Turbopack ignoring force-dynamic for useSearchParams (build failed twice
+  // before the Suspense pattern was introduced).
   const [subFilter,   setSubFilter]   = useState('')
   const [expanded,    setExpanded]    = useState<string | null>(null)
   const [editingId,   setEditingId]   = useState<string | null>(null)
@@ -386,6 +398,11 @@ export default function WatchlistPage() {
 
   return (
     <div className="hybrid-page" style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
+      {/* v27ax-fix6: deep-link sync wrapped in Suspense for Next.js static
+          generation compatibility. Returns null — invisible. */}
+      <Suspense fallback={null}>
+        <TickerDeepLinkSync onTicker={setSearch} />
+      </Suspense>
       {/* Sticky top header */}
       <header
         style={{
