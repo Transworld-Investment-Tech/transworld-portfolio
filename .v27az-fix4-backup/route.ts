@@ -1,29 +1,28 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/instrument/[ticker] (v27az-fix4)
+// /api/instrument/[ticker] (v27az-fix1)
 // ═══════════════════════════════════════════════════════════════
 //
 // GET /api/instrument/<TICKER>
 //
-// v27az-fix4 changes (the empty-holders bug):
-//   1. holdings SELECT no longer requests `latest_price` — that
-//      column doesn't exist on the holdings table. Asking for a
-//      non-existent column made PostgREST return null+error and
-//      my `data ?? []` swallowed it silently → 0 holders for every
-//      ticker even when SQL `WHERE instrument_id = 'X'` returned
-//      rows. Valuation now uses the market_prices `current_price`
-//      uniformly (which is the correct authoritative figure anyway).
-//   2. `.gt('quantity', 0)` moved client-side as defensive belt — if
-//      PostgREST filter behavior on a numeric col were ever an issue,
-//      this removes that path entirely.
-//   3. Sleeve concentration query gets the same treatment (no
-//      latest_price, client-side filter, captured errors).
-//   4. recent_transactions query identically defensive.
-//   5. New _debug envelope in the response — any Supabase error
-//      objects bubble up as { stage, message, hint } entries.
-//      Operators can see them via curl; UI ignores. Plus a
-//      console.error for Vercel function logs.
+// Returns everything the instrument detail page needs in one round:
+//   - instrument metadata (from `instruments`)
+//   - latest 2 prices for current + day-change (from `market_prices`)
+//   - watchlist membership (from `watchlist`)
+//   - holders array with mandate / client / qty / costs / values
+//   - concentration block (firm-wide totals + % of firm AUM + sleeve)
+//   - last 20 firm-wide transactions, FEE excluded, INCOME included
 //
-// Same scope, same API, same UI rendering — just correct data.
+// Errors return JSON shapes that the page handles gracefully:
+//   { error: 'not_found', ticker } → friendly empty state
+//   { error: <other> } → not-found state
+//
+// v27az-fix1 changes vs v27az:
+//   1. computeAllPortfolioNAVs takes string[] (portfolio IDs), not
+//      PortfolioWithMeta[]. Pass portfolios.map(p => p.id).
+//   2. instrumentRow tsc-narrows to GenericStringError because Supabase's
+//      typed .maybeSingle() couldn't parse the concatenated SELECT string.
+//      Two-pronged fix: SELECT is now a single literal (no concatenation)
+//      AND the result is defensively cast to an explicit row type.
 // ═══════════════════════════════════════════════════════════════
 
 import { NextResponse } from 'next/server'
@@ -73,11 +72,11 @@ type WatchlistRow = {
   active:   boolean | null
 }
 
-// v27az-fix4: no latest_price — that column doesn't exist on holdings.
 type HoldingRow = {
   portfolio_id: string
   quantity:     number | string | null
   avg_cost:     number | string | null
+  latest_price: number | string | null
 }
 
 type TxnRow = {
@@ -97,8 +96,6 @@ type PMeta = {
   client_name?: string
 }
 
-type DebugEntry = { stage: string; message: string; hint?: string }
-
 // ─── Helpers ────────────────────────────────────────────────────
 
 function client() {
@@ -109,6 +106,7 @@ function client() {
   return createClient(url, key)
 }
 
+// Defensive numeric coerce (pitfall #72)
 function num(v: unknown, fallback = 0): number {
   if (v === null || v === undefined) return fallback
   if (typeof v === 'number') return isFinite(v) ? v : fallback
@@ -126,28 +124,12 @@ const SLEEVE_LABELS: Record<string, string> = {
   fi:  'Fixed Income',
 }
 
-// v27az-fix4: capture Supabase error shape for visibility
-function captureErr(stage: string, err: unknown, debug: DebugEntry[]) {
-  if (!err) return
-  const e = err as { message?: string; hint?: string; code?: string; details?: string }
-  const entry: DebugEntry = {
-    stage,
-    message: e.message ?? String(err),
-    hint:    e.hint ?? e.details ?? e.code,
-  }
-  debug.push(entry)
-  // eslint-disable-next-line no-console
-  console.error('[instrument-route]', stage, entry.message, entry.hint ?? '')
-}
-
 // ─── GET ────────────────────────────────────────────────────────
 
 export async function GET(
   _request: Request,
   context: { params: Promise<{ ticker: string }> },
 ) {
-  const debug: DebugEntry[] = []
-
   const db = client()
   if (!db) {
     return NextResponse.json({ error: 'supabase env missing' }, { status: 500 })
@@ -157,6 +139,7 @@ export async function GET(
   const ticker = decodeURIComponent(rawTicker).toUpperCase()
 
   // ─── 1. Instrument metadata ─────────────────────────────────
+  // v27az-fix1: SELECT collapsed to a single literal (no concat).
   const { data: rawInstrument, error: instErr } = await db
     .from('instruments')
     .select('instrument_id, name, sleeve_id, asset_class, type, currency, ngx_symbol, ngx_market, sector, approved, div_per_share, div_yield_pct, div_frequency, last_div_date, next_div_date, div_status, coupon_pct, coupon_freq, maturity_date, yield_pct')
@@ -164,25 +147,25 @@ export async function GET(
     .maybeSingle()
 
   if (instErr) {
-    captureErr('instrument-lookup', instErr, debug)
     return NextResponse.json(
-      { error: (instErr as { message?: string }).message ?? 'instrument lookup failed', ticker, _debug: debug },
+      { error: (instErr as { message?: string }).message ?? 'instrument lookup failed', ticker },
       { status: 500 },
     )
   }
   if (!rawInstrument) {
     return NextResponse.json({ error: 'not_found', ticker }, { status: 404 })
   }
+  // v27az-fix1: defensive cast — Supabase typegen returns
+  // GenericStringError shape when SELECT can't be parsed.
   const instrument = rawInstrument as unknown as InstrumentRow
 
   // ─── 2. Latest 2 prices ─────────────────────────────────────
-  const { data: priceRowsRaw, error: priceErr } = await db
+  const { data: priceRowsRaw } = await db
     .from('market_prices')
     .select('price, price_date')
     .eq('instrument_id', ticker)
     .order('price_date', { ascending: false })
     .limit(2)
-  captureErr('market-prices', priceErr, debug)
   const priceRows = (priceRowsRaw ?? []) as unknown as PriceRow[]
 
   const current_price = priceRows.length > 0 ? num(priceRows[0].price) : null
@@ -197,12 +180,11 @@ export async function GET(
   }
 
   // ─── 3. Watchlist status ────────────────────────────────────
-  const { data: rawWl, error: wlErr } = await db
+  const { data: rawWl } = await db
     .from('watchlist')
     .select('ticker, section, sub_type, active')
     .eq('ticker', ticker)
     .maybeSingle()
-  captureErr('watchlist', wlErr, debug)
   const wlRow = rawWl as unknown as WatchlistRow | null
 
   const watchlist = {
@@ -211,8 +193,9 @@ export async function GET(
     sub_type:       wlRow ? wlRow.sub_type : null,
   }
 
-  // ─── 4. Active portfolios + NAVs ────────────────────────────
+  // ─── 4. Active portfolios + NAVs (for % of NAV math) ────────
   const portfolios = await fetchAllActivePortfolios(db) as unknown as PMeta[]
+  // v27az-fix1: computeAllPortfolioNAVs takes portfolio IDs (string[]), not metas.
   const portfolioIds = portfolios.map(p => p.id)
   const navMap = await computeAllPortfolioNAVs(db, portfolioIds)
   let firm_aum_ngn = 0
@@ -230,26 +213,20 @@ export async function GET(
   }
 
   // ─── 5. Holders ─────────────────────────────────────────────
-  // v27az-fix4: removed `latest_price` from SELECT (column doesn't
-  // exist on holdings — the silent error here caused empty result).
-  // Quantity > 0 filter moved client-side.
-  const { data: rawHoldings, error: holdErr } = await db
+  const { data: rawHoldings } = await db
     .from('holdings')
-    .select('portfolio_id, quantity, avg_cost')
+    .select('portfolio_id, quantity, avg_cost, latest_price')
     .eq('instrument_id', ticker)
-  captureErr('holdings-for-ticker', holdErr, debug)
+    .gt('quantity', 0)
   const holdingRows = (rawHoldings ?? []) as unknown as HoldingRow[]
 
   const holders = holdingRows
-    .filter(h => num(h.quantity) > 0)
     .map(h => {
       const p = pIndex.get(h.portfolio_id)
       if (!p) return null
       const qty           = num(h.quantity)
       const avg_cost      = num(h.avg_cost)
-      // v27az-fix4: latest_price comes uniformly from market_prices;
-      // fall back to avg_cost only if no current price exists at all.
-      const latest_price  = current_price ?? avg_cost
+      const latest_price  = num(h.latest_price, current_price ?? avg_cost)
       const market_value  = qty * latest_price
       const cost_basis    = qty * avg_cost
       const unrealised    = market_value - cost_basis
@@ -281,47 +258,24 @@ export async function GET(
   const sleeve_id = instrument.sleeve_id ?? 'unknown'
   let firm_sleeve_total_ngn = 0
   if (sleeve_id && sleeve_id !== 'unknown') {
-    const { data: rawSleeveInst, error: sleeveInstErr } = await db
+    const { data: rawSleeveInst } = await db
       .from('instruments')
       .select('instrument_id')
       .eq('sleeve_id', sleeve_id)
-    captureErr('sleeve-instruments', sleeveInstErr, debug)
     const sleeveInstRows = (rawSleeveInst ?? []) as unknown as Array<{ instrument_id: string }>
     const sleeveTickers = sleeveInstRows
       .map(r => r.instrument_id)
       .filter(Boolean)
-
     if (sleeveTickers.length > 0) {
-      // v27az-fix4: same fixes — drop latest_price column, filter qty client-side.
-      // Use a per-instrument-id price map from market_prices for valuation.
-      const { data: rawSleeveHold, error: sleeveHoldErr } = await db
+      const { data: rawSleeveHold } = await db
         .from('holdings')
-        .select('instrument_id, quantity, avg_cost')
+        .select('quantity, latest_price, avg_cost')
         .in('instrument_id', sleeveTickers)
-      captureErr('sleeve-holdings', sleeveHoldErr, debug)
-      const sleeveHoldRows = (rawSleeveHold ?? []) as unknown as Array<HoldingRow & { instrument_id: string }>
-
-      // Fetch latest market price for each sleeve ticker in one query
-      const { data: rawSleevePrices, error: sleevePricesErr } = await db
-        .from('market_prices')
-        .select('instrument_id, price, price_date')
-        .in('instrument_id', sleeveTickers)
-        .order('price_date', { ascending: false })
-      captureErr('sleeve-prices', sleevePricesErr, debug)
-      const sleevePriceRows = (rawSleevePrices ?? []) as unknown as Array<{ instrument_id: string; price: number | string | null; price_date: string }>
-
-      // Latest-per-instrument: first occurrence (sorted desc by date)
-      const sleevePriceMap = new Map<string, number>()
-      for (const r of sleevePriceRows) {
-        if (!sleevePriceMap.has(r.instrument_id)) {
-          sleevePriceMap.set(r.instrument_id, num(r.price))
-        }
-      }
-
+        .gt('quantity', 0)
+      const sleeveHoldRows = (rawSleeveHold ?? []) as unknown as HoldingRow[]
       for (const r of sleeveHoldRows) {
         const q = num(r.quantity)
-        if (q <= 0) continue
-        const p = sleevePriceMap.get(r.instrument_id) ?? num(r.avg_cost)
+        const p = num(r.latest_price, num(r.avg_cost))
         firm_sleeve_total_ngn += q * p
       }
     }
@@ -340,14 +294,13 @@ export async function GET(
   }
 
   // ─── 7. Recent transactions (FEE excluded, INCOME included) ─
-  const { data: rawTxn, error: txnErr } = await db
+  const { data: rawTxn } = await db
     .from('transactions')
     .select('trade_date, action, portfolio_id, quantity, price, amount, narration')
     .eq('instrument_id', ticker)
     .neq('action', 'FEE')
     .order('trade_date', { ascending: false })
     .limit(20)
-  captureErr('transactions', txnErr, debug)
   const txnRows = (rawTxn ?? []) as unknown as TxnRow[]
 
   const recent_transactions = txnRows.map(t => {
@@ -365,9 +318,7 @@ export async function GET(
     }
   })
 
-  // v27az-fix4: include _debug only if any errors occurred (keep
-  // healthy responses lean)
-  const response: Record<string, unknown> = {
+  return NextResponse.json({
     instrument,
     price: { current_price, price_date, day_change_pct, day_change_ngn },
     watchlist,
@@ -375,10 +326,5 @@ export async function GET(
     concentration,
     recent_transactions,
     firm_context: { firm_aum_ngn, firm_sleeve_total_ngn },
-  }
-  if (debug.length > 0) {
-    response._debug = debug
-  }
-
-  return NextResponse.json(response)
+  })
 }
