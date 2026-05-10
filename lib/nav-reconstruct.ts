@@ -1,5 +1,17 @@
 /**
- * lib/nav-reconstruct.ts — v27ag
+ * lib/nav-reconstruct.ts — v27ax-fix1
+ *
+ * v27ax-fix1: added `notes` to the transactions SELECT so the v27aw-fix3
+ * in-kind marker check inside applyCashEvent fires correctly during
+ * historical NAV rebuild. Pre-fix1, every rebuild call re-introduced
+ * the phantom cash debit on Pattern 2 portfolios (CKNET-A, CKNET-B)
+ * because the SELECT didn't fetch `notes`, applyCashEvent received
+ * undefined for the marker check, and the BUY case fell through to
+ * the principal-debit branch. Single-line change; no behavior change
+ * for portfolios without in-kind seed BUYs.
+ *
+ * ───────────────────────────────────────────────────────────────────
+ * v27ag (preserved): NAV reconstruction is now cash-aware.
  *
  * v27ag change: NAV reconstruction is now cash-aware. The previous
  * replayToDate() walked only share-bearing rows and returned a holdings
@@ -134,7 +146,7 @@ export async function reconstructPortfolioNav(
   // cash walk in replayToDate has the data it needs.
   const { data: txns } = await db
     .from('transactions')
-    .select('trade_date, action, instrument_id, quantity, price, gross_value, amount, fees')
+    .select('trade_date, action, instrument_id, quantity, price, gross_value, amount, fees, notes')
     .eq('portfolio_id', portfolioId)
     .order('trade_date', { ascending: true })
     .limit(50000)
