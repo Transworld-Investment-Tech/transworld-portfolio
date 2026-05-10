@@ -77,14 +77,21 @@ export async function fetchFeeOutlookEngineInputs(
     }
   }
 
-  // Fetch floor: earliest anchor across the universe, or current year-start
-  // if no portfolios are anchored. Conservative — we may load slightly more
-  // history than each individual portfolio needs, but the walker filters
-  // by period boundaries so over-loading is harmless.
+  // v27aw-fix2: fetch floor must be BEFORE the earliest anchor to allow
+  // at-or-before resolution for portfolios whose anchor sits at the earliest
+  // date in the universe. Pre-fix2 the floor equalled the earliest anchor
+  // exactly, so a portfolio anchored 2026-01-01 couldn't find a nav_log row
+  // dated 2025-12-31 (or any earlier weekend/year-end snapshot) — Starting
+  // NAV in the cockpit panel would render '—' even though the row existed
+  // in nav_log (per-portfolio IRR audit panels resolve via full history and
+  // saw it correctly). Buffer of 365 days is generous; nav_log row counts
+  // stay well under the 50000 limit because the floor never goes deeper
+  // than 1 year pre-earliest-anchor.
   const yearStart = `${new Date().getFullYear()}-01-01`
-  const fetchFloor = anchorDates.length > 0
-    ? anchorDates.sort()[0]
-    : yearStart
+  const earliestNeeded = anchorDates.length > 0 ? anchorDates.sort()[0] : yearStart
+  const floorDate = new Date(earliestNeeded)
+  floorDate.setDate(floorDate.getDate() - 365)
+  const fetchFloor = floorDate.toISOString().slice(0, 10)
 
   // ─── Bulk nav_log fetch ──────────────────────────────────────
   const { data: navData } = await db
