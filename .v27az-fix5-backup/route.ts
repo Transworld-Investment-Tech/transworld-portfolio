@@ -1,24 +1,29 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/instrument/[ticker] (v27az-fix5)
+// /api/instrument/[ticker] (v27az-fix4)
 // ═══════════════════════════════════════════════════════════════
 //
 // GET /api/instrument/<TICKER>
 //
-// v27az-fix5 changes (movement + sparkline):
-//   Adds `movement` block to the response:
-//     - day / week / month / quarter pct + NGN impact
-//     - 30 most-recent-trading-days sparkline points
-//   NGN impact = current firm_value_ngn × pct — "what this move
-//   means for our current position right now". For unheld tickers
-//   (firm_value_ngn = 0) the NGN impact is 0 and the page hides it.
-//   Anchors use calendar-day lookback with at-or-before resolution
-//   to handle weekends and holidays gracefully.
+// v27az-fix4 changes (the empty-holders bug):
+//   1. holdings SELECT no longer requests `latest_price` — that
+//      column doesn't exist on the holdings table. Asking for a
+//      non-existent column made PostgREST return null+error and
+//      my `data ?? []` swallowed it silently → 0 holders for every
+//      ticker even when SQL `WHERE instrument_id = 'X'` returned
+//      rows. Valuation now uses the market_prices `current_price`
+//      uniformly (which is the correct authoritative figure anyway).
+//   2. `.gt('quantity', 0)` moved client-side as defensive belt — if
+//      PostgREST filter behavior on a numeric col were ever an issue,
+//      this removes that path entirely.
+//   3. Sleeve concentration query gets the same treatment (no
+//      latest_price, client-side filter, captured errors).
+//   4. recent_transactions query identically defensive.
+//   5. New _debug envelope in the response — any Supabase error
+//      objects bubble up as { stage, message, hint } entries.
+//      Operators can see them via curl; UI ignores. Plus a
+//      console.error for Vercel function logs.
 //
-//   Everything from v27az-fix4 preserved:
-//     - holdings SELECT without latest_price (the empty-holders fix)
-//     - sleeve concentration via market_prices join
-//     - quantity > 0 client-side filter
-//     - _debug envelope with captured Supabase errors
+// Same scope, same API, same UI rendering — just correct data.
 // ═══════════════════════════════════════════════════════════════
 
 import { NextResponse } from 'next/server'
@@ -31,7 +36,7 @@ import {
 export const dynamic = 'force-dynamic'
 export const maxDuration = 30
 
-// ─── Explicit row types ─────────────────────────────────────────
+// ─── Explicit row types (decouples from Supabase typegen) ───────
 
 type InstrumentRow = {
   instrument_id: string
@@ -68,6 +73,7 @@ type WatchlistRow = {
   active:   boolean | null
 }
 
+// v27az-fix4: no latest_price — that column doesn't exist on holdings.
 type HoldingRow = {
   portfolio_id: string
   quantity:     number | string | null
@@ -92,14 +98,6 @@ type PMeta = {
 }
 
 type DebugEntry = { stage: string; message: string; hint?: string }
-
-// v27az-fix5: movement window shape
-type MoveWindow = {
-  pct:           number
-  ngn_impact:    number
-  anchor_date:   string
-  anchor_price:  number
-}
 
 // ─── Helpers ────────────────────────────────────────────────────
 
@@ -128,6 +126,7 @@ const SLEEVE_LABELS: Record<string, string> = {
   fi:  'Fixed Income',
 }
 
+// v27az-fix4: capture Supabase error shape for visibility
 function captureErr(stage: string, err: unknown, debug: DebugEntry[]) {
   if (!err) return
   const e = err as { message?: string; hint?: string; code?: string; details?: string }
@@ -176,20 +175,19 @@ export async function GET(
   }
   const instrument = rawInstrument as unknown as InstrumentRow
 
-  // ─── 2. Price history (v27az-fix5: now pulls up to 150 rows ──
-  //    to support windowed move math + 30-row sparkline)
+  // ─── 2. Latest 2 prices ─────────────────────────────────────
   const { data: priceRowsRaw, error: priceErr } = await db
     .from('market_prices')
     .select('price, price_date')
     .eq('instrument_id', ticker)
     .order('price_date', { ascending: false })
-    .limit(150)
+    .limit(2)
   captureErr('market-prices', priceErr, debug)
-  const priceHistory = (priceRowsRaw ?? []) as unknown as PriceRow[]
+  const priceRows = (priceRowsRaw ?? []) as unknown as PriceRow[]
 
-  const current_price = priceHistory.length > 0 ? num(priceHistory[0].price) : null
-  const prev_price    = priceHistory.length > 1 ? num(priceHistory[1].price) : null
-  const price_date    = priceHistory.length > 0 ? priceHistory[0].price_date : null
+  const current_price = priceRows.length > 0 ? num(priceRows[0].price) : null
+  const prev_price    = priceRows.length > 1 ? num(priceRows[1].price) : null
+  const price_date    = priceRows.length > 0 ? priceRows[0].price_date : null
 
   let day_change_pct: number | null = null
   let day_change_ngn: number | null = null
@@ -232,6 +230,9 @@ export async function GET(
   }
 
   // ─── 5. Holders ─────────────────────────────────────────────
+  // v27az-fix4: removed `latest_price` from SELECT (column doesn't
+  // exist on holdings — the silent error here caused empty result).
+  // Quantity > 0 filter moved client-side.
   const { data: rawHoldings, error: holdErr } = await db
     .from('holdings')
     .select('portfolio_id, quantity, avg_cost')
@@ -246,6 +247,8 @@ export async function GET(
       if (!p) return null
       const qty           = num(h.quantity)
       const avg_cost      = num(h.avg_cost)
+      // v27az-fix4: latest_price comes uniformly from market_prices;
+      // fall back to avg_cost only if no current price exists at all.
       const latest_price  = current_price ?? avg_cost
       const market_value  = qty * latest_price
       const cost_basis    = qty * avg_cost
@@ -289,6 +292,8 @@ export async function GET(
       .filter(Boolean)
 
     if (sleeveTickers.length > 0) {
+      // v27az-fix4: same fixes — drop latest_price column, filter qty client-side.
+      // Use a per-instrument-id price map from market_prices for valuation.
       const { data: rawSleeveHold, error: sleeveHoldErr } = await db
         .from('holdings')
         .select('instrument_id, quantity, avg_cost')
@@ -296,6 +301,7 @@ export async function GET(
       captureErr('sleeve-holdings', sleeveHoldErr, debug)
       const sleeveHoldRows = (rawSleeveHold ?? []) as unknown as Array<HoldingRow & { instrument_id: string }>
 
+      // Fetch latest market price for each sleeve ticker in one query
       const { data: rawSleevePrices, error: sleevePricesErr } = await db
         .from('market_prices')
         .select('instrument_id, price, price_date')
@@ -304,6 +310,7 @@ export async function GET(
       captureErr('sleeve-prices', sleevePricesErr, debug)
       const sleevePriceRows = (rawSleevePrices ?? []) as unknown as Array<{ instrument_id: string; price: number | string | null; price_date: string }>
 
+      // Latest-per-instrument: first occurrence (sorted desc by date)
       const sleevePriceMap = new Map<string, number>()
       for (const r of sleevePriceRows) {
         if (!sleevePriceMap.has(r.instrument_id)) {
@@ -332,68 +339,7 @@ export async function GET(
     sleeve_label: SLEEVE_LABELS[sleeve_id] ?? sleeve_id,
   }
 
-  // ─── 7. Movement (v27az-fix5) ───────────────────────────────
-  // Calendar-day lookback with at-or-before resolution to handle
-  // weekends / holidays. Returns null when there's no anchor in
-  // the requested window (e.g. ticker just listed).
-  function findAnchorByLookback(daysBack: number): PriceRow | null {
-    if (priceHistory.length === 0 || !priceHistory[0].price_date) return null
-    const todayIso = priceHistory[0].price_date as string
-    const target = new Date(todayIso + 'T00:00:00')
-    target.setDate(target.getDate() - daysBack)
-    const targetIso = target.toISOString().slice(0, 10)
-    // priceHistory is DESC: walk to find the first row at-or-before target.
-    for (const r of priceHistory) {
-      if (r.price_date && (r.price_date as string) <= targetIso) {
-        // Skip if it's literally today's row (lookback = 0 edge)
-        if (r.price_date === todayIso && daysBack > 0) continue
-        return r
-      }
-    }
-    return null
-  }
-
-  function moveFromAnchor(anchor: PriceRow | null): MoveWindow | null {
-    if (!anchor || current_price === null) return null
-    const anchorPrice = num(anchor.price)
-    if (anchorPrice <= 0) return null
-    const pct = (current_price - anchorPrice) / anchorPrice
-    return {
-      pct,
-      ngn_impact:   firm_value_ngn * pct,
-      anchor_date:  (anchor.price_date as string) ?? '',
-      anchor_price: anchorPrice,
-    }
-  }
-
-  // Day uses the already-computed day_change_pct; week/month/quarter
-  // use calendar lookback for stable semantics.
-  const day_window: MoveWindow | null = (day_change_pct !== null && prev_price !== null)
-    ? {
-        pct:          day_change_pct,
-        ngn_impact:   firm_value_ngn * day_change_pct,
-        anchor_date:  (priceHistory[1]?.price_date as string) ?? '',
-        anchor_price: prev_price,
-      }
-    : null
-
-  const movement = {
-    day:       day_window,
-    week:      moveFromAnchor(findAnchorByLookback(7)),
-    month:     moveFromAnchor(findAnchorByLookback(30)),
-    quarter:   moveFromAnchor(findAnchorByLookback(90)),
-    // Sparkline: 30 most-recent rows, reversed to ASC for left-to-right rendering.
-    sparkline: priceHistory
-      .slice(0, 30)
-      .reverse()
-      .map(r => ({
-        date:  (r.price_date as string) ?? '',
-        price: num(r.price),
-      }))
-      .filter(p => p.date && p.price > 0),
-  }
-
-  // ─── 8. Recent transactions ─────────────────────────────────
+  // ─── 7. Recent transactions (FEE excluded, INCOME included) ─
   const { data: rawTxn, error: txnErr } = await db
     .from('transactions')
     .select('trade_date, action, portfolio_id, quantity, price, amount, narration')
@@ -419,13 +365,14 @@ export async function GET(
     }
   })
 
+  // v27az-fix4: include _debug only if any errors occurred (keep
+  // healthy responses lean)
   const response: Record<string, unknown> = {
     instrument,
-    price:               { current_price, price_date, day_change_pct, day_change_ngn },
+    price: { current_price, price_date, day_change_pct, day_change_ngn },
     watchlist,
     holders,
     concentration,
-    movement,
     recent_transactions,
     firm_context: { firm_aum_ngn, firm_sleeve_total_ngn },
   }

@@ -6,38 +6,36 @@ import Link from 'next/link'
 import { RefreshCw, ArrowLeft, Star } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27az-fix5)
+// app/instrument/[ticker]/page.tsx (v27az-fix3)
 // ═══════════════════════════════════════════════════════════════
 //
 // Per-instrument detail page. Canonical landing target for any
 // ticker click-through (cockpit panels, holdings tables, etc.).
 //
-// v27az-fix5 additions:
-//   • Movement panel — 4 windowed % moves (Today/Week/Month/Quarter)
-//     with NGN impact (firm exposure × pct) + 30-day inline SVG
-//     sparkline. Sparkline color = green if trending up, red if down.
-//   • Signals badge row — reads localStorage 'cockpit-signals-cache-v1'
-//     and renders any signals firing on this ticker as compact badges
-//     between the watchlist chip and the Movement panel. Empty when
-//     cache is missing/stale/no-matching-ticker — no special UI.
-//     Reads BOTH 'narration' and 'narrated' field names defensively
-//     (schema doc and route head differ; fallback handles either).
+// v27az-fix3 visual fixes:
+//   1. <main> now explicitly sets `background: var(--bg)` — v27az
+//      page rendered on a dark navy bg in production because the
+//      route inherited body bg and never painted cream over it.
+//   2. Panel/KPI cards now use the real hybrid-design CSS vars
+//      ('--card' for fill, '--border' for outline). v27az-fix1 used
+//      a non-existent var name whose fallback color was close-but-wrong.
+//   3. KPI cards now have the 32px × 2px gold accent bar at top-left
+//      that the hybrid design v3 reference specifies.
+//   4. Panel titles now italic Cormorant, matching design v3.
+//   5. Border-radius standardised to 5px (design v3 spec).
+//   6. Panel header pattern aligned: 14px bottom padding on header,
+//      18px margin-bottom, border-bottom var(--border-soft).
 //
-// v27az-fix3 visual baseline preserved.
-// v27az-fix4 holders fix preserved (uses route's holders array).
+// Surfaces unchanged:
+//   • Instrument metadata + price + day change in header
+//   • Watchlist status chip
+//   • 4-card KPI strip
+//   • Holders table
+//   • Recent Transactions table
+//   • Friendly empty state for unknown tickers
+//
+// Deferred to v27ba/v27bb unchanged.
 // ═══════════════════════════════════════════════════════════════
-
-interface MoveWindow {
-  pct:           number
-  ngn_impact:    number
-  anchor_date:   string
-  anchor_price:  number
-}
-
-interface SparklinePoint {
-  date:  string
-  price: number
-}
 
 interface InstrumentResp {
   instrument?: {
@@ -90,13 +88,6 @@ interface InstrumentResp {
     pct_of_firm_sleeve_exposure: number
     sleeve_label:                string
   }
-  movement?: {
-    day:       MoveWindow | null
-    week:      MoveWindow | null
-    month:     MoveWindow | null
-    quarter:   MoveWindow | null
-    sparkline: SparklinePoint[]
-  }
   recent_transactions?: Array<{
     trade_date:    string
     action:        string
@@ -116,35 +107,11 @@ interface InstrumentResp {
   ticker?: string
 }
 
-// v27az-fix5: defensive shape for signals from localStorage cache.
-// Reads both 'narration' (schema doc) and 'narrated' (route head)
-// field names because they appear inconsistently in the codebase.
-type CachedSignal = {
-  id:                   string
-  type:                 string
-  severity:             'red' | 'amber' | 'gold'
-  primary_subject:      string
-  primary_subject_kind: 'ticker' | 'portfolio' | 'mandate'
-  suggested_action?:    string
-  narration?:           { headline?: string; body?: string }
-  narrated?:            { headline?: string; body?: string }
-}
-
 // ─── Formatting helpers ─────────────────────────────────────────
 
 function fmtNgnM(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   const sign = v < 0 ? '−' : ''
-  const abs = Math.abs(v)
-  if (abs >= 1e9) return sign + '\u20a6' + (abs / 1e9).toFixed(2) + 'B'
-  if (abs >= 1e6) return sign + '\u20a6' + (abs / 1e6).toFixed(2) + 'M'
-  if (abs >= 1e3) return sign + '\u20a6' + (abs / 1e3).toFixed(1) + 'K'
-  return sign + '\u20a6' + abs.toFixed(0)
-}
-
-function fmtNgnImpactSigned(v: number | null | undefined): string {
-  if (v === null || v === undefined || !isFinite(v) || v === 0) return ''
-  const sign = v < 0 ? '−' : '+'
   const abs = Math.abs(v)
   if (abs >= 1e9) return sign + '\u20a6' + (abs / 1e9).toFixed(2) + 'B'
   if (abs >= 1e6) return sign + '\u20a6' + (abs / 1e6).toFixed(2) + 'M'
@@ -188,29 +155,12 @@ function fmtDate(s: string | null | undefined): string {
   }
 }
 
-function fmtDateShort(s: string | null | undefined): string {
-  if (!s) return '—'
-  try {
-    const d = new Date(s + 'T00:00:00')
-    return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short' })
-  } catch {
-    return s
-  }
-}
-
 const ACTION_COLOR: Record<string, string> = {
   BUY:          'var(--pos)',
   SELL:         'var(--neg)',
   TRANSFER_IN:  'var(--gold)',
   TRANSFER_OUT: 'var(--warn)',
   INCOME:       'var(--pos)',
-}
-
-// v27az-fix5: severity → tier-label + style
-const SEVERITY_TIERS: Record<string, { label: string; bg: string; border: string; fg: string }> = {
-  red:   { label: 'BREACH',      bg: 'rgba(166,59,59,0.10)',   border: 'rgba(166,59,59,0.30)',   fg: 'var(--neg)'  },
-  amber: { label: 'ATTENTION',   bg: 'rgba(166,124,42,0.12)',  border: 'rgba(166,124,42,0.30)',  fg: 'var(--warn)' },
-  gold:  { label: 'OPPORTUNITY', bg: 'rgba(176,139,62,0.10)',  border: 'rgba(176,139,62,0.30)',  fg: 'var(--gold)' },
 }
 
 // ─── Page ───────────────────────────────────────────────────────
@@ -222,7 +172,6 @@ export default function InstrumentPage() {
   const [data, setData] = useState<InstrumentResp | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
-  const [signals, setSignals] = useState<CachedSignal[]>([])
 
   const load = useCallback(async () => {
     if (!ticker) return
@@ -239,30 +188,6 @@ export default function InstrumentPage() {
   }, [ticker])
 
   useEffect(() => { load() }, [load])
-
-  // v27az-fix5: read cockpit signals cache; filter to this ticker
-  useEffect(() => {
-    if (!ticker) return
-    try {
-      const cached = typeof window !== 'undefined'
-        ? window.localStorage.getItem('cockpit-signals-cache-v1')
-        : null
-      if (!cached) return
-      const parsed = JSON.parse(cached) as { as_of_date?: string; signals?: CachedSignal[] }
-      if (!parsed || !Array.isArray(parsed.signals)) return
-      // Stale-day guard: ignore cache from a previous day
-      const today = new Date().toISOString().slice(0, 10)
-      if (parsed.as_of_date && parsed.as_of_date !== today) return
-      const filtered = parsed.signals.filter(s =>
-        s.primary_subject_kind === 'ticker'
-        && typeof s.primary_subject === 'string'
-        && s.primary_subject.toUpperCase() === ticker
-      )
-      setSignals(filtered)
-    } catch {
-      // Silent fail — empty signals
-    }
-  }, [ticker])
 
   // ─── Loading state ────────────────────────────────────────────
   if (loading) {
@@ -318,7 +243,6 @@ export default function InstrumentPage() {
     total_qty: 0, firm_value_ngn: 0, mandate_count: 0,
     pct_of_firm_aum: 0, pct_of_firm_sleeve_exposure: 0, sleeve_label: '',
   }
-  const movement     = data.movement
   const transactions = data.recent_transactions ?? []
 
   const dayChangePct = price.day_change_pct
@@ -329,12 +253,11 @@ export default function InstrumentPage() {
       : (dayChangePct >= 0 ? 'var(--pos)' : 'var(--neg)')
 
   const totalCostBasis = holders.reduce((s, h) => s + (h.cost_basis_ngn ?? 0), 0)
-  const firmValueNgn = concentration.firm_value_ngn ?? 0
 
   return (
     <main style={mainStyle}>
 
-      {/* ─── Page header ─────────────────────────────────────── */}
+      {/* ─── Page header (matches hybrid design v3 portfolio header) ── */}
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
@@ -402,7 +325,7 @@ export default function InstrumentPage() {
         </div>
       </div>
 
-      {/* ─── KPI strip ───────────────────────────────────────── */}
+      {/* ─── KPI strip with gold accent bars ────────────────────── */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
@@ -434,7 +357,7 @@ export default function InstrumentPage() {
           </div>
         </KpiCard>
 
-        <KpiCard label="Firm NGN Exposure" value={fmtNgnM(firmValueNgn)}>
+        <KpiCard label="Firm NGN Exposure" value={fmtNgnM(concentration.firm_value_ngn)}>
           <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
             cost {fmtNgnM(totalCostBasis)}
           </div>
@@ -448,7 +371,7 @@ export default function InstrumentPage() {
       </div>
 
       {/* ─── Watchlist chip ──────────────────────────────────── */}
-      <div style={{ marginBottom: 16 }}>
+      <div style={{ marginBottom: 20 }}>
         {wl.is_watchlisted ? (
           <span style={{
             display: 'inline-flex',
@@ -485,48 +408,11 @@ export default function InstrumentPage() {
         )}
       </div>
 
-      {/* ─── v27az-fix5: Signals badge row ───────────────────── */}
-      {signals.length > 0 && (
-        <div style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: 8,
-          marginBottom: 20,
-        }}>
-          {signals.map(s => (
-            <SignalBadge key={s.id} signal={s} />
-          ))}
-        </div>
-      )}
-
-      {/* ─── v27az-fix5: Movement panel ──────────────────────── */}
-      {movement && (
-        <div style={{ marginBottom: 20 }}>
-          <Panel
-            title="Movement"
-            meta={movement.sparkline.length > 0 ? `${movement.sparkline.length}-day trend` : null}
-          >
-            <div style={{
-              display: 'grid',
-              gridTemplateColumns: 'repeat(4, 1fr)',
-              gap: 16,
-              marginBottom: 22,
-            }}>
-              <MoveCell label="Today"   data={movement.day}     firmValue={firmValueNgn} />
-              <MoveCell label="Week"    data={movement.week}    firmValue={firmValueNgn} />
-              <MoveCell label="Month"   data={movement.month}   firmValue={firmValueNgn} />
-              <MoveCell label="Quarter" data={movement.quarter} firmValue={firmValueNgn} />
-            </div>
-            <Sparkline points={movement.sparkline} />
-          </Panel>
-        </div>
-      )}
-
       {/* ─── Holders panel ───────────────────────────────────── */}
       <Panel
         title={`Holders (${holders.length})`}
         meta={holders.length > 0
-          ? `${fmtQty(concentration.total_qty)} shares · ${fmtNgnM(firmValueNgn)}`
+          ? `${fmtQty(concentration.total_qty)} shares · ${fmtNgnM(concentration.firm_value_ngn)}`
           : null
         }
       >
@@ -690,6 +576,7 @@ function KpiCard({
       position: 'relative',
       overflow: 'hidden',
     }}>
+      {/* 32px × 2px gold accent bar at top-left — design v3 hallmark */}
       <div style={{
         position: 'absolute',
         top: 0,
@@ -770,193 +657,6 @@ function Panel({
         ) : null}
       </div>
       {children}
-    </div>
-  )
-}
-
-// v27az-fix5: MoveCell — one of 4 windowed move cards
-function MoveCell({
-  label,
-  data,
-  firmValue,
-}: {
-  label:     string
-  data:      MoveWindow | null
-  firmValue: number
-}) {
-  if (!data) {
-    return (
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-        <div style={{
-          fontSize: 10,
-          letterSpacing: '0.14em',
-          fontWeight: 600,
-          color: 'var(--text-3)',
-          textTransform: 'uppercase',
-          marginBottom: 8,
-        }}>
-          {label}
-        </div>
-        <div style={{
-          fontFamily: '"Cormorant Garamond", Georgia, serif',
-          fontSize: 22,
-          fontWeight: 500,
-          color: 'var(--text-3)',
-        }}>
-          —
-        </div>
-      </div>
-    )
-  }
-  const color = data.pct >= 0 ? 'var(--pos)' : 'var(--neg)'
-  return (
-    <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-      <div style={{
-        fontSize: 10,
-        letterSpacing: '0.14em',
-        fontWeight: 600,
-        color: 'var(--text-3)',
-        textTransform: 'uppercase',
-        marginBottom: 8,
-      }}>
-        {label}
-      </div>
-      <div style={{
-        fontFamily: '"Cormorant Garamond", Georgia, serif',
-        fontSize: 22,
-        fontWeight: 500,
-        color,
-        letterSpacing: '-0.01em',
-        marginBottom: 3,
-      }}>
-        {fmtPctSigned(data.pct)}
-      </div>
-      {firmValue > 0 ? (
-        <div style={{ fontSize: 11, color, fontVariantNumeric: 'tabular-nums' }}>
-          {fmtNgnImpactSigned(data.ngn_impact)}
-          <span style={{ color: 'var(--text-3)' }}> firm impact</span>
-        </div>
-      ) : (
-        <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
-          from {fmtPrice(data.anchor_price)}
-        </div>
-      )}
-    </div>
-  )
-}
-
-// v27az-fix5: Sparkline — inline SVG trend line
-function Sparkline({ points }: { points: SparklinePoint[] }) {
-  if (points.length < 2) {
-    return (
-      <div style={{ fontSize: 11, color: 'var(--text-3)', padding: '8px 0', textAlign: 'center' }}>
-        Insufficient price history for sparkline.
-      </div>
-    )
-  }
-  const W = 1000
-  const H = 60
-  const PAD = 4
-  const prices = points.map(p => p.price)
-  let min = prices[0]
-  let max = prices[0]
-  for (const p of prices) {
-    if (p < min) min = p
-    if (p > max) max = p
-  }
-  const range = max - min || 1
-  const polylinePoints = points.map((p, i) => {
-    const x = PAD + (i / (points.length - 1)) * (W - 2 * PAD)
-    const y = H - PAD - ((p.price - min) / range) * (H - 2 * PAD)
-    return `${x.toFixed(2)},${y.toFixed(2)}`
-  }).join(' ')
-  const last = points[points.length - 1]
-  const first = points[0]
-  const isUp = last.price >= first.price
-  const strokeColor = isUp ? 'var(--pos)' : 'var(--neg)'
-  const fillColor   = isUp ? 'rgba(45,110,78,0.06)' : 'rgba(166,59,59,0.06)'
-
-  // Fill area: polyline + bottom edge
-  const lastX = (PAD + (points.length - 1) / (points.length - 1) * (W - 2 * PAD)).toFixed(2)
-  const fillPath = `M ${PAD},${H - PAD} L ${polylinePoints.split(' ').join(' L ')} L ${lastX},${H - PAD} Z`
-
-  const endX = PAD + (W - 2 * PAD)
-  const endY = H - PAD - ((last.price - min) / range) * (H - 2 * PAD)
-
-  return (
-    <div>
-      <svg
-        viewBox={`0 0 ${W} ${H}`}
-        preserveAspectRatio="none"
-        style={{ width: '100%', height: 60, display: 'block' }}
-      >
-        <path d={fillPath} fill={fillColor} stroke="none" />
-        <polyline points={polylinePoints} fill="none" stroke={strokeColor} strokeWidth="1.5" vectorEffect="non-scaling-stroke" />
-        <circle cx={endX} cy={endY} r="2.5" fill={strokeColor} />
-      </svg>
-      <div style={{
-        display: 'flex',
-        justifyContent: 'space-between',
-        marginTop: 6,
-        fontSize: 10,
-        color: 'var(--text-3)',
-        letterSpacing: '0.04em',
-      }}>
-        <span>
-          <span style={{ color: 'var(--text-2)' }}>{fmtPrice(first.price)}</span>
-          {' · '}{fmtDateShort(first.date)}
-        </span>
-        <span>
-          <span style={{ color: 'var(--text-2)' }}>{fmtPrice(last.price)}</span>
-          {' · '}{fmtDateShort(last.date)}
-        </span>
-      </div>
-    </div>
-  )
-}
-
-// v27az-fix5: SignalBadge — one signal from the cockpit cache
-function SignalBadge({ signal }: { signal: CachedSignal }) {
-  const tier = SEVERITY_TIERS[signal.severity] ?? SEVERITY_TIERS.gold
-  // Defensive: read both 'narration' (schema doc) and 'narrated' (route head)
-  const headline =
-    signal.narration?.headline
-    ?? signal.narrated?.headline
-    ?? signal.suggested_action
-    ?? signal.type.replace(/_/g, ' ')
-  return (
-    <div style={{
-      display: 'inline-flex',
-      alignItems: 'center',
-      padding: '7px 12px',
-      background: tier.bg,
-      border: `1px solid ${tier.border}`,
-      borderRadius: 3,
-      fontSize: 11,
-      fontWeight: 500,
-      letterSpacing: '0.01em',
-      maxWidth: 520,
-      lineHeight: 1.4,
-    }}>
-      <span style={{
-        fontSize: 9,
-        fontWeight: 700,
-        letterSpacing: '0.14em',
-        textTransform: 'uppercase',
-        marginRight: 10,
-        color: tier.fg,
-        flexShrink: 0,
-      }}>
-        ● {tier.label}
-      </span>
-      <span style={{
-        color: 'var(--text)',
-        overflow: 'hidden',
-        textOverflow: 'ellipsis',
-        whiteSpace: 'nowrap',
-      }} title={headline}>
-        {headline}
-      </span>
     </div>
   )
 }
