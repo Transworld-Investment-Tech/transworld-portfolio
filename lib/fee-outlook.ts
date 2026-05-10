@@ -207,12 +207,21 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
 
   // ─── Branch 1: no_fee (internal or fee_model='none') ─────────
   if (isInternal) {
+    // v27aw-fix5: surface portfolio.starting_nav as a contextual reference
+    // for fee-free books (TRIL-A is the only one currently). Different
+    // semantic than fee-anchor Starting NAV — this is the mandate-inception
+    // NGN value already on the portfolios row. Panel renders dashes when
+    // null, so missing/zero starting_nav stays dashed (graceful degradation
+    // for any hypothetical fee_model='none' portfolio with no inception NAV).
+    const startingNavRef = num(portfolio.starting_nav, 0)
     return {
       portfolio_id:   portfolio.id,
       portfolio_name: portfolio.name,
       client_name:    portfolio.client?.name ?? '—',
       client_code:    portfolio.client?.code ?? '—',
       is_internal:    true,
+
+      starting_nav_at_anchor: startingNavRef > 0 ? startingNavRef : null,
 
       year_start_basis:           basis,
       effective_year_start_date:  isoDate(effectiveStart),
