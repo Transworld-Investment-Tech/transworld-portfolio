@@ -88,7 +88,11 @@ export interface FeeOutlook {
   is_unanchored?:        boolean
 
   // v27aw-fix1: NAV at fee_relationship_start_date (performance modes only)
+  // v27aw-fix6: now period-start NAV (effectiveStart-anchored) across all branches
   starting_nav_at_anchor?: number | null
+
+  // v27aw-fix6: net TRANSFER_IN minus TRANSFER_OUT amounts over [effectiveStart, asOf]
+  net_flows?: number | null
 
   year_start_basis:           'jan_1' | 'mandate_start'
   effective_year_start_date:  string
@@ -205,15 +209,38 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
   const daysElapsed = Math.max(1, daysBetween(effectiveStart, asOf))
   const daysRemaining = Math.max(0, daysBetween(asOf, yEnd))
 
+  // v27aw-fix6: hoist period-start NAV and net flows so every branch
+  // (no_fee, fixed_annual, unanchored, performance) reads them through the
+  // same path. Starting NAV is nav_log at-or-before effectiveStart (year-start,
+  // or anchor for mid-year-anchored). Net Flows is sum of TRANSFER_IN minus
+  // TRANSFER_OUT amounts over [effectiveStart, asOf].
+  const effectiveStartIso = isoDate(effectiveStart)
+  const asOfIso = isoDate(asOf)
+
+  let periodStartingNav: number | null = null
+  for (let i = navRows.length - 1; i >= 0; i--) {
+    if (navRows[i].nav_date <= effectiveStartIso) {
+      periodStartingNav = navRows[i].nav_value
+      break
+    }
+  }
+
+  let netFlows = 0
+  for (const tx of txRows) {
+    if (tx.trade_date < effectiveStartIso) continue
+    if (tx.trade_date > asOfIso) continue
+    const amt = Math.abs(num(tx.amount, 0))
+    if (tx.action === 'TRANSFER_IN') netFlows += amt
+    else if (tx.action === 'TRANSFER_OUT') netFlows -= amt
+  }
+
   // ─── Branch 1: no_fee (internal or fee_model='none') ─────────
   if (isInternal) {
-    // v27aw-fix5: surface portfolio.starting_nav as a contextual reference
-    // for fee-free books (TRIL-A is the only one currently). Different
-    // semantic than fee-anchor Starting NAV — this is the mandate-inception
-    // NGN value already on the portfolios row. Panel renders dashes when
-    // null, so missing/zero starting_nav stays dashed (graceful degradation
-    // for any hypothetical fee_model='none' portfolio with no inception NAV).
-    const startingNavRef = num(portfolio.starting_nav, 0)
+    // v27aw-fix6: period-start NAV and net flows from hoisted resolvers.
+    // For fee-free books (TRIL-A) with anchor=null, effectiveStart = yStart,
+    // so starting_nav_at_anchor = nav_log at-or-before Jan 1 (year-start NAV).
+    // Net flows surfaced for operator transparency on capital movements YTD;
+    // Target/Excess stay dashed (no fee model means no benchmark math).
     return {
       portfolio_id:   portfolio.id,
       portfolio_name: portfolio.name,
@@ -221,7 +248,8 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
       client_code:    portfolio.client?.code ?? '—',
       is_internal:    true,
 
-      starting_nav_at_anchor: startingNavRef > 0 ? startingNavRef : null,
+      starting_nav_at_anchor: periodStartingNav,
+      net_flows:              netFlows,
 
       year_start_basis:           basis,
       effective_year_start_date:  isoDate(effectiveStart),
@@ -370,28 +398,30 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
   // todaysPending is no longer read for these metrics; engine ground truth
   // remains in crystallised_ytd_fee (the YTD fee from fee_periods).
   const targetReturn = num(portfolio.target_return, ANNUAL_TARGET_DEFAULT)
-  const anchorIso = portfolio.fee_relationship_start_date as string
 
-  // Resolve starting NAV: latest nav_log row at-or-before anchor
-  let startingNavAtAnchor: number | null = null
-  for (let i = navRows.length - 1; i >= 0; i--) {
-    if (navRows[i].nav_date <= anchorIso) {
-      startingNavAtAnchor = navRows[i].nav_value
-      break
-    }
-  }
-
+  // v27aw-fix6: use periodStartingNav and netFlows (hoisted at top).
+  // periodStartingNav is at-or-before effectiveStart, which collapses to
+  // the anchor for mid-year-anchored portfolios and to year-start for
+  // portfolios anchored before this year (fixes latent year-rollover bug).
+  //
+  // Target and Excess are flow-aware:
+  //   Target   = Starting × (1 + r × t/365) + NetFlows
+  //     (Option B — flows added at face value, end-of-period treatment.
+  //      Doesn't reward flows with target compounding they didn't earn.)
+  //   Excess   = Current − Starting − NetFlows
+  //     (skill P&L: capital movements netted out.)
+  //   Excess % = Excess / Starting (denominator stays Starting only)
   const yearFraction = daysElapsed / Math.max(1, daysInYear)
 
   let targetNav: number
   let excessNgn: number
   let excessPct: number
-  if (startingNavAtAnchor !== null && startingNavAtAnchor > 0) {
-    targetNav = startingNavAtAnchor * (1 + targetReturn * yearFraction)
-    excessNgn = totalNAV - startingNavAtAnchor
-    excessPct = (totalNAV - startingNavAtAnchor) / startingNavAtAnchor
+  if (periodStartingNav !== null && periodStartingNav > 0) {
+    targetNav = periodStartingNav * (1 + targetReturn * yearFraction) + netFlows
+    excessNgn = totalNAV - periodStartingNav - netFlows
+    excessPct = excessNgn / periodStartingNav
   } else {
-    // No nav_log row at-or-before anchor — degraded display, no metrics
+    // No nav_log row at-or-before effectiveStart — degraded display
     targetNav = 0
     excessNgn = 0
     excessPct = 0
@@ -421,7 +451,8 @@ export function computeFeeOutlook(input: FeeOutlookInput): FeeOutlook {
     target_nav:  targetNav,
     excess_ngn:  excessNgn,
     excess_pct:  excessPct,
-    starting_nav_at_anchor: startingNavAtAnchor,
+    starting_nav_at_anchor: periodStartingNav,
+    net_flows:              netFlows,
 
     crystallised_ytd_fee:           crystallisedYtdFee,
     projected_year_end_fee:         projectedYearEndFee,

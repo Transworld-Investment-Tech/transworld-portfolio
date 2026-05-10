@@ -74,6 +74,7 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
         <tr>
           <th>Mandate</th>
           <th className="num">Starting NAV</th>
+          <th className="num">Net Flows</th>
           <th className="num">Current NAV</th>
           <th className="num">Target NAV</th>
           <th className="num">Excess</th>
@@ -156,6 +157,9 @@ export default function FeeOutlookPanel({ loading, data }: Props): ReactElement 
               </td>
               <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
                 {row.starting_nav_at_anchor != null ? fmtNgnM(row.starting_nav_at_anchor) : '—'}
+              </td>
+              <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
+                {row.net_flows != null ? fmtNgnM(row.net_flows) : '—'}
               </td>
               <td className="num num-serif">{fmtNgnM(row.current_nav)}</td>
               <td className="num num-serif" style={{ color: 'var(--text-2)' }}>
