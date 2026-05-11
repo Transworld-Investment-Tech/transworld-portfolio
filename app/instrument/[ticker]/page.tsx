@@ -804,6 +804,7 @@ export default function InstrumentPage() {
       )}
 
       {/* Fundamentals panel (equity only) */}
+      {/* v27cb-a-fix6: added "Edit historical fundamentals →" link for discoverability */}
       {isEquity && fundamentals && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -814,6 +815,24 @@ export default function InstrumentPage() {
                 : 'No period reported'
             }
           >
+            <div style={{ marginBottom: 14, paddingBottom: 12, borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))' }}>
+              <a
+                href={`/instrument/${inst.instrument_id}/fundamentals`}
+                style={{
+                  fontSize: 11,
+                  letterSpacing: '0.10em',
+                  textTransform: 'uppercase',
+                  fontWeight: 600,
+                  color: 'var(--gold, #b08b3e)',
+                  textDecoration: 'none',
+                }}
+              >
+                Edit historical fundamentals →
+              </a>
+              <span style={{ marginLeft: 10, fontSize: 11, color: 'var(--text-3, #8a8f9a)', fontStyle: 'italic' }}>
+                Open the per-period editor to verify, correct, or fill missing values.
+              </span>
+            </div>
             <FundamentalsBody fundamentals={fundamentals} sector={inst.sector ?? ''} />
           </Panel>
         </div>
