@@ -110,17 +110,16 @@ export async function extractPdfLines(buffer: Buffer): Promise<string[]> {
  * Falls back to returning the whole document head (first maxChars) if no
  * marker is found — better to send full text than nothing.
  */
-// v27ca-fix1: strict heading-only matching.
-// The original selector matched any sentence containing the phrase
-// "statement of profit or loss" — but in NGX audited reports those phrases
-// appear extensively in accounting-policy NOTES paragraphs that come BEFORE
-// the actual statements. To target the real statements we require:
-//   1. Match against heading-shaped regex patterns (heading, not prose)
-//   2. The line itself is short (<= 100 chars) — true headings are short,
-//      while policy-prose paragraphs are long
-// Verified against ACCESSCORP FY2025: matches line 3544
-// "Consolidated and separate statement of comprehensive income" (the real
-// heading) rather than line 4004 (an IFRS-18 policy note).
+// v27ca-fix2: heading-or-P&L-data anchor with back-up logic.
+// v27ca-fix1 correctly avoided policy-note false positives but failed when
+// pdfjs fragmented the P&L heading line (e.g. ACCESSCORP FY2024) — the
+// only matchable heading became the Balance Sheet heading, which left
+// Claude with BS rows but no P&L or EPS data. This fix adds P&L-data-row
+// anchors that NEVER appear in policy notes, and backs up from the BS
+// heading to the earlier P&L-data anchor when one is found.
+//
+// Verified against ACCESSCORP FY2025 (heading_pl anchor),
+// FY2024 (pldata_before_bs anchor), Q1 2026 (heading_pl anchor).
 const HEADING_PATTERNS: RegExp[] = [
   /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?(?:interim\s+)?statement of (?:profit or loss(?:\s+and other comprehensive income)?|comprehensive income|financial position)\s*$/i,
   /^\s*(?:consolidated\s+)?income statement\s*$/i,
@@ -128,9 +127,31 @@ const HEADING_PATTERNS: RegExp[] = [
   /^\s*statement of (?:profit or loss|comprehensive income|financial position)\s*(?:\([^)]*\))?\s*$/i,
 ]
 
-function isLikelyHeadingLine(line: string): boolean {
+// PL_DATA_PATTERNS: row labels that ONLY appear in an income statement, never
+// in a balance sheet, and never in policy notes (notes describe what the
+// concept IS but don't list a value with thousands-separator formatting).
+const PL_DATA_PATTERNS: RegExp[] = [
+  /^Interest income\b.*[\d,]+/i,
+  /^Net interest income\b.*[\d,]+/i,
+  /^Gross earnings\b.*[\d,]+/i,
+  /^Revenue\b.*[\d,]+/i,
+  /^Cost of sales\b.*[\d,]+/i,
+  /^Gross profit\b.*[\d,]+/i,
+]
+
+const BS_HEADING_RE = /statement of financial position/i
+
+function isHeadingLine(line: string): boolean {
   if (line.length > 100) return false
   for (const re of HEADING_PATTERNS) {
+    if (re.test(line)) return true
+  }
+  return false
+}
+
+function isPlDataLine(line: string): boolean {
+  if (line.length > 250) return false
+  for (const re of PL_DATA_PATTERNS) {
     if (re.test(line)) return true
   }
   return false
@@ -140,17 +161,29 @@ export function findFinancialStatementSection(
   lines: string[],
   maxChars = 40_000,
 ): { section: string; matched_marker: string | null; total_lines: number } {
-  let startIdx = -1
-  let matched_marker: string | null = null
+  // Scan for first heading match AND first P&L-data match in parallel
+  let firstHeading = -1
+  let firstHeadingText: string | null = null
+  let firstPlData = -1
+  let firstPlText: string | null = null
   for (let i = 0; i < lines.length; i++) {
-    if (isLikelyHeadingLine(lines[i])) {
-      startIdx = i
-      matched_marker = lines[i]
-      break
+    const l = lines[i]
+    if (firstHeading === -1 && isHeadingLine(l)) {
+      firstHeading = i
+      firstHeadingText = l
     }
+    if (firstPlData === -1 && isPlDataLine(l)) {
+      firstPlData = i
+      firstPlText = l
+    }
+    if (firstHeading !== -1 && firstPlData !== -1) break
   }
 
-  if (startIdx === -1) {
+  // Decision tree
+  let startIdx = -1
+  let matched_marker: string | null = null
+
+  if (firstHeading === -1 && firstPlData === -1) {
     // Fallback: return head of document
     const joined = lines.join('\n')
     return {
@@ -158,6 +191,25 @@ export function findFinancialStatementSection(
       matched_marker: null,
       total_lines: lines.length,
     }
+  } else if (firstHeading !== -1) {
+    const isBsHeading = firstHeadingText !== null && BS_HEADING_RE.test(firstHeadingText)
+    if (!isBsHeading) {
+      // P&L heading found — use it
+      startIdx = firstHeading
+      matched_marker = firstHeadingText
+    } else if (firstPlData !== -1 && firstPlData < firstHeading) {
+      // BS heading found but P&L data row exists earlier — back up
+      startIdx = firstPlData
+      matched_marker = firstPlText
+    } else {
+      // Only BS heading available — use it
+      startIdx = firstHeading
+      matched_marker = firstHeadingText
+    }
+  } else {
+    // Only P&L data row found
+    startIdx = firstPlData
+    matched_marker = firstPlText
   }
 
   // Read forward — generous slice (1200 lines is enough for P&L + BS + EPS
