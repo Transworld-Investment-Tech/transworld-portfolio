@@ -1,4 +1,4 @@
-// v27cb-a-fix3 — broadened cash field vocabulary
+// v27cb-a-fix3 — broadened cash field vocabulary   // v27cb-a-fix5: per-period shares_outstanding extraction
 // v27ca — OData-driven NGX fundamentals refresh
 //
 // Replaces the Anthropic+web_search-based extraction (which had gaps and
@@ -60,6 +60,7 @@ interface FundamentalsExtraction {
   total_debt_ngn_m: number | null
   cash_and_equivalents_ngn_m: number | null
   cash_from_operations_ngn_m: number | null
+  shares_outstanding: number | null
   roe_pct: number | null
   roa_pct: number | null
   net_margin_pct: number | null
@@ -118,6 +119,7 @@ CRITICAL RULES:
 5. cash_and_equivalents_ngn_m: BALANCE SHEET line item. Common labels: "Cash and cash equivalents", "Cash and balances with banks" (banks), "Cash and short-term funds", "Cash and bank balances", "Cash at bank and in hand". Use the top-of-balance-sheet asset line, NOT the cash-flow-statement reconciliation total at year-end. Millions of naira.
 6. cash_from_operations_ngn_m: subtotal from the STATEMENT OF CASH FLOWS in the operating activities section. Common labels: "Net cash from operating activities", "Net cash generated from operating activities", "Net cash provided by operating activities", "Net cash (used in) operating activities", "Cash generated from/used in operations" — whichever variant the filing uses. It is the LAST line of the operating-activities section before the "Cash flows from investing activities" heading begins. Millions of naira. Negative numbers (in parentheses) allowed.
 6b. Both cash fields: do NOT confuse "Cash and cash equivalents at end of year" (a reconciliation total at the bottom of the cash flow statement) with "Cash and cash equivalents" on the balance sheet. The balance sheet line is what we want for cash_and_equivalents_ngn_m.
+6c. shares_outstanding: number of ordinary shares in issue AT PERIOD END. Common labels: "Number of ordinary shares in issue", "Issued share capital (number of ordinary shares)", "Weighted average number of ordinary shares" (for EPS calculation purposes), "Ordinary shares of N0.50 each" with a share count alongside. Report as ACTUAL share count (e.g. 54375796458 for 54.38B shares, NOT in millions). If the filing reports shares in millions, multiply by 1,000,000 before reporting. Return null if NOT disclosed in the filing.
 7. ROE, ROA, net_margin are PERCENTAGES (e.g. 25.5 means 25.5%).
 8. Return null for ANY field NOT REPORTED in the statement. Do NOT estimate, infer, fabricate, or compute from other fields.
 9. For BANKS, INSURERS, ASSET MANAGERS: "gross_profit_ngn_m" should be null (no COGS concept). "revenue_ngn_m" = Gross Earnings (interest income + non-interest income).
@@ -141,6 +143,7 @@ Required JSON schema:
   "total_debt_ngn_m": number|null,
   "cash_and_equivalents_ngn_m": number|null,
   "cash_from_operations_ngn_m": number|null,
+  "shares_outstanding": number|null,
   "roe_pct": number|null,
   "roa_pct": number|null,
   "net_margin_pct": number|null,
@@ -230,6 +233,7 @@ function validateExtraction(raw: unknown): FundamentalsExtraction | null {
     total_debt_ngn_m: numOrNull(r.total_debt_ngn_m),
     cash_and_equivalents_ngn_m: numOrNull(r.cash_and_equivalents_ngn_m),
     cash_from_operations_ngn_m: numOrNull(r.cash_from_operations_ngn_m),
+    shares_outstanding: numOrNull(r.shares_outstanding),
     roe_pct: numOrNull(r.roe_pct),
     roa_pct: numOrNull(r.roa_pct),
     net_margin_pct: numOrNull(r.net_margin_pct),
@@ -369,6 +373,7 @@ async function processTicker(
         total_debt_ngn_m: pfr.extraction.total_debt_ngn_m,
         cash_and_equivalents_ngn_m: pfr.extraction.cash_and_equivalents_ngn_m,
         cash_from_operations_ngn_m: pfr.extraction.cash_from_operations_ngn_m,
+        shares_outstanding: pfr.extraction.shares_outstanding,
         roe_pct: pfr.extraction.roe_pct,
         roa_pct: pfr.extraction.roa_pct,
         net_margin_pct: pfr.extraction.net_margin_pct,
@@ -411,6 +416,7 @@ async function processTicker(
           total_debt_ngn_m: ex.total_debt_ngn_m,
           cash_and_equivalents_ngn_m: ex.cash_and_equivalents_ngn_m,
           cash_from_operations_ngn_m: ex.cash_from_operations_ngn_m,
+          ...(ex.shares_outstanding !== null ? { shares_outstanding: ex.shares_outstanding, shares_outstanding_last_refreshed_at: new Date().toISOString() } : {}),
           roe_pct: ex.roe_pct,
           roa_pct: ex.roa_pct,
           net_margin_pct: ex.net_margin_pct,

@@ -35,11 +35,14 @@ export default async function FundamentalsEditorPage({ params }: PageProps) {
     ok: boolean
     error?: string
     instrument?: {
+      // v27cb-a-fix5: added shares_outstanding + shares_outstanding_last_refreshed_at
       instrument_id: string
       name: string
       sector: string | null
       isin: string | null
       type: string
+      shares_outstanding: number | null
+      shares_outstanding_last_refreshed_at: string | null
     }
     periods?: Array<Record<string, unknown>>
   }

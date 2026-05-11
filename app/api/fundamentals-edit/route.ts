@@ -1,11 +1,19 @@
-// v27cb-a-fix2 — Fundamentals editor API   // v27cb-a-fix3: broadened cash field vocabulary
+// v27cb-a-fix5 — Fundamentals editor API
 //
-// Adds vs v27cb-a:
-//   • Two new fields persisted to fundamentals_history:
-//       - cash_and_equivalents_ngn_m   (BS — cash & cash equivalents)
-//       - cash_from_operations_ngn_m   (Statement of Cash Flow — operating activities)
-//   • Cash Conversion derived ratio (CFO / PAT × 100) returned in derived_ratios
-//   • Re-extract reads/writes the 2 new fields from Claude output
+// Adds vs v27cb-a-fix3:
+//   • Per-period shares_outstanding I/O (read + write fundamentals_history)
+//   • derived_ratios now includes computed book_value_per_share (uses per-period
+//     shares with fallback to instruments.shares_outstanding for null periods)
+//   • New POST action 'update-shares-current': updates instruments.shares_outstanding
+//     (current shares, used by per-instrument page for market cap)
+//   • Auto-sync: when operator saves a period with shares_outstanding set, if that
+//     period is the MOST RECENT (latest period_end), also update instruments.shares_outstanding
+//   • Re-extract reads shares_outstanding from Claude output (may be null if filing
+//     doesn't disclose; operator can manually type after)
+//
+// New fields in derived_ratios payload:
+//   - book_value_per_share: number | null
+//   - bvps_basis: 'per_period_shares' | 'current_shares_fallback' | 'no_shares' | 'no_equity'
 
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
@@ -49,6 +57,7 @@ interface FundamentalsRow {
   total_debt_ngn_m?:            number | null
   cash_and_equivalents_ngn_m?:  number | null
   cash_from_operations_ngn_m?:  number | null
+  shares_outstanding?:          number | null
   currency?:                    string | null
   source?:                      string | null
   extraction_notes?:            string | null
@@ -63,19 +72,41 @@ interface DerivedRatios {
   roa_pct:              number | null
   net_margin_pct:       number | null
   cash_conversion_pct:  number | null
+  book_value_per_share: number | null
+  bvps_basis:           'per_period_shares' | 'current_shares_fallback' | 'no_shares' | 'no_equity'
 }
 
-function deriveRatios(row: FundamentalsRow): DerivedRatios {
+function deriveRatios(row: FundamentalsRow, currentShares: number | null): DerivedRatios {
   const pat = row.profit_after_tax_ngn_m ?? null
   const eq = row.total_equity_ngn_m ?? null
   const assets = row.total_assets_ngn_m ?? null
   const rev = row.revenue_ngn_m ?? null
   const cfo = row.cash_from_operations_ngn_m ?? null
+  const periodShares = row.shares_outstanding ?? null
+
+  // BVPS: total_equity_ngn_m × 1,000,000 ÷ shares_outstanding
+  // Per-period shares preferred; fallback to current instrument shares
+  let bvps: number | null = null
+  let basis: DerivedRatios['bvps_basis'] = 'no_equity'
+  if (eq === null || eq <= 0) {
+    basis = 'no_equity'
+  } else if (periodShares !== null && periodShares > 0) {
+    bvps = (eq * 1_000_000) / periodShares
+    basis = 'per_period_shares'
+  } else if (currentShares !== null && currentShares > 0) {
+    bvps = (eq * 1_000_000) / currentShares
+    basis = 'current_shares_fallback'
+  } else {
+    basis = 'no_shares'
+  }
+
   return {
     roe_pct: pat !== null && eq !== null && eq > 0 ? (pat / eq) * 100 : null,
     roa_pct: pat !== null && assets !== null && assets > 0 ? (pat / assets) * 100 : null,
     net_margin_pct: pat !== null && rev !== null && rev > 0 ? (pat / rev) * 100 : null,
     cash_conversion_pct: pat !== null && pat !== 0 && cfo !== null ? (cfo / pat) * 100 : null,
+    book_value_per_share: bvps,
+    bvps_basis: basis,
   }
 }
 
@@ -85,12 +116,13 @@ async function handleList(ticker: string): Promise<unknown> {
   const db = supabaseAdmin()
   const { data: inst } = await db
     .from('instruments')
-    .select('instrument_id, name, sector, isin, type, approved')
+    .select('instrument_id, name, sector, isin, type, approved, shares_outstanding, shares_outstanding_last_refreshed_at')
     .eq('instrument_id', ticker)
     .maybeSingle()
   if (!inst) {
     return { ok: false, error: `instrument '${ticker}' not found` }
   }
+  const currentShares = (inst.shares_outstanding ?? null) as number | null
   const { data: periods, error: pErr } = await db
     .from('fundamentals_history')
     .select('*')
@@ -101,7 +133,7 @@ async function handleList(ticker: string): Promise<unknown> {
   }
   const enriched = (periods ?? []).map((row) => ({
     ...row,
-    derived_ratios: deriveRatios(row as FundamentalsRow),
+    derived_ratios: deriveRatios(row as FundamentalsRow, currentShares),
   }))
   return {
     ok: true,
@@ -144,6 +176,7 @@ async function handleUpsert(ticker: string, body: FundamentalsRow): Promise<unkn
     total_debt_ngn_m: coerceNumOrNull(body.total_debt_ngn_m),
     cash_and_equivalents_ngn_m: coerceNumOrNull(body.cash_and_equivalents_ngn_m),
     cash_from_operations_ngn_m: coerceNumOrNull(body.cash_from_operations_ngn_m),
+    shares_outstanding: coerceNumOrNull(body.shares_outstanding),
     currency: body.currency ?? 'NGN',
     extraction_notes: body.extraction_notes ?? null,
     verified_status: body.verified_status ?? 'unverified',
@@ -160,10 +193,66 @@ async function handleUpsert(ticker: string, body: FundamentalsRow): Promise<unkn
   if (error) {
     return { ok: false, error: `upsert failed: ${error.message}` }
   }
-  return { ok: true, row: data, derived_ratios: deriveRatios(row as FundamentalsRow) }
+
+  // Auto-sync: if THIS period is the most recent for the ticker AND has a shares_outstanding,
+  // sync it to instruments.shares_outstanding (operator can override later via update-shares-current).
+  let auto_synced_current_shares = false
+  if (row.shares_outstanding !== null && row.shares_outstanding > 0) {
+    const { data: latest } = await db
+      .from('fundamentals_history')
+      .select('period_end')
+      .eq('instrument_id', ticker)
+      .order('period_end', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (latest && latest.period_end === body.period_end) {
+      const { error: instErr } = await db
+        .from('instruments')
+        .update({
+          shares_outstanding: row.shares_outstanding,
+          shares_outstanding_last_refreshed_at: new Date().toISOString(),
+        })
+        .eq('instrument_id', ticker)
+      if (!instErr) auto_synced_current_shares = true
+    }
+  }
+
+  // Re-fetch current shares for derive
+  const { data: inst2 } = await db
+    .from('instruments')
+    .select('shares_outstanding')
+    .eq('instrument_id', ticker)
+    .maybeSingle()
+  const currentShares = (inst2?.shares_outstanding ?? null) as number | null
+
+  return {
+    ok: true,
+    row: data,
+    derived_ratios: deriveRatios(row as FundamentalsRow, currentShares),
+    auto_synced_current_shares,
+  }
 }
 
-// ─── POST (action=re-extract): re-run extraction for one period ────
+// ─── POST (action=update-shares-current): manual override ──────────
+
+async function handleUpdateSharesCurrent(ticker: string, body: { shares_outstanding: number | null }): Promise<unknown> {
+  const db = supabaseAdmin()
+  const shares = coerceNumOrNull(body.shares_outstanding)
+  if (shares === null || shares <= 0) {
+    return { ok: false, error: 'shares_outstanding must be a positive number' }
+  }
+  const { error } = await db
+    .from('instruments')
+    .update({
+      shares_outstanding: shares,
+      shares_outstanding_last_refreshed_at: new Date().toISOString(),
+    })
+    .eq('instrument_id', ticker)
+  if (error) return { ok: false, error: `instruments UPDATE failed: ${error.message}` }
+  return { ok: true, shares_outstanding: shares }
+}
+
+// ─── POST (action=re-extract) ──────────────────────────────────────
 
 interface ExtractionResult {
   revenue_ngn_m: number | null
@@ -179,6 +268,7 @@ interface ExtractionResult {
   total_debt_ngn_m: number | null
   cash_and_equivalents_ngn_m: number | null
   cash_from_operations_ngn_m: number | null
+  shares_outstanding: number | null
   currency: string
   extraction_notes: string | null
 }
@@ -201,12 +291,13 @@ Period end: ${periodEnd} (${periodType})
 
 CRITICAL RULES:
 1. All ngn_m fields are in MILLIONS OF NAIRA. Convert if the statement uses thousands or billions.
-2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If the line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion). If you see a value like "4878.176" without commas, treat it literally — but a value WITH commas is always thousands-grouped.
+2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If a line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion).
 3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
 4. book_value_per_share is in actual naira per share.
 5. cash_and_equivalents_ngn_m: BALANCE SHEET line item. Common labels: "Cash and cash equivalents", "Cash and balances with banks" (banks), "Cash and short-term funds", "Cash and bank balances", "Cash at bank and in hand". Use the top-of-balance-sheet asset line, NOT the cash-flow-statement reconciliation total at year-end. Millions of naira.
 6. cash_from_operations_ngn_m: subtotal from the STATEMENT OF CASH FLOWS in the operating activities section. Common labels: "Net cash from operating activities", "Net cash generated from operating activities", "Net cash provided by operating activities", "Net cash (used in) operating activities", "Cash generated from/used in operations" — whichever variant the filing uses. It is the LAST line of the operating-activities section before the "Cash flows from investing activities" heading begins. Millions of naira. Negative numbers (in parentheses) allowed.
 6b. Both cash fields: do NOT confuse "Cash and cash equivalents at end of year" (a reconciliation total at the bottom of the cash flow statement) with "Cash and cash equivalents" on the balance sheet. The balance sheet line is what we want for cash_and_equivalents_ngn_m.
+6c. shares_outstanding: number of ordinary shares in issue AT PERIOD END. Common labels: "Number of ordinary shares in issue", "Issued share capital (number of ordinary shares)", "Weighted average number of ordinary shares" (for EPS calculation purposes), "Ordinary shares of N0.50 each" with a share count alongside. Report as ACTUAL share count (e.g. 54375796458 for 54.38B shares, NOT in millions). If the filing reports shares in millions, multiply by 1,000,000 before reporting. Return null if NOT disclosed in the filing.
 7. Return null for ANY field NOT REPORTED. Do NOT estimate, infer, fabricate, or compute from other fields.
 8. For BANKS, INSURERS, ASSET MANAGERS: gross_profit_ngn_m should be null. revenue_ngn_m = Gross Earnings (interest income + non-interest income).
 9. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
@@ -229,6 +320,7 @@ Required JSON schema:
   "total_debt_ngn_m": number|null,
   "cash_and_equivalents_ngn_m": number|null,
   "cash_from_operations_ngn_m": number|null,
+  "shares_outstanding": number|null,
   "currency": "NGN",
   "extraction_notes": "1-2 sentences flagging oddities or conversions"
 }
@@ -295,6 +387,7 @@ async function callClaude(prompt: string, key: string): Promise<{ extraction: Ex
         total_debt_ngn_m: num(r.total_debt_ngn_m),
         cash_and_equivalents_ngn_m: num(r.cash_and_equivalents_ngn_m),
         cash_from_operations_ngn_m: num(r.cash_from_operations_ngn_m),
+        shares_outstanding: num(r.shares_outstanding),
         currency: typeof r.currency === 'string' ? r.currency : 'NGN',
         extraction_notes: typeof r.extraction_notes === 'string' ? r.extraction_notes : null,
       },
@@ -327,7 +420,7 @@ async function handleReExtract(
 
   const { data: inst } = await db
     .from('instruments')
-    .select('instrument_id, name, sector, isin')
+    .select('instrument_id, name, sector, isin, shares_outstanding')
     .eq('instrument_id', ticker)
     .maybeSingle()
   if (!inst) return { ok: false, error: `instrument '${ticker}' not found` }
@@ -344,10 +437,7 @@ async function handleReExtract(
     }
   }
   if (!matchingFiling) {
-    return {
-      ok: false,
-      error: `no OData filing found matching period ${periodEnd} ${periodType}`,
-    }
+    return { ok: false, error: `no OData filing found matching period ${periodEnd} ${periodType}` }
   }
 
   try {
@@ -391,11 +481,13 @@ async function handleReExtract(
       .select()
       .maybeSingle()
     if (upErr) return { ok: false, error: `upsert failed: ${upErr.message}` }
+
+    const currentShares = (inst.shares_outstanding ?? null) as number | null
     return {
       ok: true,
       row: written,
       matched_marker,
-      derived_ratios: deriveRatios(row as unknown as FundamentalsRow),
+      derived_ratios: deriveRatios(row as unknown as FundamentalsRow, currentShares),
     }
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : String(e) }
@@ -436,6 +528,17 @@ export async function POST(req: NextRequest) {
       )
     }
     const result = await handleReExtract(ticker, periodEnd, periodType)
+    return NextResponse.json(result)
+  }
+
+  if (action === 'update-shares-current') {
+    let body: { shares_outstanding: number | null }
+    try {
+      body = (await req.json()) as { shares_outstanding: number | null }
+    } catch {
+      return NextResponse.json({ ok: false, error: 'invalid JSON body' }, { status: 400 })
+    }
+    const result = await handleUpdateSharesCurrent(ticker, body)
     return NextResponse.json(result)
   }
 
