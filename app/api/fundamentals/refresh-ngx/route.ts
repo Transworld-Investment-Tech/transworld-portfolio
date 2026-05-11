@@ -45,6 +45,7 @@ const CLAUDE_MAX_TOKENS = 2000
 // ─── Types ─────────────────────────────────────────────────────────
 
 interface FundamentalsExtraction {
+  // v27cb-a-fix2 — added cash_and_equivalents_ngn_m + cash_from_operations_ngn_m
   revenue_ngn_m: number | null
   gross_profit_ngn_m: number | null
   operating_profit_ngn_m: number | null
@@ -56,6 +57,8 @@ interface FundamentalsExtraction {
   total_assets_ngn_m: number | null
   total_equity_ngn_m: number | null
   total_debt_ngn_m: number | null
+  cash_and_equivalents_ngn_m: number | null
+  cash_from_operations_ngn_m: number | null
   roe_pct: number | null
   roa_pct: number | null
   net_margin_pct: number | null
@@ -108,15 +111,18 @@ Period end: ${periodEnd} (${periodType})
 
 CRITICAL RULES:
 1. All ngn_m fields are in MILLIONS OF NAIRA. Convert if the statement uses thousands or billions.
-2. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "k", DIVIDE BY 100 before reporting.
-3. book_value_per_share is in actual naira per share.
-4. ROE, ROA, net_margin are PERCENTAGES (e.g. 25.5 means 25.5%).
-5. Return null for ANY field NOT REPORTED in the statement. Do NOT estimate, infer, fabricate, or compute from other fields.
-6. For BANKS, INSURERS, ASSET MANAGERS: "gross_profit_ngn_m" should be null (no COGS concept). "revenue_ngn_m" = Gross Earnings (interest income + non-interest income).
-7. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
-8. If the statement shows BOTH Group and Company columns, use the GROUP (consolidated) column.
-9. Numbers may have parentheses or hyphens for negatives — convert to negative numbers.
-10. Output ONLY the JSON object — nothing else.
+2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If a line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion).
+3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
+4. book_value_per_share is in actual naira per share.
+5. cash_and_equivalents_ngn_m: line item from the BALANCE SHEET labeled "Cash and cash equivalents" or "Cash and balances with banks" (banks). Millions of naira.
+6. cash_from_operations_ngn_m: top-line subtotal from the STATEMENT OF CASH FLOWS in the "Cash flows from operating activities" section — the "Net cash from/(used in) operating activities" line. Millions of naira. Negative numbers (in parentheses) allowed.
+7. ROE, ROA, net_margin are PERCENTAGES (e.g. 25.5 means 25.5%).
+8. Return null for ANY field NOT REPORTED in the statement. Do NOT estimate, infer, fabricate, or compute from other fields.
+9. For BANKS, INSURERS, ASSET MANAGERS: "gross_profit_ngn_m" should be null (no COGS concept). "revenue_ngn_m" = Gross Earnings (interest income + non-interest income).
+10. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
+11. If the statement shows BOTH Group and Company columns, use the GROUP (consolidated) column.
+12. Numbers may have parentheses or hyphens for negatives — convert to negative numbers.
+13. Output ONLY the JSON object — nothing else.
 
 Required JSON schema:
 {
@@ -131,6 +137,8 @@ Required JSON schema:
   "total_assets_ngn_m": number|null,
   "total_equity_ngn_m": number|null,
   "total_debt_ngn_m": number|null,
+  "cash_and_equivalents_ngn_m": number|null,
+  "cash_from_operations_ngn_m": number|null,
   "roe_pct": number|null,
   "roa_pct": number|null,
   "net_margin_pct": number|null,
@@ -218,6 +226,8 @@ function validateExtraction(raw: unknown): FundamentalsExtraction | null {
     total_assets_ngn_m: numOrNull(r.total_assets_ngn_m),
     total_equity_ngn_m: numOrNull(r.total_equity_ngn_m),
     total_debt_ngn_m: numOrNull(r.total_debt_ngn_m),
+    cash_and_equivalents_ngn_m: numOrNull(r.cash_and_equivalents_ngn_m),
+    cash_from_operations_ngn_m: numOrNull(r.cash_from_operations_ngn_m),
     roe_pct: numOrNull(r.roe_pct),
     roa_pct: numOrNull(r.roa_pct),
     net_margin_pct: numOrNull(r.net_margin_pct),
@@ -355,6 +365,8 @@ async function processTicker(
         total_assets_ngn_m: pfr.extraction.total_assets_ngn_m,
         total_equity_ngn_m: pfr.extraction.total_equity_ngn_m,
         total_debt_ngn_m: pfr.extraction.total_debt_ngn_m,
+        cash_and_equivalents_ngn_m: pfr.extraction.cash_and_equivalents_ngn_m,
+        cash_from_operations_ngn_m: pfr.extraction.cash_from_operations_ngn_m,
         roe_pct: pfr.extraction.roe_pct,
         roa_pct: pfr.extraction.roa_pct,
         net_margin_pct: pfr.extraction.net_margin_pct,
@@ -395,6 +407,8 @@ async function processTicker(
           total_assets_ngn_m: ex.total_assets_ngn_m,
           total_equity_ngn_m: ex.total_equity_ngn_m,
           total_debt_ngn_m: ex.total_debt_ngn_m,
+          cash_and_equivalents_ngn_m: ex.cash_and_equivalents_ngn_m,
+          cash_from_operations_ngn_m: ex.cash_from_operations_ngn_m,
           roe_pct: ex.roe_pct,
           roa_pct: ex.roa_pct,
           net_margin_pct: ex.net_margin_pct,

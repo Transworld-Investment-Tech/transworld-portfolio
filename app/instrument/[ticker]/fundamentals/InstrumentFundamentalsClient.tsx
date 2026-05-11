@@ -1,17 +1,11 @@
-// v27cb-a — Fundamentals editor (interactive client component).
+// v27cb-a-fix2 — Fundamentals editor (interactive client component)
 //
-// Layout:
-//   - Crumb + heading + back link
-//   - Each PERIOD gets its own card. Columns layout if multiple periods present.
-//   - Each card contains:
-//       * Header: period_end + period_type + verified-status badge
-//       * PDF link (filename) + Re-extract button
-//       * Editable fields grouped into Income Statement + Balance Sheet
-//       * Computed-ratio display (read-only — derived from inputs at save time)
-//       * Operator notes textarea
-//       * Save buttons: "Save & mark verified" / "Save (still unverified)" / "Flag"
-//
-// Verified rows show inputs as read-only with an "Unverify to edit" button.
+// Adds vs v27cb-a:
+//   • Two new editable fields: cash_and_equivalents_ngn_m + cash_from_operations_ngn_m
+//   • Calculator field: any input value starting with "=" is evaluated as a JS
+//     arithmetic expression on blur (e.g. "=989630+2402362" -> 3392000).
+//     Only +, -, *, /, parentheses, decimals, digits, and whitespace allowed.
+//   • Cash Conversion derived ratio (CFO / PAT × 100, percent)
 
 'use client'
 
@@ -30,6 +24,7 @@ interface DerivedRatios {
   roe_pct: number | null
   roa_pct: number | null
   net_margin_pct: number | null
+  cash_conversion_pct: number | null
 }
 
 type PeriodRow = {
@@ -50,6 +45,8 @@ type PeriodRow = {
   total_assets_ngn_m: number | null
   total_equity_ngn_m: number | null
   total_debt_ngn_m: number | null
+  cash_and_equivalents_ngn_m: number | null
+  cash_from_operations_ngn_m: number | null
   currency: string | null
   source?: string | null
   extraction_notes?: string | null
@@ -88,7 +85,14 @@ const FIELD_GROUPS: Array<{
       { key: 'total_assets_ngn_m', label: 'Total assets', unit: '₦M' },
       { key: 'total_equity_ngn_m', label: 'Total equity', unit: '₦M' },
       { key: 'total_debt_ngn_m', label: 'Total debt', unit: '₦M' },
+      { key: 'cash_and_equivalents_ngn_m', label: 'Cash & equivalents', unit: '₦M' },
       { key: 'book_value_per_share', label: 'Book value / share', unit: '₦' },
+    ],
+  },
+  {
+    group_label: 'Cash flow',
+    fields: [
+      { key: 'cash_from_operations_ngn_m', label: 'Cash from operations', unit: '₦M' },
     ],
   },
 ]
@@ -110,11 +114,40 @@ function deriveRatios(r: PeriodRow): DerivedRatios {
   const eq = r.total_equity_ngn_m
   const assets = r.total_assets_ngn_m
   const rev = r.revenue_ngn_m
+  const cfo = r.cash_from_operations_ngn_m
   return {
     roe_pct: pat !== null && eq !== null && eq > 0 ? (pat / eq) * 100 : null,
     roa_pct: pat !== null && assets !== null && assets > 0 ? (pat / assets) * 100 : null,
     net_margin_pct: pat !== null && rev !== null && rev > 0 ? (pat / rev) * 100 : null,
+    cash_conversion_pct: pat !== null && pat !== 0 && cfo !== null ? (cfo / pat) * 100 : null,
   }
+}
+
+// Safe calculator: accepts only digits, +, -, *, /, (, ), ., and whitespace
+// — and rejects everything else outright. Evaluated via Function constructor
+// (not eval) so any other tokens cause a SyntaxError, which we catch.
+function safeEvalExpression(expr: string): number | null {
+  const cleaned = expr.replace(/,/g, '').replace(/\s+/g, '')
+  if (!/^[\d+\-*/().]+$/.test(cleaned)) return null
+  if (cleaned.length === 0 || cleaned.length > 200) return null
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const fn = new Function(`"use strict"; return (${cleaned})`)
+    const v = fn()
+    return typeof v === 'number' && isFinite(v) ? v : null
+  } catch {
+    return null
+  }
+}
+
+function parseFieldInput(raw: string): number | null {
+  const trimmed = raw.trim()
+  if (trimmed === '' || trimmed === '-' || trimmed === '—') return null
+  if (trimmed.startsWith('=')) {
+    return safeEvalExpression(trimmed.slice(1))
+  }
+  const num = parseFloat(trimmed.replace(/,/g, ''))
+  return isFinite(num) ? num : null
 }
 
 function normalizePeriod(raw: Record<string, unknown>): PeriodRow {
@@ -124,7 +157,7 @@ function normalizePeriod(raw: Record<string, unknown>): PeriodRow {
     return typeof n === 'number' && isFinite(n) ? n : null
   }
   return {
-    id: (raw.id as string | undefined),
+    id: raw.id as string | undefined,
     instrument_id: raw.instrument_id as string,
     period_end: raw.period_end as string,
     period_type: raw.period_type as 'annual' | 'quarterly',
@@ -141,6 +174,8 @@ function normalizePeriod(raw: Record<string, unknown>): PeriodRow {
     total_assets_ngn_m: num(raw.total_assets_ngn_m),
     total_equity_ngn_m: num(raw.total_equity_ngn_m),
     total_debt_ngn_m: num(raw.total_debt_ngn_m),
+    cash_and_equivalents_ngn_m: num(raw.cash_and_equivalents_ngn_m),
+    cash_from_operations_ngn_m: num(raw.cash_from_operations_ngn_m),
     currency: (raw.currency as string | null) ?? 'NGN',
     source: (raw.source as string | null) ?? null,
     extraction_notes: (raw.extraction_notes as string | null) ?? null,
@@ -161,26 +196,36 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
   )
   const [busy, setBusy] = useState<Record<string, boolean>>({})
   const [flash, setFlash] = useState<{ key: string; kind: 'ok' | 'err'; msg: string } | null>(null)
+  // Local per-cell input buffer so user can type "=989630+2402362" without
+  // losing focus mid-type; we only parse on blur.
+  const [drafts, setDrafts] = useState<Record<string, string>>({})
 
   const periodKey = (r: PeriodRow) => `${r.period_end}|${r.period_type}`
+  const draftKey = (k: string, field: string) => `${k}::${field}`
 
-  const updateField = (key: string, field: keyof PeriodRow, value: string) => {
+  const onDraftChange = (key: string, field: keyof PeriodRow, value: string) => {
+    setDrafts((d) => ({ ...d, [draftKey(key, field as string)]: value }))
+  }
+
+  const onFieldCommit = (key: string, field: keyof PeriodRow) => {
+    const dk = draftKey(key, field as string)
+    const raw = drafts[dk]
+    if (raw === undefined) return // never edited
+    const parsed = parseFieldInput(raw)
     setPeriods((prev) =>
       prev.map((r) => {
         if (periodKey(r) !== key) return r
-        const trimmed = value.trim()
-        const num =
-          trimmed === '' || trimmed === '-' || trimmed === '—'
-            ? null
-            : parseFloat(trimmed.replace(/,/g, ''))
-        const next: PeriodRow = {
-          ...r,
-          [field]: isFinite(num as number) ? (num as number) : null,
-        }
+        const next: PeriodRow = { ...r, [field]: parsed }
         next.derived_ratios = deriveRatios(next)
         return next
       }),
     )
+    // Clear the draft so the cell re-renders from canonical state
+    setDrafts((d) => {
+      const out = { ...d }
+      delete out[dk]
+      return out
+    })
   }
 
   const updateNotes = (key: string, value: string) => {
@@ -224,7 +269,11 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
   const callReExtract = async (key: string) => {
     const row = periods.find((r) => periodKey(r) === key)
     if (!row) return
-    if (!confirm('Re-extract from PDF? This will overwrite the current values with a fresh Claude extraction (verified rows are protected).')) {
+    if (
+      !confirm(
+        'Re-extract from PDF? This will overwrite current values with a fresh Claude extraction (verified rows are protected).',
+      )
+    ) {
       return
     }
     setBusy((b) => ({ ...b, [key]: true }))
@@ -258,6 +307,7 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
       const json = await res.json()
       if (json.ok && Array.isArray(json.periods)) {
         setPeriods(json.periods.map(normalizePeriod))
+        setDrafts({})
         setFlash({ key: '_global', kind: 'ok', msg: 'Refreshed from server' })
       }
     } catch (e) {
@@ -338,6 +388,17 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
             {instrument.sector ? ` · ${instrument.sector}` : ''}
             {instrument.isin ? ` · ${instrument.isin}` : ''}
           </div>
+          <div
+            style={{
+              fontSize: 11,
+              color: 'var(--text-3, #8a8f9a)',
+              marginTop: 6,
+              fontStyle: 'italic',
+            }}
+          >
+            Tip: type <code style={{ fontFamily: 'ui-monospace, monospace' }}>=989630+2402362</code>{' '}
+            in any field to compute on blur.
+          </div>
         </div>
         <div style={{ display: 'flex', gap: 12, alignItems: 'center' }}>
           <div style={{ fontSize: 12, color: 'var(--text-2, #5c6573)' }}>
@@ -374,13 +435,14 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
         </div>
       </div>
 
-      {/* Global flash */}
       {flash && flash.key === '_global' ? (
         <div
           style={{
             padding: '10px 14px',
             background: flash.kind === 'ok' ? 'rgba(45,110,78,0.08)' : 'rgba(166,59,59,0.08)',
-            border: `1px solid ${flash.kind === 'ok' ? 'rgba(45,110,78,0.3)' : 'rgba(166,59,59,0.3)'}`,
+            border: `1px solid ${
+              flash.kind === 'ok' ? 'rgba(45,110,78,0.3)' : 'rgba(166,59,59,0.3)'
+            }`,
             borderRadius: 3,
             fontSize: 12,
             color: flash.kind === 'ok' ? 'var(--pos)' : 'var(--neg)',
@@ -391,7 +453,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
         </div>
       ) : null}
 
-      {/* No periods */}
       {periods.length === 0 ? (
         <div
           style={{
@@ -404,7 +465,7 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
             fontSize: 13,
           }}
         >
-          No fundamentals data for {ticker} yet. Run the OData refresh from /admin or via curl:
+          No fundamentals data for {ticker} yet. Run the OData refresh:
           <code
             style={{
               display: 'inline-block',
@@ -421,7 +482,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
         </div>
       ) : null}
 
-      {/* Period cards */}
       <div
         style={{
           display: 'grid',
@@ -447,7 +507,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 opacity: isBusy ? 0.6 : 1,
               }}
             >
-              {/* Card header */}
               <div
                 style={{
                   display: 'flex',
@@ -486,7 +545,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 <StatusPill status={row.verified_status} />
               </div>
 
-              {/* PDF + re-extract */}
               <div
                 style={{
                   fontSize: 11,
@@ -536,7 +594,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 </button>
               </div>
 
-              {/* Fields */}
               {FIELD_GROUPS.map((g) => (
                 <div key={g.group_label} style={{ marginBottom: 14 }}>
                   <div
@@ -553,7 +610,15 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                   </div>
                   {g.fields.map((f) => {
                     const v = row[f.key]
-                    const display = v === null || v === undefined ? '' : String(v)
+                    const dk = draftKey(key, f.key as string)
+                    const draftVal = drafts[dk]
+                    const display =
+                      draftVal !== undefined
+                        ? draftVal
+                        : v === null || v === undefined
+                          ? ''
+                          : String(v)
+                    const isFormula = display.trim().startsWith('=')
                     return (
                       <div
                         key={f.key as string}
@@ -577,14 +642,24 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                           type="text"
                           value={display}
                           disabled={isVerified || isBusy}
-                          onChange={(e) => updateField(key, f.key, e.target.value)}
+                          onChange={(e) => onDraftChange(key, f.key, e.target.value)}
+                          onBlur={() => onFieldCommit(key, f.key)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter') {
+                              ;(e.currentTarget as HTMLInputElement).blur()
+                            }
+                          }}
                           style={{
                             flex: 1,
                             padding: '4px 8px',
                             fontSize: 13,
-                            fontFamily: '"Cormorant Garamond", Georgia, serif',
+                            fontFamily: isFormula
+                              ? 'ui-monospace, "SF Mono", Menlo, monospace'
+                              : '"Cormorant Garamond", Georgia, serif',
                             fontVariantNumeric: 'tabular-nums',
-                            border: '1px solid var(--border, rgba(15,41,71,0.12))',
+                            border: isFormula
+                              ? '1px solid var(--gold, #b08b3e)'
+                              : '1px solid var(--border, rgba(15,41,71,0.12))',
                             borderRadius: 3,
                             background: isVerified ? 'var(--bg-soft, #faf5ea)' : '#fff',
                             color: 'var(--text)',
@@ -608,7 +683,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 </div>
               ))}
 
-              {/* Derived ratios — read-only */}
               <div style={{ marginBottom: 14 }}>
                 <div
                   style={{
@@ -626,6 +700,7 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                   { label: 'ROE', value: ratios.roe_pct },
                   { label: 'ROA', value: ratios.roa_pct },
                   { label: 'Net margin', value: ratios.net_margin_pct },
+                  { label: 'Cash conversion', value: ratios.cash_conversion_pct },
                 ].map((r) => (
                   <div
                     key={r.label}
@@ -662,7 +737,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 ))}
               </div>
 
-              {/* Extraction notes (read-only) */}
               {row.extraction_notes ? (
                 <div
                   style={{
@@ -682,7 +756,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 </div>
               ) : null}
 
-              {/* Operator notes */}
               <div style={{ marginBottom: 12 }}>
                 <div
                   style={{
@@ -716,7 +789,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 />
               </div>
 
-              {/* Actions */}
               <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
                 {isVerified ? (
                   <button
@@ -797,7 +869,6 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                 )}
               </div>
 
-              {/* Per-card flash */}
               {localFlash ? (
                 <div
                   style={{

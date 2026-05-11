@@ -1,20 +1,11 @@
-// v27cb-a — Fundamentals editor API
+// v27cb-a-fix2 — Fundamentals editor API
 //
-// Three operations on `fundamentals_history` rows for the human-in-the-loop
-// review workflow:
-//   - GET  ?ticker=X                → all fundamentals_history rows for that ticker, newest first
-//                                     plus instrument metadata (name, sector, isin)
-//   - POST ?ticker=X (body: row)    → upsert one period with operator edits + verified status
-//   - POST ?ticker=X&action=re-extract&period_end=YYYY-MM-DD&period_type=annual
-//                                   → re-runs the OData-driven extraction for one specific period
-//                                     (useful when prompt improves or operator wants a clean retry)
-//
-// Architectural notes:
-//   - Verified rows are SAFE from re-extract: re-extract refuses to overwrite a verified row
-//     (operator must explicitly unverify via UI first)
-//   - Computed ratios (ROE / ROA / Net Margin) are computed server-side from operator-verified
-//     inputs at read time — they are NOT stored. This means once Revenue/PAT/Equity/Assets
-//     are verified, the ratios auto-derive cleanly.
+// Adds vs v27cb-a:
+//   • Two new fields persisted to fundamentals_history:
+//       - cash_and_equivalents_ngn_m   (BS — cash & cash equivalents)
+//       - cash_from_operations_ngn_m   (Statement of Cash Flow — operating activities)
+//   • Cash Conversion derived ratio (CFO / PAT × 100) returned in derived_ratios
+//   • Re-extract reads/writes the 2 new fields from Claude output
 
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '@/lib/supabase'
@@ -39,36 +30,39 @@ const CLAUDE_MAX_TOKENS = 2000
 // ─── Types ─────────────────────────────────────────────────────────
 
 interface FundamentalsRow {
-  id?:                       string
-  instrument_id:             string
-  period_end:                string
-  period_type:               'annual' | 'quarterly'
-  pdf_source_url?:           string | null
-  pdf_filename?:             string | null
-  revenue_ngn_m?:            number | null
-  gross_profit_ngn_m?:       number | null
-  operating_profit_ngn_m?:   number | null
-  profit_before_tax_ngn_m?:  number | null
-  profit_after_tax_ngn_m?:   number | null
-  eps_basic?:                number | null
-  eps_diluted?:              number | null
-  book_value_per_share?:     number | null
-  total_assets_ngn_m?:       number | null
-  total_equity_ngn_m?:       number | null
-  total_debt_ngn_m?:         number | null
-  currency?:                 string | null
-  source?:                   string | null
-  extraction_notes?:         string | null
-  verified_status?:          'unverified' | 'verified' | 'flagged'
-  verified_at?:              string | null
-  verified_by?:              string | null
-  operator_notes?:           string | null
+  id?:                          string
+  instrument_id:                string
+  period_end:                   string
+  period_type:                  'annual' | 'quarterly'
+  pdf_source_url?:              string | null
+  pdf_filename?:                string | null
+  revenue_ngn_m?:               number | null
+  gross_profit_ngn_m?:          number | null
+  operating_profit_ngn_m?:      number | null
+  profit_before_tax_ngn_m?:     number | null
+  profit_after_tax_ngn_m?:      number | null
+  eps_basic?:                   number | null
+  eps_diluted?:                 number | null
+  book_value_per_share?:        number | null
+  total_assets_ngn_m?:          number | null
+  total_equity_ngn_m?:          number | null
+  total_debt_ngn_m?:            number | null
+  cash_and_equivalents_ngn_m?:  number | null
+  cash_from_operations_ngn_m?:  number | null
+  currency?:                    string | null
+  source?:                      string | null
+  extraction_notes?:            string | null
+  verified_status?:             'unverified' | 'verified' | 'flagged'
+  verified_at?:                 string | null
+  verified_by?:                 string | null
+  operator_notes?:              string | null
 }
 
 interface DerivedRatios {
-  roe_pct:        number | null
-  roa_pct:        number | null
-  net_margin_pct: number | null
+  roe_pct:              number | null
+  roa_pct:              number | null
+  net_margin_pct:       number | null
+  cash_conversion_pct:  number | null
 }
 
 function deriveRatios(row: FundamentalsRow): DerivedRatios {
@@ -76,10 +70,12 @@ function deriveRatios(row: FundamentalsRow): DerivedRatios {
   const eq = row.total_equity_ngn_m ?? null
   const assets = row.total_assets_ngn_m ?? null
   const rev = row.revenue_ngn_m ?? null
+  const cfo = row.cash_from_operations_ngn_m ?? null
   return {
     roe_pct: pat !== null && eq !== null && eq > 0 ? (pat / eq) * 100 : null,
     roa_pct: pat !== null && assets !== null && assets > 0 ? (pat / assets) * 100 : null,
     net_margin_pct: pat !== null && rev !== null && rev > 0 ? (pat / rev) * 100 : null,
+    cash_conversion_pct: pat !== null && pat !== 0 && cfo !== null ? (cfo / pat) * 100 : null,
   }
 }
 
@@ -146,6 +142,8 @@ async function handleUpsert(ticker: string, body: FundamentalsRow): Promise<unkn
     total_assets_ngn_m: coerceNumOrNull(body.total_assets_ngn_m),
     total_equity_ngn_m: coerceNumOrNull(body.total_equity_ngn_m),
     total_debt_ngn_m: coerceNumOrNull(body.total_debt_ngn_m),
+    cash_and_equivalents_ngn_m: coerceNumOrNull(body.cash_and_equivalents_ngn_m),
+    cash_from_operations_ngn_m: coerceNumOrNull(body.cash_from_operations_ngn_m),
     currency: body.currency ?? 'NGN',
     extraction_notes: body.extraction_notes ?? null,
     verified_status: body.verified_status ?? 'unverified',
@@ -179,6 +177,8 @@ interface ExtractionResult {
   total_assets_ngn_m: number | null
   total_equity_ngn_m: number | null
   total_debt_ngn_m: number | null
+  cash_and_equivalents_ngn_m: number | null
+  cash_from_operations_ngn_m: number | null
   currency: string
   extraction_notes: string | null
 }
@@ -201,15 +201,17 @@ Period end: ${periodEnd} (${periodType})
 
 CRITICAL RULES:
 1. All ngn_m fields are in MILLIONS OF NAIRA. Convert if the statement uses thousands or billions.
-2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176.
-3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or just "k", DIVIDE BY 100 before reporting.
+2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If the line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion). If you see a value like "4878.176" without commas, treat it literally — but a value WITH commas is always thousands-grouped.
+3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
 4. book_value_per_share is in actual naira per share.
-5. Return null for ANY field NOT REPORTED in the statement. Do NOT estimate, infer, fabricate, or compute from other fields.
-6. For BANKS, INSURERS, ASSET MANAGERS: "gross_profit_ngn_m" should be null. "revenue_ngn_m" = Gross Earnings (interest income + non-interest income).
-7. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
-8. If the statement shows BOTH Group and Company columns, use the GROUP (consolidated) column.
-9. Numbers in parentheses are negative.
-10. Output ONLY the JSON object.
+5. cash_and_equivalents_ngn_m: line item from the BALANCE SHEET labeled "Cash and cash equivalents" or "Cash and balances with banks" (banks). Millions of naira.
+6. cash_from_operations_ngn_m: top-line subtotal from the STATEMENT OF CASH FLOWS in the "Cash flows from operating activities" section — the "Net cash from/(used in) operating activities" line. Millions of naira. Negative numbers (in parentheses) allowed.
+7. Return null for ANY field NOT REPORTED. Do NOT estimate, infer, fabricate, or compute from other fields.
+8. For BANKS, INSURERS, ASSET MANAGERS: gross_profit_ngn_m should be null. revenue_ngn_m = Gross Earnings (interest income + non-interest income).
+9. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
+10. If the statement shows BOTH Group and Company columns, use the GROUP (consolidated) column.
+11. Numbers in parentheses are negative.
+12. Output ONLY the JSON object.
 
 Required JSON schema:
 {
@@ -224,6 +226,8 @@ Required JSON schema:
   "total_assets_ngn_m": number|null,
   "total_equity_ngn_m": number|null,
   "total_debt_ngn_m": number|null,
+  "cash_and_equivalents_ngn_m": number|null,
+  "cash_from_operations_ngn_m": number|null,
   "currency": "NGN",
   "extraction_notes": "1-2 sentences flagging oddities or conversions"
 }
@@ -288,6 +292,8 @@ async function callClaude(prompt: string, key: string): Promise<{ extraction: Ex
         total_assets_ngn_m: num(r.total_assets_ngn_m),
         total_equity_ngn_m: num(r.total_equity_ngn_m),
         total_debt_ngn_m: num(r.total_debt_ngn_m),
+        cash_and_equivalents_ngn_m: num(r.cash_and_equivalents_ngn_m),
+        cash_from_operations_ngn_m: num(r.cash_from_operations_ngn_m),
         currency: typeof r.currency === 'string' ? r.currency : 'NGN',
         extraction_notes: typeof r.extraction_notes === 'string' ? r.extraction_notes : null,
       },
@@ -307,7 +313,6 @@ async function handleReExtract(
   const anthropicKey = process.env.ANTHROPIC_API_KEY
   if (!anthropicKey) return { ok: false, error: 'ANTHROPIC_API_KEY not set' }
 
-  // Refuse to re-extract a verified row
   const { data: existing } = await db
     .from('fundamentals_history')
     .select('verified_status, pdf_source_url, pdf_filename')
@@ -319,7 +324,6 @@ async function handleReExtract(
     return { ok: false, error: 'period is marked verified — unverify first via UI before re-extracting' }
   }
 
-  // Find instrument
   const { data: inst } = await db
     .from('instruments')
     .select('instrument_id, name, sector, isin')
@@ -328,13 +332,11 @@ async function handleReExtract(
   if (!inst) return { ok: false, error: `instrument '${ticker}' not found` }
   if (!inst.isin) return { ok: false, error: `instrument '${ticker}' has no ISIN — run build-isin-registry first` }
 
-  // Find the matching filing in OData
   const filings = await fetchFinancialFilings(inst.isin as string)
   let matchingFiling: XFinancialNewsItem | null = null
   for (const f of filings) {
     const meta = extractPeriodMetadata(f)
     if (meta && meta.period_end === periodEnd && meta.period_type === periodType) {
-      // Prefer most recently modified for ties
       if (matchingFiling === null || new Date(f.Modified) > new Date(matchingFiling.Modified)) {
         matchingFiling = f
       }
@@ -347,7 +349,6 @@ async function handleReExtract(
     }
   }
 
-  // Download + extract + Claude
   try {
     const pdfUrl = matchingFiling.URL.Url
     const pdfFilename = matchingFiling.URL.Description
@@ -371,7 +372,6 @@ async function handleReExtract(
       return { ok: false, error: error ?? 'no extraction', matched_marker }
     }
 
-    // Upsert (preserves any existing operator_notes; resets verified_status to unverified)
     const row = {
       instrument_id: ticker,
       period_end: periodEnd,
@@ -438,7 +438,6 @@ export async function POST(req: NextRequest) {
     return NextResponse.json(result)
   }
 
-  // Default: upsert
   let body: FundamentalsRow
   try {
     body = (await req.json()) as FundamentalsRow
