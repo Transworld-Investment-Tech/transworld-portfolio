@@ -1,0 +1,173 @@
+// v27ca — PDF download + text extraction + financial-section locator
+//
+// Builds on the unpdf-based pattern already proven in lib/broker-parser.ts.
+// unpdf ships a serverless-friendly pdfjs build with DOMMatrix / Path2D / other
+// browser globals pre-polyfilled — required because Vercel's Node runtime
+// otherwise throws "DOMMatrix is not defined" when pdfjs is used directly.
+//
+// Three public helpers:
+//   - downloadPdfAsBuffer(url)          → fetch the PDF binary as a Buffer
+//   - extractPdfLines(buffer)           → layout-aware line extraction (y-sorted, x-joined)
+//   - findFinancialStatementSection(lines, maxChars)
+//                                       → returns a focused text block of just the
+//                                          P&L + Balance Sheet + EPS pages, capped at ~30K chars
+//
+// findFinancialStatementSection is the key sizing knob: full audited reports are
+// 100-300 pages but the actual financial statements are concentrated in ~10-30
+// pages near the middle. Cutting to that section reduces Claude input cost ~10x.
+
+const PDF_USER_AGENT =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+/**
+ * Fetch a PDF from a URL and return its bytes as a Node Buffer.
+ * Uses browser-like headers to maximise compatibility with anti-bot defenses.
+ */
+export async function downloadPdfAsBuffer(url: string): Promise<Buffer> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), 30_000)
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        'User-Agent': PDF_USER_AGENT,
+        Accept: 'application/pdf,application/octet-stream,*/*',
+      },
+      signal: controller.signal,
+      redirect: 'follow',
+    })
+    if (!res.ok) {
+      throw new Error(`PDF download ${res.status}: ${url.slice(-80)}`)
+    }
+    const ab = await res.arrayBuffer()
+    return Buffer.from(ab)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+}
+
+const Y_TOLERANCE = 2
+
+/**
+ * Coordinate-aware line extraction. Sort items by y descending (PDF coords
+ * are bottom-up), then group items within Y_TOLERANCE pixels into the same
+ * line, then sort each line's items left-to-right by x. Returns one logical
+ * line per array element. Critical for tabular financial statements where
+ * column alignment matters.
+ */
+export async function extractPdfLines(buffer: Buffer): Promise<string[]> {
+  const { getDocumentProxy } = await import('unpdf')
+  const pdf = await getDocumentProxy(new Uint8Array(buffer))
+  const allLines: string[] = []
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p)
+    const content = await page.getTextContent()
+
+    type Item = { str: string; x: number; y: number }
+    const items: Item[] = (content.items as Array<{ str: string; transform: number[] }>)
+      .filter((it) => it && typeof it.str === 'string' && it.str.trim().length > 0)
+      .map((it) => ({
+        str: it.str,
+        x: it.transform[4],
+        y: it.transform[5],
+      }))
+
+    items.sort((a, b) => b.y - a.y || a.x - b.x)
+
+    let currentY: number | null = null
+    let current: Item[] = []
+    const flush = () => {
+      if (current.length === 0) return
+      current.sort((a, b) => a.x - b.x)
+      const line = current
+        .map((c) => c.str)
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+      if (line) allLines.push(line)
+      current = []
+    }
+    for (const it of items) {
+      if (currentY === null || Math.abs(it.y - currentY) > Y_TOLERANCE) {
+        flush()
+        currentY = it.y
+      }
+      current.push(it)
+    }
+    flush()
+  }
+
+  return allLines
+}
+
+/**
+ * Locate the financial-statements section within an extracted line array.
+ * Returns the joined text of lines from the first "Statement of profit or loss"
+ * or "Statement of comprehensive income" marker through to the end of the
+ * "Statement of cash flows" or "Earnings per share" notes, capped at maxChars.
+ *
+ * Falls back to returning the whole document head (first maxChars) if no
+ * marker is found — better to send full text than nothing.
+ */
+export function findFinancialStatementSection(
+  lines: string[],
+  maxChars = 30_000,
+): { section: string; matched_marker: string | null; total_lines: number } {
+  const markers = [
+    /statement of profit or loss/i,
+    /statement of comprehensive income/i,
+    /consolidated income statement/i,
+    /interim statement of comprehensive income/i,
+    /consolidated statement of comprehensive income/i,
+  ]
+
+  let startIdx = -1
+  let matched_marker: string | null = null
+  for (const re of markers) {
+    for (let i = 0; i < lines.length; i++) {
+      if (re.test(lines[i])) {
+        startIdx = i
+        matched_marker = lines[i]
+        break
+      }
+    }
+    if (startIdx !== -1) break
+  }
+
+  if (startIdx === -1) {
+    // Fallback: return head of document
+    const joined = lines.join('\n')
+    return {
+      section: joined.slice(0, maxChars),
+      matched_marker: null,
+      total_lines: lines.length,
+    }
+  }
+
+  // Read forward until we hit a clear end marker OR run out of budget
+  const endMarkers = [
+    /notes to (the )?consolidated/i,
+    /notes to the financial statements/i,
+    /significant accounting polic/i,
+  ]
+  let endIdx = lines.length
+  for (let i = startIdx + 100; i < lines.length; i++) {
+    let matched = false
+    for (const re of endMarkers) {
+      if (re.test(lines[i])) {
+        endIdx = i
+        matched = true
+        break
+      }
+    }
+    if (matched) break
+  }
+
+  const slice = lines.slice(startIdx, endIdx).join('\n')
+  return {
+    section: slice.slice(0, maxChars),
+    matched_marker,
+    total_lines: lines.length,
+  }
+}

@@ -20,6 +20,12 @@
     },
     "app/api/ai-summaries/refresh/route.ts": {
       "maxDuration": 300
+    },
+    "app/api/fundamentals/refresh-ngx/route.ts": {
+      "maxDuration": 300
+    },
+    "app/api/admin/build-isin-registry/route.ts": {
+      "maxDuration": 60
     }
   },
   "crons": [
@@ -38,6 +44,10 @@
     {
       "path": "/api/ai-summaries/refresh",
       "schedule": "0 14 * * 0"
+    },
+    {
+      "path": "/api/fundamentals/refresh-ngx",
+      "schedule": "0 10 * * 6"
     }
   ]
 }
