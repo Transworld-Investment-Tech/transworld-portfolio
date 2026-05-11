@@ -1,4 +1,4 @@
-// v27cb-a-fix2 — Fundamentals editor API
+// v27cb-a-fix2 — Fundamentals editor API   // v27cb-a-fix3: broadened cash field vocabulary
 //
 // Adds vs v27cb-a:
 //   • Two new fields persisted to fundamentals_history:
@@ -204,8 +204,9 @@ CRITICAL RULES:
 2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If the line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion). If you see a value like "4878.176" without commas, treat it literally — but a value WITH commas is always thousands-grouped.
 3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
 4. book_value_per_share is in actual naira per share.
-5. cash_and_equivalents_ngn_m: line item from the BALANCE SHEET labeled "Cash and cash equivalents" or "Cash and balances with banks" (banks). Millions of naira.
-6. cash_from_operations_ngn_m: top-line subtotal from the STATEMENT OF CASH FLOWS in the "Cash flows from operating activities" section — the "Net cash from/(used in) operating activities" line. Millions of naira. Negative numbers (in parentheses) allowed.
+5. cash_and_equivalents_ngn_m: BALANCE SHEET line item. Common labels: "Cash and cash equivalents", "Cash and balances with banks" (banks), "Cash and short-term funds", "Cash and bank balances", "Cash at bank and in hand". Use the top-of-balance-sheet asset line, NOT the cash-flow-statement reconciliation total at year-end. Millions of naira.
+6. cash_from_operations_ngn_m: subtotal from the STATEMENT OF CASH FLOWS in the operating activities section. Common labels: "Net cash from operating activities", "Net cash generated from operating activities", "Net cash provided by operating activities", "Net cash (used in) operating activities", "Cash generated from/used in operations" — whichever variant the filing uses. It is the LAST line of the operating-activities section before the "Cash flows from investing activities" heading begins. Millions of naira. Negative numbers (in parentheses) allowed.
+6b. Both cash fields: do NOT confuse "Cash and cash equivalents at end of year" (a reconciliation total at the bottom of the cash flow statement) with "Cash and cash equivalents" on the balance sheet. The balance sheet line is what we want for cash_and_equivalents_ngn_m.
 7. Return null for ANY field NOT REPORTED. Do NOT estimate, infer, fabricate, or compute from other fields.
 8. For BANKS, INSURERS, ASSET MANAGERS: gross_profit_ngn_m should be null. revenue_ngn_m = Gross Earnings (interest income + non-interest income).
 9. For CONSUMER, INDUSTRIAL, OIL & GAS, CEMENT: conventional revenue → gross profit → operating profit → PBT → PAT.
