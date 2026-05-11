@@ -1,16 +1,17 @@
-// v27ca-probe — NGX company-profile scrape diagnostic
+// v27ca-probe2 — NGX company-profile scrape diagnostic (enhanced)
 //
-// Single-shot diagnostic endpoint. Fetches the NGX company-profile page for a given
-// ticker from this Vercel function (browser-like UA, 55s timeout), then parses the
-// HTML for doclib.ngxgroup.com PDF URLs. Returns a structured JSON envelope with:
-//   - status_code, fetch_duration_ms, html_size_bytes
-//   - pdf_urls[] + pdf_count
-//   - diagnostics flags (has_doclib_reference, has_datatable_signature, etc.)
-//   - excerpts of the HTML around key markers
-//   - an interpretation string telling the operator what the result means
-//
-// Purpose: decides whether v27ca proper ships auto-scrape (pdf_count > 0) or
-// manual-upload pipeline (pdf_count == 0, table is JS-rendered).
+// Probe1 confirmed the page is fetchable from Vercel and contains the WEBSERVICE
+// config block, but PDF URLs aren't in static <a> links — the Documents table is
+// rendered by the wpDataTables WordPress plugin via AJAX. Probe2 hunts for the
+// AJAX endpoint:
+//   1. Extract every <script> block mentioning doclib/WEBSERVICE/requestUri/wpdt
+//      (capped 5KB each, max 5 blocks)
+//   2. Extract every URL-like candidate from JS: `url: "..."`, `WEBSERVICE_BASE_URL + "..."`,
+//      `WEBSERVICE_ORIGIN + "..."`, direct doclib URLs, REST endpoint strings
+//   3. Extract wpDataTables `table_id` references — these key the admin-ajax.php endpoint
+//   4. Smart-locate the Documents table via wpDataTablesWrapper occurrences with
+//      proximity scoring (avoids the footer-nav false-positive that probe1 hit)
+//   5. Carry forward probe1 fields for continuity
 
 import { NextRequest, NextResponse } from 'next/server'
 
@@ -41,12 +42,125 @@ function findDoclibUrls(html: string): string[] {
   return Array.from(urls).sort()
 }
 
-function excerptAroundMarker(html: string, marker: string, padding = 1500): string | null {
-  const idx = html.toLowerCase().indexOf(marker.toLowerCase())
-  if (idx === -1) return null
-  const start = Math.max(0, idx - padding)
-  const end = Math.min(html.length, idx + marker.length + padding)
-  return html.slice(start, end)
+interface ScriptBlock {
+  snippet: string
+  full_length: number
+  matched_keyword: string
+  position_in_html: number
+}
+
+function extractScriptBlocks(html: string, maxBlocks = 5, maxBytes = 5000): ScriptBlock[] {
+  const blocks: ScriptBlock[] = []
+  const keywords = ['doclib', 'WEBSERVICE', 'requestUri', 'wpdt', 'get_wdtable', 'admin-ajax']
+  const scriptRegex = /<script[^>]*>([\s\S]*?)<\/script>/gi
+  let m: RegExpExecArray | null
+  while ((m = scriptRegex.exec(html)) !== null && blocks.length < maxBlocks) {
+    const content = m[1]
+    let matchedKw: string | null = null
+    for (const kw of keywords) {
+      if (content.includes(kw)) {
+        matchedKw = kw
+        break
+      }
+    }
+    if (matchedKw === null) continue
+    const snippet =
+      content.length > maxBytes
+        ? content.slice(0, maxBytes) + `\n...[TRUNCATED — full length: ${content.length} bytes]`
+        : content
+    blocks.push({
+      snippet,
+      full_length: content.length,
+      matched_keyword: matchedKw,
+      position_in_html: m.index,
+    })
+  }
+  return blocks
+}
+
+function extractJsUrlCandidates(html: string): string[] {
+  const candidates = new Set<string>()
+  const patterns: Array<[RegExp, (match: RegExpExecArray) => string]> = [
+    // url: "..." or url : '...'
+    [/\burl\s*:\s*['"]([^'"]+)['"]/gi, (m) => m[1]],
+    // requestUri_X = WEBSERVICE_BASE_URL + "..."
+    [
+      /=\s*WEBSERVICE_BASE_URL\s*\+\s*['"]([^'"]+)['"]/gi,
+      (m) => '${WEBSERVICE_BASE_URL}' + m[1],
+    ],
+    // requestUri_X = WEBSERVICE_ORIGIN + "..."
+    [
+      /=\s*WEBSERVICE_ORIGIN\s*\+\s*['"]([^'"]+)['"]/gi,
+      (m) => '${WEBSERVICE_ORIGIN}' + m[1],
+    ],
+    // direct doclib URLs in strings
+    [/['"](https?:\/\/doclib\.ngxgroup\.com[^'"]+)['"]/gi, (m) => m[1]],
+    // /REST/... string refs
+    [/['"](\/REST\/[^'"]+)['"]/gi, (m) => m[1]],
+    // admin-ajax.php references
+    [/['"]([^'"]*admin-ajax\.php[^'"]*)['"]/gi, (m) => m[1]],
+    // wp-json REST endpoints
+    [/['"]([^'"]*\/wp-json\/[^'"]+)['"]/gi, (m) => m[1]],
+    // get_wdtable AJAX action references
+    [/action=get_wdtable[^'"\s&]*/gi, (m) => m[0]],
+  ]
+  for (const [regex, extract] of patterns) {
+    let m: RegExpExecArray | null
+    while ((m = regex.exec(html)) !== null) {
+      const value = extract(m)
+      if (value && value.length < 500) candidates.add(value)
+    }
+  }
+  return Array.from(candidates).sort()
+}
+
+function extractTableIds(html: string): string[] {
+  const ids = new Set<string>()
+  const patterns = [
+    /table_id["']?\s*[:=]\s*['"]?(\d+)/gi,
+    /wpdt[-_]?id["']?\s*[:=]\s*['"]?(\d+)/gi,
+    /wpDataTableId["']?\s*[:=]\s*['"]?(\d+)/gi,
+    /data-table-id\s*=\s*['"](\d+)['"]/gi,
+    /wpDataTablesPlugin\.[a-z]+\s*=\s*['"]?(\d+)/gi,
+  ]
+  for (const p of patterns) {
+    let m: RegExpExecArray | null
+    while ((m = p.exec(html)) !== null) {
+      ids.add(m[1])
+    }
+  }
+  return Array.from(ids).sort()
+}
+
+function locateDocumentsTable(html: string, maxBytes = 15000): string | null {
+  const wrapperRegex = /wpDataTablesWrapper/gi
+  const candidates: Array<{ start: number; end: number; score: number; preview: string }> = []
+  let m: RegExpExecArray | null
+  while ((m = wrapperRegex.exec(html)) !== null) {
+    const start = Math.max(0, m.index - 500)
+    const end = Math.min(html.length, m.index + maxBytes)
+    const window = html.slice(start, end)
+    let score = 0
+    if (/AUDITED FINANCIAL STATEMENT|QUARTER \d+\s*-\s*FINANCIAL/i.test(window)) score += 30
+    if (/\bDocuments\b/.test(window) && !/Memorandum Listings|Offer Documents/i.test(window)) {
+      score += 10
+    }
+    if (/Financials Statements/i.test(window)) score += 5
+    if (/wpDataTable_\d+|wpdt-c/i.test(window)) score += 3
+    // Penalty for footer-nav match
+    if (/Memorandum Listings|Mutual Funds.*Offer Documents/i.test(window)) score -= 20
+    if (/Company Name|Sub-Sector|Market Classification/i.test(window)) score -= 5 // Profile tab
+    candidates.push({
+      start,
+      end,
+      score,
+      preview: window.slice(500, 600),
+    })
+  }
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => b.score - a.score)
+  const best = candidates[0]
+  return html.slice(best.start, best.end)
 }
 
 interface ProbeResult {
@@ -63,10 +177,16 @@ interface ProbeResult {
     has_financial_statements_tab: boolean
     has_documents_header: boolean
     has_datatable_signature: boolean
+    has_wpdatatables_signature: boolean
     has_doclib_reference: boolean
+    has_admin_ajax_reference: boolean
     has_cloudflare_challenge: boolean
   }
-  excerpts: Record<string, string | null>
+  js_url_candidates: string[]
+  js_url_candidate_count: number
+  wpdatatables_table_ids: string[]
+  script_blocks_matching_keywords: ScriptBlock[]
+  documents_table_excerpt: string | null
   interpretation: string
 }
 
@@ -84,7 +204,6 @@ async function runProbe(ticker: string): Promise<ProbeResult> {
   try {
     const controller = new AbortController()
     const timeoutId = setTimeout(() => controller.abort(), 55_000)
-
     const res = await fetch(targetUrl, {
       method: 'GET',
       headers: {
@@ -97,7 +216,6 @@ async function runProbe(ticker: string): Promise<ProbeResult> {
       signal: controller.signal,
       redirect: 'follow',
     })
-
     clearTimeout(timeoutId)
     status = res.status
     html = await res.text()
@@ -107,48 +225,37 @@ async function runProbe(ticker: string): Promise<ProbeResult> {
 
   const fetchDurationMs = Date.now() - t0
   const pdfUrls = findDoclibUrls(html)
+  const jsUrls = extractJsUrlCandidates(html)
+  const tableIds = extractTableIds(html)
+  const scriptBlocks = extractScriptBlocks(html)
+  const documentsExcerpt = locateDocumentsTable(html)
 
   const hasFinancialStatementsTab = /financial[s]?\s+statement[s]?/i.test(html)
   const hasDocumentsHeader =
     /<th[^>]*>\s*Documents\s*<\/th>/i.test(html) ||
-    /class=["'][^"']*documents/i.test(html) ||
-    />\s*Documents\s*</.test(html)
+    /AUDITED FINANCIAL STATEMENT|QUARTER \d+\s*-\s*FINANCIAL/i.test(html)
   const hasDataTable = /DataTable|dataTables/.test(html)
+  const hasWpDataTables = /wpDataTable|wpdt-c|wp-data-tables/.test(html)
   const hasDoclibReference = /doclib\.ngxgroup\.com/i.test(html)
+  const hasAdminAjax = /admin-ajax\.php/i.test(html)
   const hasCloudflareChallenge =
     /cf-browser-verification|__cf_chl|cloudflare/i.test(html) && status !== 200
 
-  const excerpts: Record<string, string | null> = {}
-  if (hasDoclibReference) {
-    excerpts['around_doclib_first'] = excerptAroundMarker(html, 'doclib.ngxgroup.com', 1500)
-  }
-  if (hasDocumentsHeader) {
-    excerpts['around_documents_header'] = excerptAroundMarker(html, 'Documents', 1500)
-  }
-  if (hasFinancialStatementsTab) {
-    excerpts['around_financials_tab'] = excerptAroundMarker(html, 'Financials Statements', 1500)
-  }
-  // Always include a head-of-body excerpt for sanity if nothing else matched
-  if (Object.keys(excerpts).length === 0 && html.length > 0) {
-    excerpts['head_of_html'] = html.slice(0, 3000)
-  }
-
   let interpretation: string
   if (fetchError) {
-    interpretation = `FETCH FAILED — ${fetchError}. From Vercel this typically means the page timed out (>55s) or the host rejected the request.`
+    interpretation = `FETCH FAILED — ${fetchError}.`
   } else if (status !== 200) {
-    interpretation = `NON-200 STATUS (${status}) — page rejected the request. Check headers or anti-bot defenses.`
+    interpretation = `NON-200 STATUS (${status}) — page rejected the request.`
   } else if (pdfUrls.length > 0) {
-    interpretation = `AUTO-SCRAPE VIABLE — ${pdfUrls.length} PDF URL(s) present in static HTML. v27ca proper can ship as auto-scrape pipeline.`
-  } else if (hasDataTable && !hasDoclibReference) {
-    interpretation =
-      'AJAX-RENDERED TABLE — DataTables signature found but zero doclib references. Documents are loaded via AJAX after page render. v27ca proper must fall back to manual-upload pipeline OR reverse-engineer the AJAX endpoint.'
-  } else if (!hasDoclibReference) {
-    interpretation =
-      'NO DOCLIB REFERENCES — page may have anti-bot defenses, geofencing, or returns a different layout to server fetches. Check the head_of_html excerpt for clues.'
+    interpretation = `STATIC AUTO-SCRAPE VIABLE — ${pdfUrls.length} PDF URL(s) in static HTML.`
+  } else if (tableIds.length > 0 && hasAdminAjax) {
+    interpretation = `AJAX VIA admin-ajax.php — wpDataTables found with table_id(s): [${tableIds.join(', ')}]. Probe the admin-ajax.php endpoint with action=get_wdtable + table_id to retrieve JSON.`
+  } else if (jsUrls.some((u) => u.includes('REST') || u.includes('doclib'))) {
+    interpretation = `REST API ENDPOINTS FOUND — check js_url_candidates for the candidate endpoint that lists company documents. Hit it directly from Vercel.`
+  } else if (hasWpDataTables) {
+    interpretation = `WPDATATABLES PRESENT but no table_id or AJAX endpoint extracted. Inspect script_blocks_matching_keywords for the loader pattern.`
   } else {
-    interpretation =
-      'DOCLIB REFERENCED BUT NO PDF URLS EXTRACTED — investigate the around_doclib_first excerpt; regex may need adjustment.'
+    interpretation = `INCONCLUSIVE — no obvious AJAX endpoint found. Inspect script_blocks_matching_keywords and documents_table_excerpt for manual analysis.`
   }
 
   return {
@@ -165,10 +272,16 @@ async function runProbe(ticker: string): Promise<ProbeResult> {
       has_financial_statements_tab: hasFinancialStatementsTab,
       has_documents_header: hasDocumentsHeader,
       has_datatable_signature: hasDataTable,
+      has_wpdatatables_signature: hasWpDataTables,
       has_doclib_reference: hasDoclibReference,
+      has_admin_ajax_reference: hasAdminAjax,
       has_cloudflare_challenge: hasCloudflareChallenge,
     },
-    excerpts,
+    js_url_candidates: jsUrls,
+    js_url_candidate_count: jsUrls.length,
+    wpdatatables_table_ids: tableIds,
+    script_blocks_matching_keywords: scriptBlocks,
+    documents_table_excerpt: documentsExcerpt,
     interpretation,
   }
 }
