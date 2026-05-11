@@ -1,34 +1,38 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/instrument/[ticker] (v27ba)
+// /api/instrument/[ticker] (v27bb)
 // ═══════════════════════════════════════════════════════════════
 //
 // GET /api/instrument/<TICKER>
 //
-// v27ba changes — Per-instrument fundamentals research surface:
-//   Adds the following new response blocks:
-//     • market_cap         — current_price × shares_outstanding (equity)
-//     • liquidity          — windowed AVG(value_ngn) + AVG(volume) for
-//                            day/week/month/quarter, sourced from NGX-
-//                            reported value_ngn on market_prices
-//     • dividend_snapshot  — latest declared div fields from instruments
-//                            (kept fresh weekly via /api/dividends/refresh)
-//     • income_history     — firm-wide INCOME transactions aggregated by
-//                            trade_date with per-date totals + mandate list
-//     • fi_metadata        — coupon_pct, coupon_freq, maturity_date,
-//                            yield_pct (conditional on FI sleeve)
+// v27bb changes vs v27ba:
+//   • REMOVED: income_history block (operator workflow doesn't track
+//     dividends as INCOME transactions — divs paid direct to client
+//     bank accounts; firm has no visibility). The associated row type,
+//     aggregation map, and SELECT are all gone.
+//   • FIXED: recent transactions SELECT was reading 'narration' which
+//     doesn't exist on transactions; the real column is 'notes'.
+//     Pitfall #93 sixth recurrence. Caused Recent Transactions panel
+//     to silently fail (pitfall #152). Response field renamed
+//     'narration' → 'notes' for end-to-end honesty.
+//   • ADDED: fundamentals block — pass-through of 18 fields from
+//     instruments (newly-populated by /api/fundamentals/refresh):
+//     EPS basic/diluted, BVPS, income statement (revenue/gross/
+//     operating/PBT/PAT), balance sheet (assets/equity/debt),
+//     ratios (ROE/ROA/net margin), period, source.
+//   • ADDED: valuation block — server-computed:
+//       pe_ratio = current_price / EPS (prefer diluted, fall back basic)
+//       pb_ratio = current_price / BVPS
+//       graham_number = √(22.5 × EPS × BVPS)  [Benjamin Graham's intrinsic value]
+//       graham_test_passes = (P/E × P/B) ≤ 22.5
+//       intrinsic_value_gap_pct = (graham_number - current_price) / current_price
+//     Each metric independently nullable; eps_meaningful flag is false
+//     when EPS ≤ 0 (P/E exists arithmetically but is not interpretable).
 //
-//   Schema reads expand:
-//     • instruments SELECT adds shares_outstanding, div_notes,
-//       div_last_refreshed_at
-//     • market_prices SELECT adds volume, value_ngn (needed for ADTV)
-//     • market_prices LIMIT bumped from 150 to 200 (covers 12mo + buffer)
-//
-//   Everything from v27az-fix5 preserved:
-//     - holdings SELECT without latest_price (the empty-holders fix)
-//     - sleeve concentration via market_prices join
-//     - quantity > 0 client-side filter
-//     - _debug envelope with captured Supabase errors
-//     - movement block (windowed pct + NGN impact) + sparkline
+// All v27ba functionality preserved:
+//   • market_cap, liquidity, dividend_snapshot, fi_metadata blocks
+//   • Movement panel + sparkline
+//   • Concentration / holders / firm_context
+//   • _debug envelope on PostgREST errors
 // ═══════════════════════════════════════════════════════════════
 
 import { NextResponse } from 'next/server'
@@ -44,6 +48,7 @@ export const maxDuration = 30
 // ─── Explicit row types ─────────────────────────────────────────
 
 type InstrumentRow = {
+  // v27ba-era
   instrument_id:                        string
   name:                                 string
   sleeve_id:                            string | null
@@ -68,6 +73,28 @@ type InstrumentRow = {
   yield_pct:                            number | null
   shares_outstanding:                   number | null
   shares_outstanding_last_refreshed_at: string | null
+
+  // v27bb additions — fundamentals (all 18 fields)
+  eps_basic:                            number | null
+  eps_diluted:                          number | null
+  book_value_per_share:                 number | null
+  revenue_ngn_m:                        number | null
+  gross_profit_ngn_m:                   number | null
+  operating_profit_ngn_m:               number | null
+  profit_before_tax_ngn_m:              number | null
+  profit_after_tax_ngn_m:               number | null
+  total_assets_ngn_m:                   number | null
+  total_equity_ngn_m:                   number | null
+  total_debt_ngn_m:                     number | null
+  roe_pct:                              number | null
+  roa_pct:                              number | null
+  net_margin_pct:                       number | null
+  fundamentals_period_end:              string | null
+  fundamentals_period_type:             string | null
+  fundamentals_currency:                string | null
+  fundamentals_source:                  string | null
+  fundamentals_notes:                   string | null
+  fundamentals_last_refreshed_at:       string | null
 }
 
 type PriceRow = {
@@ -90,6 +117,9 @@ type HoldingRow = {
   avg_cost:     number | string | null
 }
 
+// v27bb FIX: transactions table column is 'notes', not 'narration'.
+// v27ba's SELECT silently returned null+error (pitfall #152) so Recent
+// Transactions panel was empty for every ticker. Now uses real column.
 type TxnRow = {
   trade_date:   string
   action:       string
@@ -97,15 +127,7 @@ type TxnRow = {
   quantity:     number | string | null
   price:        number | string | null
   amount:       number | string | null
-  narration:    string | null
-}
-
-type IncomeRow = {
-  trade_date:      string
-  portfolio_id:    string
-  amount:          number | string | null
-  income_category: string | null
-  narration:       string | null
+  notes:        string | null
 }
 
 type PMeta = {
@@ -117,7 +139,6 @@ type PMeta = {
 
 type DebugEntry = { stage: string; message: string; hint?: string }
 
-// v27az-fix5: movement window shape (preserved)
 type MoveWindow = {
   pct:           number
   ngn_impact:    number
@@ -125,20 +146,10 @@ type MoveWindow = {
   anchor_price:  number
 }
 
-// v27ba: liquidity window shape — windowed averages from value_ngn + volume
 type LiquidityWindow = {
   avg_value_ngn: number
   avg_volume:    number
-  trading_days:  number   // count of contributing days (out of window size)
-}
-
-// v27ba: income history per-event entry (aggregated firm-wide by trade_date)
-type IncomeEvent = {
-  trade_date:       string
-  income_category:  string | null
-  total_amount_ngn: number
-  mandate_count:    number
-  mandates:         string[]  // mandate_label strings for transparency
+  trading_days:  number
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -161,6 +172,21 @@ function num(v: unknown, fallback = 0): number {
   return fallback
 }
 
+// v27bb: nullable numeric coercion — returns null when the value is
+// genuinely null/undefined/non-numeric, preserving the distinction
+// between "missing data" (null) and "data is zero" (0). Used for
+// fundamentals so the page can render '—' for unrefreshed tickers.
+function numOrNull(v: unknown): number | null {
+  if (v === null || v === undefined) return null
+  if (typeof v === 'number') return isFinite(v) ? v : null
+  if (typeof v === 'string') {
+    if (v.trim() === '') return null
+    const n = Number(v)
+    return isFinite(n) ? n : null
+  }
+  return null
+}
+
 const SLEEVE_LABELS: Record<string, string> = {
   eq:  'Equity',
   liq: 'Cash & Liquidity',
@@ -181,10 +207,6 @@ function captureErr(stage: string, err: unknown, debug: DebugEntry[]) {
   console.error('[instrument-route]', stage, entry.message, entry.hint ?? '')
 }
 
-// v27ba: compute liquidity window from N most-recent price rows.
-// Excludes zero-value sessions from the average so non-trading days
-// don't drag the mean down. trading_days reports the actual contributor
-// count for operator awareness (low count = thin liquidity signal).
 function computeLiquidityWindow(rows: PriceRow[], n: number): LiquidityWindow | null {
   const slice = rows.slice(0, n)
   let valSum = 0
@@ -193,8 +215,6 @@ function computeLiquidityWindow(rows: PriceRow[], n: number): LiquidityWindow | 
   for (const r of slice) {
     const v   = num(r.value_ngn)
     const vol = num(r.volume)
-    // Count a day as "traded" if EITHER metric is positive. NGX sometimes
-    // reports volume without value (or vice versa) for low-print sessions.
     if (v > 0 || vol > 0) {
       valSum += v
       volSum += vol
@@ -225,12 +245,10 @@ export async function GET(
   const { ticker: rawTicker } = await context.params
   const ticker = decodeURIComponent(rawTicker).toUpperCase()
 
-  // ─── 1. Instrument metadata ─────────────────────────────────
-  // v27ba: SELECT extended with shares_outstanding,
-  // shares_outstanding_last_refreshed_at, div_notes, div_last_refreshed_at.
+  // ─── 1. Instrument metadata (v27bb: SELECT extended w/ 18 fundamentals fields) ──
   const { data: rawInstrument, error: instErr } = await db
     .from('instruments')
-    .select('instrument_id, name, sleeve_id, asset_class, type, currency, ngx_symbol, ngx_market, sector, approved, div_per_share, div_yield_pct, div_frequency, last_div_date, next_div_date, div_status, div_notes, div_last_refreshed_at, coupon_pct, coupon_freq, maturity_date, yield_pct, shares_outstanding, shares_outstanding_last_refreshed_at')
+    .select('instrument_id, name, sleeve_id, asset_class, type, currency, ngx_symbol, ngx_market, sector, approved, div_per_share, div_yield_pct, div_frequency, last_div_date, next_div_date, div_status, div_notes, div_last_refreshed_at, coupon_pct, coupon_freq, maturity_date, yield_pct, shares_outstanding, shares_outstanding_last_refreshed_at, eps_basic, eps_diluted, book_value_per_share, revenue_ngn_m, gross_profit_ngn_m, operating_profit_ngn_m, profit_before_tax_ngn_m, profit_after_tax_ngn_m, total_assets_ngn_m, total_equity_ngn_m, total_debt_ngn_m, roe_pct, roa_pct, net_margin_pct, fundamentals_period_end, fundamentals_period_type, fundamentals_currency, fundamentals_source, fundamentals_notes, fundamentals_last_refreshed_at')
     .eq('instrument_id', ticker)
     .maybeSingle()
 
@@ -247,9 +265,6 @@ export async function GET(
   const instrument = rawInstrument as unknown as InstrumentRow
 
   // ─── 2. Price history ───────────────────────────────────────
-  // v27ba: SELECT extended with volume, value_ngn (ADTV math).
-  // Limit bumped to 200 (covers 12mo trading days ~250 with margin,
-  // and the existing movement quarter lookback at 90 calendar days).
   const { data: priceRowsRaw, error: priceErr } = await db
     .from('market_prices')
     .select('price, price_date, volume, value_ngn')
@@ -303,7 +318,7 @@ export async function GET(
     return code + '-' + lab
   }
 
-  // ─── 5. Holders (v27az-fix4: no latest_price in SELECT) ─────
+  // ─── 5. Holders ─────────────────────────────────────────────
   const { data: rawHoldings, error: holdErr } = await db
     .from('holdings')
     .select('portfolio_id, quantity, avg_cost')
@@ -404,7 +419,7 @@ export async function GET(
     sleeve_label: SLEEVE_LABELS[sleeve_id] ?? sleeve_id,
   }
 
-  // ─── 7. Movement (v27az-fix5, preserved) ────────────────────
+  // ─── 7. Movement ────────────────────────────────────────────
   function findAnchorByLookback(daysBack: number): PriceRow | null {
     if (priceHistory.length === 0 || !priceHistory[0].price_date) return null
     const todayIso = priceHistory[0].price_date as string
@@ -457,9 +472,7 @@ export async function GET(
       .filter(p => p.date && p.price > 0),
   }
 
-  // ─── 8. v27ba: Market Cap ───────────────────────────────────
-  // Only meaningful for equities. FI instruments return null; page
-  // substitutes a Maturity/YTM card from fi_metadata instead.
+  // ─── 8. Market Cap ──────────────────────────────────────────
   let market_cap: {
     ngn: number
     shares_outstanding: number
@@ -479,9 +492,7 @@ export async function GET(
     }
   }
 
-  // ─── 9. v27ba: Liquidity (windowed ADV/ADTV) ────────────────
-  // Trading-day windows: 1D / 5D / 21D / 63D. Computed from
-  // NGX-reported value_ngn (more accurate than volume × close).
+  // ─── 9. Liquidity ───────────────────────────────────────────
   const liquidity = {
     day:     computeLiquidityWindow(priceHistory, 1),
     week:    computeLiquidityWindow(priceHistory, 5),
@@ -489,9 +500,7 @@ export async function GET(
     quarter: computeLiquidityWindow(priceHistory, 63),
   }
 
-  // ─── 10. v27ba: Dividend Snapshot ───────────────────────────
-  // Latest declared values from instruments table (refreshed weekly
-  // via /api/dividends/refresh cron). Pass-through with numeric coercion.
+  // ─── 10. Dividend Snapshot ──────────────────────────────────
   const dividend_snapshot = {
     div_per_share:         num(instrument.div_per_share),
     div_yield_pct:         num(instrument.div_yield_pct),
@@ -503,48 +512,98 @@ export async function GET(
     div_last_refreshed_at: instrument.div_last_refreshed_at,
   }
 
-  // ─── 11. v27ba: Income History (firm-wide aggregation) ──────
-  // Query all INCOME transactions for this ticker across all portfolios.
-  // Aggregate by trade_date. Output the last 12 events sorted DESC.
-  const { data: rawIncome, error: incomeErr } = await db
-    .from('transactions')
-    .select('trade_date, portfolio_id, amount, income_category, narration')
-    .eq('instrument_id', ticker)
-    .eq('action', 'INCOME')
-    .order('trade_date', { ascending: false })
-    .limit(200)  // generous cap; we aggregate down to ~12 events
-  captureErr('income-history', incomeErr, debug)
-  const incomeRows = (rawIncome ?? []) as unknown as IncomeRow[]
+  // ─── 11. v27bb: Fundamentals (pass-through from instruments) ─
+  // Equity only. FI instruments report null block — they have their
+  // own FI Metadata panel via fi_metadata.
+  const fundamentals = (sleeve_id === 'eq')
+    ? {
+        eps_basic:               numOrNull(instrument.eps_basic),
+        eps_diluted:             numOrNull(instrument.eps_diluted),
+        book_value_per_share:    numOrNull(instrument.book_value_per_share),
+        revenue_ngn_m:           numOrNull(instrument.revenue_ngn_m),
+        gross_profit_ngn_m:      numOrNull(instrument.gross_profit_ngn_m),
+        operating_profit_ngn_m:  numOrNull(instrument.operating_profit_ngn_m),
+        profit_before_tax_ngn_m: numOrNull(instrument.profit_before_tax_ngn_m),
+        profit_after_tax_ngn_m:  numOrNull(instrument.profit_after_tax_ngn_m),
+        total_assets_ngn_m:      numOrNull(instrument.total_assets_ngn_m),
+        total_equity_ngn_m:      numOrNull(instrument.total_equity_ngn_m),
+        total_debt_ngn_m:        numOrNull(instrument.total_debt_ngn_m),
+        roe_pct:                 numOrNull(instrument.roe_pct),
+        roa_pct:                 numOrNull(instrument.roa_pct),
+        net_margin_pct:          numOrNull(instrument.net_margin_pct),
+        period_end:              instrument.fundamentals_period_end,
+        period_type:             instrument.fundamentals_period_type,
+        currency:                instrument.fundamentals_currency,
+        source:                  instrument.fundamentals_source,
+        notes:                   instrument.fundamentals_notes,
+        last_refreshed_at:       instrument.fundamentals_last_refreshed_at,
+      }
+    : null
 
-  const incomeByDate = new Map<string, IncomeEvent>()
-  for (const r of incomeRows) {
-    const key = r.trade_date
-    if (!incomeByDate.has(key)) {
-      incomeByDate.set(key, {
-        trade_date:       r.trade_date,
-        income_category:  r.income_category,
-        total_amount_ngn: 0,
-        mandate_count:    0,
-        mandates:         [],
-      })
+  // ─── 12. v27bb: Valuation (server-computed from fundamentals + price) ─
+  // Each metric independently nullable based on input availability.
+  // Diluted EPS preferred; falls back to basic when diluted is null.
+  // Graham Number = √(22.5 × EPS × BVPS) — Benjamin Graham's intrinsic value.
+  // Graham 22.5 test = (P/E × P/B) ≤ 22.5  — equivalent passing condition.
+  let valuation: {
+    pe_ratio:                number | null
+    pb_ratio:                number | null
+    graham_number:           number | null
+    graham_test_passes:      boolean | null
+    intrinsic_value_gap_pct: number | null
+    intrinsic_value_gap_ngn: number | null
+    eps_used:                number | null      // which EPS we used (diluted or basic)
+    eps_used_kind:           'diluted' | 'basic' | null
+    eps_meaningful:          boolean            // false when EPS ≤ 0
+  } | null = null
+
+  if (sleeve_id === 'eq' && current_price !== null && current_price > 0) {
+    const epsDiluted = numOrNull(instrument.eps_diluted)
+    const epsBasic   = numOrNull(instrument.eps_basic)
+    const bvps       = numOrNull(instrument.book_value_per_share)
+
+    // Preference: diluted > basic
+    const epsUsed: number | null = epsDiluted !== null ? epsDiluted
+                                  : epsBasic !== null ? epsBasic
+                                  : null
+    const epsKind: 'diluted' | 'basic' | null = epsDiluted !== null ? 'diluted'
+                                                : epsBasic !== null ? 'basic'
+                                                : null
+
+    const pe = epsUsed !== null && epsUsed !== 0 ? current_price / epsUsed : null
+    const pb = bvps !== null && bvps > 0          ? current_price / bvps    : null
+
+    // Graham Number: requires positive EPS AND positive BVPS
+    // (negative EPS would make 22.5 × EPS × BVPS negative; sqrt of negative is NaN)
+    let graham: number | null = null
+    let grahamTest: boolean | null = null
+    let gapPct:     number | null = null
+    let gapNgn:     number | null = null
+    if (epsUsed !== null && epsUsed > 0 && bvps !== null && bvps > 0) {
+      graham   = Math.sqrt(22.5 * epsUsed * bvps)
+      gapNgn   = graham - current_price
+      gapPct   = gapNgn / current_price
     }
-    const entry = incomeByDate.get(key)!
-    entry.total_amount_ngn += num(r.amount)
-    entry.mandate_count    += 1
-    entry.mandates.push(mandateLabel(r.portfolio_id))
-    // First non-null income_category wins (defensive — events should be consistent)
-    if (!entry.income_category && r.income_category) {
-      entry.income_category = r.income_category
+    // Graham 22.5 test (P/E × P/B ≤ 22.5) is meaningful even when EPS is
+    // positive but the Graham Number itself was computable; otherwise null.
+    if (pe !== null && pe > 0 && pb !== null && pb > 0) {
+      grahamTest = (pe * pb) <= 22.5
+    }
+
+    valuation = {
+      pe_ratio:                pe,
+      pb_ratio:                pb,
+      graham_number:           graham,
+      graham_test_passes:      grahamTest,
+      intrinsic_value_gap_pct: gapPct,
+      intrinsic_value_gap_ngn: gapNgn,
+      eps_used:                epsUsed,
+      eps_used_kind:           epsKind,
+      eps_meaningful:          epsUsed !== null && epsUsed > 0,
     }
   }
 
-  const income_history = Array.from(incomeByDate.values())
-    .sort((a, b) => b.trade_date.localeCompare(a.trade_date))
-    .slice(0, 12)
-
-  // ─── 12. v27ba: FI Metadata ─────────────────────────────────
-  // Only included when the instrument is fixed-income. Page conditionally
-  // renders the FI metadata panel + swaps KPI4 (mcap → maturity/YTM).
+  // ─── 13. FI Metadata ────────────────────────────────────────
   const fi_metadata = (sleeve_id === 'ntb' || sleeve_id === 'fi')
     ? {
         coupon_pct:    num(instrument.coupon_pct),
@@ -554,10 +613,17 @@ export async function GET(
       }
     : null
 
-  // ─── 13. Recent transactions (v27az-fix5, preserved) ────────
+  // ─── 14. Recent transactions (v27bb FIX: notes column) ─────
+  // The bug: v27ba's SELECT requested 'narration' which doesn't exist
+  // on transactions (column is 'notes'). PostgREST silently returned
+  // null+error, the `data ?? []` fallback swallowed it, and Recent
+  // Transactions rendered "No transactions on record" for every ticker.
+  // Pitfall #152 (silent PostgREST column-mismatch) + pitfall #93
+  // (schema doc drift). Response field is also 'notes' for honesty —
+  // matches the underlying column name.
   const { data: rawTxn, error: txnErr } = await db
     .from('transactions')
-    .select('trade_date, action, portfolio_id, quantity, price, amount, narration')
+    .select('trade_date, action, portfolio_id, quantity, price, amount, notes')
     .eq('instrument_id', ticker)
     .neq('action', 'FEE')
     .order('trade_date', { ascending: false })
@@ -576,11 +642,15 @@ export async function GET(
       qty:           num(t.quantity),
       price:         num(t.price),
       amount:        num(t.amount),
-      narration:     t.narration ?? '',
+      notes:         t.notes ?? '',
     }
   })
 
-  // ─── 14. Response assembly ──────────────────────────────────
+  // ─── 15. Response assembly ──────────────────────────────────
+  // NOTE: income_history block removed in v27bb. The operator workflow
+  // doesn't record dividends as INCOME transactions (divs paid direct
+  // to client bank accounts; firm has no visibility). Replacing with
+  // fundamentals + valuation surface what operator actually wants.
   const response: Record<string, unknown> = {
     instrument,
     price:               { current_price, price_date, day_change_pct, day_change_ngn },
@@ -591,7 +661,8 @@ export async function GET(
     market_cap,
     liquidity,
     dividend_snapshot,
-    income_history,
+    fundamentals,     // v27bb NEW
+    valuation,        // v27bb NEW
     fi_metadata,
     recent_transactions,
     firm_context: { firm_aum_ngn, firm_sleeve_total_ngn },

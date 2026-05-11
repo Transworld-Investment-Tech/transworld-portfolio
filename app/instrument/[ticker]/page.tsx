@@ -6,32 +6,28 @@ import Link from 'next/link'
 import { RefreshCw, ArrowLeft, Star } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27ba)
+// app/instrument/[ticker]/page.tsx (v27bb)
 // ═══════════════════════════════════════════════════════════════
 //
-// Per-instrument fundamentals research surface. Click-through target
-// from cockpit, watchlist, portfolio holdings, and portfolio txns.
-//
-// v27ba additions — Per-instrument fundamentals research surface:
-//   • KPI strip card 4 is now sleeve-aware:
-//       - Equity: Market Cap (with % of firm AUM as subtext)
-//       - FI:     Maturity / YTM (with % of firm AUM as subtext)
-//   • New panel: FI Metadata (conditional on FI sleeve)
-//       - Coupon %, frequency, maturity, YTM
-//   • New panel: Trading Liquidity
-//       - 4-cell windowed Avg Daily Value + Avg Daily Volume
-//         (1D / 1W / 1M / 1Q trading days, sourced from NGX value_ngn)
-//   • New panel: Dividend Snapshot (conditional on equity sleeve)
-//       - Current declared DPS, frequency, yield, status, dates, notes
-//   • New panel: Income History (firm-wide)
-//       - INCOME transactions aggregated by trade_date with totals
-//   • New panels render between Movement and Holders.
-//
-// v27az-fix5 functionality preserved:
-//   • Movement panel (4 windowed pct moves + sparkline)
-//   • Signals badge row (from localStorage cockpit cache)
-//   • Holders + Recent Transactions panels
-//   • Loading / not-found states
+// v27bb additions vs v27ba:
+//   • REMOVED: Income History panel. Operator workflow doesn't record
+//     dividend receipts as INCOME transactions (paid direct to client
+//     bank accounts; firm has no visibility). The panel was always
+//     empty; replacing with fundamentals surface that operator actually
+//     wants for buy/hold/sell decisions.
+//   • FIXED: Recent Transactions field name 'narration' → 'notes'.
+//     The transactions table column is 'notes'; v27ba's route SELECT
+//     of 'narration' silently failed (pitfall #152). Same correction
+//     in route + page for end-to-end honesty.
+//   • NEW: Valuation Snapshot panel — equity only, between Trading
+//     Liquidity and Fundamentals. 5 cards: P/E, P/B, Graham Number
+//     (with intrinsic value gap colored), Graham 22.5 test pill, EPS.
+//   • NEW: Fundamentals panel — equity only, between Valuation Snapshot
+//     and Dividend Snapshot. Two rows under one panel:
+//       Row 1: Income Statement — Revenue, Gross Profit, Operating
+//              Profit, PBT, PAT (5 cards)
+//       Row 2: Balance Sheet & Returns — Total Assets, Total Equity,
+//              Total Debt, ROE%, ROA%, Net Margin% (6 cards)
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Type definitions ─────────────────────────────────────────
@@ -48,23 +44,12 @@ interface SparklinePoint {
   price: number
 }
 
-// v27ba: liquidity window shape
 interface LiquidityWindow {
   avg_value_ngn: number
   avg_volume:    number
   trading_days:  number
 }
 
-// v27ba: income event aggregated firm-wide by trade_date
-interface IncomeEvent {
-  trade_date:       string
-  income_category:  string | null
-  total_amount_ngn: number
-  mandate_count:    number
-  mandates:         string[]
-}
-
-// v27ba: market cap block (null for FI / unrefreshed)
 interface MarketCapBlock {
   ngn:                  number
   shares_outstanding:   number
@@ -72,12 +57,48 @@ interface MarketCapBlock {
   last_refreshed_at:    string | null
 }
 
-// v27ba: FI metadata block (null for equity)
 interface FiMetadataBlock {
   coupon_pct:    number
   coupon_freq:   number | null
   maturity_date: string | null
   yield_pct:     number
+}
+
+// v27bb: fundamentals block (all 18 fields from instruments, AI-populated)
+interface FundamentalsBlock {
+  eps_basic:               number | null
+  eps_diluted:             number | null
+  book_value_per_share:    number | null
+  revenue_ngn_m:           number | null
+  gross_profit_ngn_m:      number | null    // null for banks (no COGS)
+  operating_profit_ngn_m:  number | null
+  profit_before_tax_ngn_m: number | null
+  profit_after_tax_ngn_m:  number | null
+  total_assets_ngn_m:      number | null
+  total_equity_ngn_m:      number | null
+  total_debt_ngn_m:        number | null
+  roe_pct:                 number | null
+  roa_pct:                 number | null
+  net_margin_pct:          number | null
+  period_end:              string | null
+  period_type:             string | null    // 'FY2024' | 'H1-2025' | 'Q1-2026'
+  currency:                string | null
+  source:                  string | null
+  notes:                   string | null
+  last_refreshed_at:       string | null
+}
+
+// v27bb: valuation block (server-computed from fundamentals + price)
+interface ValuationBlock {
+  pe_ratio:                number | null
+  pb_ratio:                number | null
+  graham_number:           number | null
+  graham_test_passes:      boolean | null
+  intrinsic_value_gap_pct: number | null
+  intrinsic_value_gap_ngn: number | null
+  eps_used:                number | null
+  eps_used_kind:           'diluted' | 'basic' | null
+  eps_meaningful:          boolean
 }
 
 interface InstrumentResp {
@@ -140,7 +161,6 @@ interface InstrumentResp {
     quarter:   MoveWindow | null
     sparkline: SparklinePoint[]
   }
-  // v27ba additions
   market_cap?: MarketCapBlock | null
   liquidity?: {
     day:     LiquidityWindow | null
@@ -158,8 +178,11 @@ interface InstrumentResp {
     div_notes:             string | null
     div_last_refreshed_at: string | null
   }
-  income_history?: IncomeEvent[]
-  fi_metadata?: FiMetadataBlock | null
+  // v27bb: fundamentals + valuation
+  fundamentals?:           FundamentalsBlock | null
+  valuation?:              ValuationBlock | null
+  fi_metadata?:            FiMetadataBlock | null
+  // v27bb FIX: rename narration → notes on recent_transactions[]
   recent_transactions?: Array<{
     trade_date:    string
     action:        string
@@ -169,7 +192,7 @@ interface InstrumentResp {
     qty:           number
     price:         number
     amount:        number
-    narration:     string
+    notes:         string
   }>
   firm_context?: {
     firm_aum_ngn:          number
@@ -179,7 +202,6 @@ interface InstrumentResp {
   ticker?: string
 }
 
-// v27az-fix5: signals cache shape (preserved)
 type CachedSignal = {
   id:                   string
   type:                 string
@@ -201,6 +223,21 @@ function fmtNgnM(v: number | null | undefined): string {
   if (abs >= 1e6) return sign + '\u20a6' + (abs / 1e6).toFixed(2) + 'M'
   if (abs >= 1e3) return sign + '\u20a6' + (abs / 1e3).toFixed(1) + 'K'
   return sign + '\u20a6' + abs.toFixed(0)
+}
+
+// v27bb: format a value that's already in millions of NGN (the unit used
+// for revenue/gross/operating/PBT/PAT/assets/equity/debt columns). Converts
+// up to T (trillions) since major banks have multi-trillion totals.
+function fmtNgnFromMillions(v: number | null | undefined): string {
+  if (v === null || v === undefined || !isFinite(v)) return '—'
+  const sign = v < 0 ? '−' : ''
+  const abs = Math.abs(v)
+  // v is already in millions
+  if (abs >= 1e6) return sign + '\u20a6' + (abs / 1e6).toFixed(2) + 'T'
+  if (abs >= 1e3) return sign + '\u20a6' + (abs / 1e3).toFixed(2) + 'B'
+  if (abs >= 1)   return sign + '\u20a6' + abs.toFixed(0) + 'M'
+  // sub-1M (very rare; e.g. a small-cap with reporting in thousands)
+  return sign + '\u20a6' + (abs * 1e3).toFixed(0) + 'K'
 }
 
 function fmtNgnImpactSigned(v: number | null | undefined): string {
@@ -229,7 +266,6 @@ function fmtPctSigned(v: number | null | undefined, dp = 2): string {
   return (v >= 0 ? '+' : '') + (v * 100).toFixed(dp) + '%'
 }
 
-// v27ba: format raw % (already in % units, e.g. coupon_pct=8.5 means 8.5%)
 function fmtRawPct(v: number | null | undefined, dp = 2): string {
   if (v === null || v === undefined || !isFinite(v) || v === 0) return '—'
   return v.toFixed(dp) + '%'
@@ -240,7 +276,6 @@ function fmtQty(v: number | null | undefined): string {
   return Math.round(v).toLocaleString('en-US')
 }
 
-// v27ba: short-form quantity for share counts (B/M/K suffix)
 function fmtShares(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v) || v === 0) return '—'
   if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B'
@@ -252,6 +287,12 @@ function fmtShares(v: number | null | undefined): string {
 function fmtPrice(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return '\u20a6' + v.toLocaleString('en-US', { maximumFractionDigits: 2 })
+}
+
+// v27bb: format a P/E or P/B ratio — a unitless multiple, typically 5-50
+function fmtRatio(v: number | null | undefined, dp = 1): string {
+  if (v === null || v === undefined || !isFinite(v)) return '—'
+  return v.toFixed(dp) + '×'
 }
 
 function fmtDate(s: string | null | undefined): string {
@@ -274,9 +315,6 @@ function fmtDateShort(s: string | null | undefined): string {
   }
 }
 
-// v27ba: relative time ("3 days ago", "12 weeks ago") — used for refresh
-// timestamps on Dividend Snapshot + Market Cap so the operator can see
-// how fresh each piece of fundamental data is.
 function fmtRelativeTime(iso: string | null | undefined): string {
   if (!iso) return 'never'
   try {
@@ -299,7 +337,6 @@ function fmtRelativeTime(iso: string | null | undefined): string {
   }
 }
 
-// v27ba: coupon frequency code → human label
 function fmtCouponFreq(freq: number | null | undefined): string {
   if (freq === null || freq === undefined || freq === 0) return '—'
   if (freq === 1) return 'Annual'
@@ -309,7 +346,6 @@ function fmtCouponFreq(freq: number | null | undefined): string {
   return `${freq}× / year`
 }
 
-// v27ba: days between today and a future date (positive integer or null)
 function daysUntil(s: string | null | undefined): number | null {
   if (!s) return null
   try {
@@ -336,7 +372,6 @@ const SEVERITY_TIERS: Record<string, { label: string; bg: string; border: string
   gold:  { label: 'OPPORTUNITY', bg: 'rgba(176,139,62,0.10)',  border: 'rgba(176,139,62,0.30)',  fg: 'var(--gold)' },
 }
 
-// v27ba: status pill colors for dividend status
 const DIV_STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
   paying:    { bg: 'rgba(45, 110, 78, 0.12)',  fg: 'var(--pos)',  label: 'Paying'    },
   suspended: { bg: 'rgba(166, 59, 59, 0.12)',  fg: 'var(--neg)',  label: 'Suspended' },
@@ -372,7 +407,6 @@ export default function InstrumentPage() {
 
   useEffect(() => { load() }, [load])
 
-  // v27az-fix5: read cockpit signals cache; filter to this ticker (preserved)
   useEffect(() => {
     if (!ticker) return
     try {
@@ -391,7 +425,7 @@ export default function InstrumentPage() {
       )
       setSignals(filtered)
     } catch {
-      // Silent fail — empty signals
+      // Silent fail
     }
   }, [ticker])
 
@@ -452,12 +486,13 @@ export default function InstrumentPage() {
   const movement     = data.movement
   const transactions = data.recent_transactions ?? []
 
-  // v27ba: new data blocks
   const marketCap        = data.market_cap        ?? null
   const liquidity        = data.liquidity         ?? null
   const dividendSnapshot = data.dividend_snapshot ?? null
-  const incomeHistory    = data.income_history    ?? []
   const fiMetadata       = data.fi_metadata       ?? null
+  // v27bb: fundamentals + valuation
+  const fundamentals     = data.fundamentals      ?? null
+  const valuation        = data.valuation         ?? null
 
   const sleeveId       = inst.sleeve_id ?? ''
   const isEquity       = sleeveId === 'eq'
@@ -544,7 +579,7 @@ export default function InstrumentPage() {
         </div>
       </div>
 
-      {/* ─── KPI strip (v27ba: card 4 sleeve-aware) ──────────── */}
+      {/* ─── KPI strip (sleeve-aware card 4) ─────────────────── */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
@@ -582,7 +617,6 @@ export default function InstrumentPage() {
           </div>
         </KpiCard>
 
-        {/* v27ba: sleeve-aware KPI4 */}
         {isFi && fiMetadata ? (
           <KpiCard label="Maturity / YTM" value={
             fiMetadata.maturity_date
@@ -656,7 +690,7 @@ export default function InstrumentPage() {
         )}
       </div>
 
-      {/* ─── Signals badge row (v27az-fix5, preserved) ──────── */}
+      {/* ─── Signals badge row ───────────────────────────────── */}
       {signals.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
           {signals.map(s => (
@@ -665,7 +699,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Movement panel (v27az-fix5, preserved) ─────────── */}
+      {/* ─── Movement panel ──────────────────────────────────── */}
       {movement && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -688,7 +722,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27ba: FI Metadata panel (conditional on FI sleeve) ─ */}
+      {/* ─── FI Metadata panel (FI only) ─────────────────────── */}
       {isFi && fiMetadata && (
         <div style={{ marginBottom: 20 }}>
           <Panel title="Fixed Income Profile" meta="Bond / NTB fundamentals">
@@ -715,7 +749,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27ba: Trading Liquidity panel ──────────────────── */}
+      {/* ─── Trading Liquidity panel ─────────────────────────── */}
       {liquidity && (
         <div style={{ marginBottom: 20 }}>
           <Panel title="Trading Liquidity" meta="NGX-reported value & volume">
@@ -743,7 +777,39 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27ba: Dividend Snapshot panel (conditional on equity) ─ */}
+      {/* ─── v27bb: Valuation Snapshot panel (equity only) ──── */}
+      {isEquity && valuation && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="Valuation Snapshot"
+            meta={
+              fundamentals?.last_refreshed_at
+                ? `Refreshed ${fmtRelativeTime(fundamentals.last_refreshed_at)}`
+                : 'Not yet refreshed'
+            }
+          >
+            <ValuationBody valuation={valuation} currentPrice={price.current_price ?? null} />
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── v27bb: Fundamentals panel (equity only) ─────────── */}
+      {isEquity && fundamentals && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="Fundamentals"
+            meta={
+              fundamentals.period_type
+                ? `${fundamentals.period_type}${fundamentals.period_end ? ' · ' + fmtDate(fundamentals.period_end) : ''}`
+                : 'No period reported'
+            }
+          >
+            <FundamentalsBody fundamentals={fundamentals} sector={inst.sector ?? ''} />
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── Dividend Snapshot panel (equity only) ───────────── */}
       {isEquity && dividendSnapshot && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -759,76 +825,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27ba: Income History panel (firm-wide) ─────────── */}
-      <div style={{ marginBottom: 20 }}>
-        <Panel
-          title={`Income History (${incomeHistory.length})`}
-          meta="Firm-wide · last 12 events"
-        >
-          {incomeHistory.length === 0 ? (
-            <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0' }}>
-              No income received yet for {inst.instrument_id}.
-            </div>
-          ) : (
-            <table style={tableStyle}>
-              <thead>
-                <tr>
-                  <th style={thLeft}>Date</th>
-                  <th style={thLeft}>Category</th>
-                  <th style={thRight}>Total Received</th>
-                  <th style={thRight}>Mandates</th>
-                  <th style={thLeft}>Mandate List</th>
-                </tr>
-              </thead>
-              <tbody>
-                {incomeHistory.map((e, idx) => (
-                  <tr key={idx}>
-                    <td style={tdLeft}>{fmtDate(e.trade_date)}</td>
-                    <td style={tdLeft}>
-                      <span style={{
-                        fontFamily: 'var(--font-mono, ui-monospace, monospace)',
-                        fontSize: 10,
-                        fontWeight: 600,
-                        letterSpacing: '0.04em',
-                        color: 'var(--gold)',
-                        padding: '2px 6px',
-                        background: 'rgba(176,139,62,0.08)',
-                        borderRadius: 2,
-                      }}>
-                        {e.income_category ?? 'Other'}
-                      </span>
-                    </td>
-                    <td style={{
-                      ...tdRight,
-                      fontFamily: '"Cormorant Garamond", Georgia, serif',
-                      fontSize: 16,
-                      fontWeight: 500,
-                      letterSpacing: '-0.005em',
-                      color: 'var(--pos)',
-                    }}>
-                      {fmtNgnM(e.total_amount_ngn)}
-                    </td>
-                    <td style={tdRight}>{e.mandate_count}</td>
-                    <td style={{
-                      ...tdLeft,
-                      color: 'var(--text-2)',
-                      fontSize: 11,
-                      maxWidth: 320,
-                      overflow: 'hidden',
-                      textOverflow: 'ellipsis',
-                      whiteSpace: 'nowrap',
-                    }} title={e.mandates.join(', ')}>
-                      {e.mandates.join(', ')}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
-      </div>
-
-      {/* ─── Holders panel (preserved) ───────────────────────── */}
+      {/* ─── Holders panel ───────────────────────────────────── */}
       <Panel
         title={`Holders (${holders.length})`}
         meta={holders.length > 0
@@ -895,7 +892,7 @@ export default function InstrumentPage() {
         )}
       </Panel>
 
-      {/* ─── Recent transactions panel (preserved) ───────────── */}
+      {/* ─── Recent transactions panel (v27bb FIX: t.notes) ─── */}
       <div style={{ marginTop: 20 }}>
         <Panel
           title={`Recent Transactions (${transactions.length})`}
@@ -915,7 +912,7 @@ export default function InstrumentPage() {
                   <th style={thRight}>Qty</th>
                   <th style={thRight}>Price</th>
                   <th style={thRight}>NGN Value</th>
-                  <th style={thLeft}>Narration</th>
+                  <th style={thLeft}>Notes</th>
                 </tr>
               </thead>
               <tbody>
@@ -955,8 +952,8 @@ export default function InstrumentPage() {
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
-                    }} title={t.narration}>
-                      {t.narration || '—'}
+                    }} title={t.notes}>
+                      {t.notes || '—'}
                     </td>
                   </tr>
                 ))}
@@ -1080,7 +1077,6 @@ function Panel({
   )
 }
 
-// v27az-fix5: MoveCell (preserved)
 function MoveCell({
   label,
   data,
@@ -1093,16 +1089,7 @@ function MoveCell({
   if (!data) {
     return (
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-        <div style={{
-          fontSize: 10,
-          letterSpacing: '0.14em',
-          fontWeight: 600,
-          color: 'var(--text-3)',
-          textTransform: 'uppercase',
-          marginBottom: 8,
-        }}>
-          {label}
-        </div>
+        <div style={cellLabelStyle}>{label}</div>
         <div style={{
           fontFamily: '"Cormorant Garamond", Georgia, serif',
           fontSize: 22,
@@ -1117,16 +1104,7 @@ function MoveCell({
   const color = data.pct >= 0 ? 'var(--pos)' : 'var(--neg)'
   return (
     <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-      <div style={{
-        fontSize: 10,
-        letterSpacing: '0.14em',
-        fontWeight: 600,
-        color: 'var(--text-3)',
-        textTransform: 'uppercase',
-        marginBottom: 8,
-      }}>
-        {label}
-      </div>
+      <div style={cellLabelStyle}>{label}</div>
       <div style={{
         fontFamily: '"Cormorant Garamond", Georgia, serif',
         fontSize: 22,
@@ -1151,7 +1129,6 @@ function MoveCell({
   )
 }
 
-// v27az-fix5: Sparkline (preserved)
 function Sparkline({ points }: { points: SparklinePoint[] }) {
   if (points.length < 2) {
     return (
@@ -1220,7 +1197,6 @@ function Sparkline({ points }: { points: SparklinePoint[] }) {
   )
 }
 
-// v27az-fix5: SignalBadge (preserved)
 function SignalBadge({ signal }: { signal: CachedSignal }) {
   const tier = SEVERITY_TIERS[signal.severity] ?? SEVERITY_TIERS.gold
   const headline =
@@ -1265,20 +1241,10 @@ function SignalBadge({ signal }: { signal: CachedSignal }) {
   )
 }
 
-// v27ba: FiCell — one cell in the FI Metadata grid
 function FiCell({ label, value, sub }: { label: string; value: string; sub: string }) {
   return (
     <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-      <div style={{
-        fontSize: 10,
-        letterSpacing: '0.14em',
-        fontWeight: 600,
-        color: 'var(--text-3)',
-        textTransform: 'uppercase',
-        marginBottom: 8,
-      }}>
-        {label}
-      </div>
+      <div style={cellLabelStyle}>{label}</div>
       <div style={{
         fontFamily: '"Cormorant Garamond", Georgia, serif',
         fontSize: 22,
@@ -1298,7 +1264,6 @@ function FiCell({ label, value, sub }: { label: string; value: string; sub: stri
   )
 }
 
-// v27ba: LiquidityCell — one cell in the Trading Liquidity grid
 function LiquidityCell({
   label,
   window: w,
@@ -1311,16 +1276,7 @@ function LiquidityCell({
   if (!w) {
     return (
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-        <div style={{
-          fontSize: 10,
-          letterSpacing: '0.14em',
-          fontWeight: 600,
-          color: 'var(--text-3)',
-          textTransform: 'uppercase',
-          marginBottom: 8,
-        }}>
-          {label}
-        </div>
+        <div style={cellLabelStyle}>{label}</div>
         <div style={{
           fontFamily: '"Cormorant Garamond", Georgia, serif',
           fontSize: 22,
@@ -1337,16 +1293,7 @@ function LiquidityCell({
   }
   return (
     <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-      <div style={{
-        fontSize: 10,
-        letterSpacing: '0.14em',
-        fontWeight: 600,
-        color: 'var(--text-3)',
-        textTransform: 'uppercase',
-        marginBottom: 8,
-      }}>
-        {label}
-      </div>
+      <div style={cellLabelStyle}>{label}</div>
       <div style={{
         fontFamily: '"Cormorant Garamond", Georgia, serif',
         fontSize: 22,
@@ -1367,7 +1314,6 @@ function LiquidityCell({
   )
 }
 
-// v27ba: DividendSnapshotBody — fields from instrument record
 function DividendSnapshotBody({
   snapshot,
 }: {
@@ -1378,7 +1324,6 @@ function DividendSnapshotBody({
 
   return (
     <div>
-      {/* Top row: status + key numbers */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
@@ -1386,7 +1331,7 @@ function DividendSnapshotBody({
         marginBottom: 18,
       }}>
         <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-          <div style={dsLabelStyle}>Status</div>
+          <div style={cellLabelStyle}>Status</div>
           <span style={{
             display: 'inline-block',
             padding: '4px 10px',
@@ -1403,20 +1348,19 @@ function DividendSnapshotBody({
           </span>
         </div>
         <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-          <div style={dsLabelStyle}>DPS</div>
-          <div style={dsValueStyle}>{fmtPrice(snapshot.div_per_share)}</div>
+          <div style={cellLabelStyle}>DPS</div>
+          <div style={cellValueStyle}>{fmtPrice(snapshot.div_per_share)}</div>
         </div>
         <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-          <div style={dsLabelStyle}>Yield</div>
-          <div style={dsValueStyle}>{fmtPct(snapshot.div_yield_pct)}</div>
+          <div style={cellLabelStyle}>Yield</div>
+          <div style={cellValueStyle}>{fmtPct(snapshot.div_yield_pct)}</div>
         </div>
         <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-          <div style={dsLabelStyle}>Frequency</div>
-          <div style={dsValueStyle}>{snapshot.div_frequency ?? '—'}</div>
+          <div style={cellLabelStyle}>Frequency</div>
+          <div style={cellValueStyle}>{snapshot.div_frequency ?? '—'}</div>
         </div>
       </div>
 
-      {/* Dates row */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: '1fr 1fr',
@@ -1439,7 +1383,6 @@ function DividendSnapshotBody({
         </div>
       </div>
 
-      {/* Notes (if present) */}
       {snapshot.div_notes && (
         <div style={{
           paddingTop: 14,
@@ -1453,6 +1396,307 @@ function DividendSnapshotBody({
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+// v27bb: Valuation panel body — 5 cards (P/E, P/B, Graham Number with
+// gap, Graham 22.5 test pill, EPS).
+function ValuationBody({
+  valuation,
+  currentPrice,
+}: {
+  valuation:    ValuationBlock
+  currentPrice: number | null
+}) {
+  const peColor = valuation.eps_meaningful ? 'var(--text)' : 'var(--warn)'
+  // Graham gap: positive (graham > price) = undervalued = green
+  const gapColor = valuation.intrinsic_value_gap_pct === null
+    ? 'var(--text-3)'
+    : valuation.intrinsic_value_gap_pct > 0 ? 'var(--pos)' : 'var(--neg)'
+  const gapLabel = valuation.intrinsic_value_gap_pct === null ? '' :
+                   valuation.intrinsic_value_gap_pct > 0 ? 'undervalued' : 'overvalued'
+
+  return (
+    <div style={{
+      display: 'grid',
+      gridTemplateColumns: 'repeat(5, 1fr)',
+      gap: 16,
+    }}>
+      {/* P/E */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={cellLabelStyle}>P / E</div>
+        <div style={{
+          ...cellValueStyle,
+          color: peColor,
+        }}>
+          {valuation.eps_meaningful ? fmtRatio(valuation.pe_ratio) : 'N/M'}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {valuation.eps_meaningful
+            ? (valuation.eps_used_kind === 'diluted' ? 'diluted EPS' : 'basic EPS')
+            : <span style={{ color: 'var(--warn)' }}>EPS ≤ 0 — not meaningful</span>}
+        </div>
+      </div>
+
+      {/* P/B */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={cellLabelStyle}>P / B</div>
+        <div style={cellValueStyle}>{fmtRatio(valuation.pb_ratio)}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {valuation.pb_ratio !== null
+            ? (valuation.pb_ratio < 1 ? 'below book' : 'above book')
+            : '—'}
+        </div>
+      </div>
+
+      {/* Graham Number */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={cellLabelStyle}>Graham Number</div>
+        <div style={cellValueStyle}>{fmtPrice(valuation.graham_number)}</div>
+        <div style={{ fontSize: 11, color: gapColor, fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
+          {valuation.intrinsic_value_gap_pct !== null ? (
+            <>
+              {fmtPctSigned(valuation.intrinsic_value_gap_pct)} {gapLabel}
+            </>
+          ) : '—'}
+        </div>
+      </div>
+
+      {/* Graham 22.5 test */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={cellLabelStyle}>Graham 22.5 Test</div>
+        <div style={{ marginTop: 4 }}>
+          {valuation.graham_test_passes === null ? (
+            <span style={{
+              ...cellValueStyle,
+              color: 'var(--text-3)',
+            }}>—</span>
+          ) : (
+            <span style={{
+              display: 'inline-block',
+              padding: '6px 14px',
+              background: valuation.graham_test_passes
+                ? 'rgba(176, 139, 62, 0.14)'
+                : 'rgba(166, 59, 59, 0.12)',
+              color: valuation.graham_test_passes ? 'var(--gold)' : 'var(--neg)',
+              borderRadius: 3,
+              fontSize: 12,
+              fontWeight: 700,
+              letterSpacing: '0.14em',
+              textTransform: 'uppercase',
+            }}>
+              {valuation.graham_test_passes ? 'Passes' : 'Fails'}
+            </span>
+          )}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+          P/E × P/B {valuation.graham_test_passes === false ? '> 22.5' : '≤ 22.5'}
+        </div>
+      </div>
+
+      {/* EPS used */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={cellLabelStyle}>EPS</div>
+        <div style={cellValueStyle}>{fmtPrice(valuation.eps_used)}</div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {valuation.eps_used_kind ?? '—'}
+          {currentPrice !== null && valuation.eps_used !== null && valuation.eps_used > 0 && (
+            <span style={{ marginLeft: 4 }}>· {(currentPrice / valuation.eps_used).toFixed(1)}× price</span>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// v27bb: Fundamentals panel body — two rows under one panel.
+// Row 1: Income Statement (5 cards). Row 2: Balance Sheet & Returns (6 cards).
+function FundamentalsBody({
+  fundamentals,
+  sector,
+}: {
+  fundamentals: FundamentalsBlock
+  sector:       string
+}) {
+  // Detect bank-like sectors for the gross-profit-N/A footnote
+  const sectorLower = sector.toLowerCase()
+  const isBankLike = sectorLower.includes('bank')
+                  || sectorLower.includes('financial')
+                  || sectorLower.includes('insurance')
+
+  return (
+    <div>
+      {/* ─── Row 1: Income Statement ─── */}
+      <div style={{
+        fontSize: 10,
+        fontWeight: 600,
+        letterSpacing: '0.18em',
+        color: 'var(--gold)',
+        textTransform: 'uppercase',
+        marginBottom: 12,
+      }}>
+        Income Statement
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(5, 1fr)',
+        gap: 16,
+        marginBottom: 24,
+      }}>
+        <FundamentalCell
+          label="Revenue"
+          value={fmtNgnFromMillions(fundamentals.revenue_ngn_m)}
+          sub={isBankLike ? 'Gross earnings' : 'Top line'}
+        />
+        <FundamentalCell
+          label="Gross Profit"
+          value={fundamentals.gross_profit_ngn_m === null
+            ? (isBankLike ? 'N/A' : '—')
+            : fmtNgnFromMillions(fundamentals.gross_profit_ngn_m)
+          }
+          sub={isBankLike && fundamentals.gross_profit_ngn_m === null ? 'banks/insurers' : 'Rev − COGS'}
+          muted={isBankLike && fundamentals.gross_profit_ngn_m === null}
+        />
+        <FundamentalCell
+          label="Operating Profit"
+          value={fmtNgnFromMillions(fundamentals.operating_profit_ngn_m)}
+          sub="Before tax + finance"
+        />
+        <FundamentalCell
+          label="PBT"
+          value={fmtNgnFromMillions(fundamentals.profit_before_tax_ngn_m)}
+          sub="Profit before tax"
+        />
+        <FundamentalCell
+          label="PAT"
+          value={fmtNgnFromMillions(fundamentals.profit_after_tax_ngn_m)}
+          sub="Profit after tax"
+        />
+      </div>
+
+      {/* ─── Row 2: Balance Sheet & Returns ─── */}
+      <div style={{
+        fontSize: 10,
+        fontWeight: 600,
+        letterSpacing: '0.18em',
+        color: 'var(--gold)',
+        textTransform: 'uppercase',
+        marginBottom: 12,
+      }}>
+        Balance Sheet &amp; Returns
+      </div>
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(6, 1fr)',
+        gap: 14,
+      }}>
+        <FundamentalCell
+          label="Total Assets"
+          value={fmtNgnFromMillions(fundamentals.total_assets_ngn_m)}
+          sub="Balance sheet"
+        />
+        <FundamentalCell
+          label="Total Equity"
+          value={fmtNgnFromMillions(fundamentals.total_equity_ngn_m)}
+          sub="Shareholders' funds"
+        />
+        <FundamentalCell
+          label="Total Debt"
+          value={fmtNgnFromMillions(fundamentals.total_debt_ngn_m)}
+          sub="Interest-bearing"
+        />
+        <FundamentalCell
+          label="ROE"
+          value={fmtRawPct(fundamentals.roe_pct)}
+          sub="Return on equity"
+        />
+        <FundamentalCell
+          label="ROA"
+          value={fmtRawPct(fundamentals.roa_pct)}
+          sub="Return on assets"
+        />
+        <FundamentalCell
+          label="Net Margin"
+          value={fmtRawPct(fundamentals.net_margin_pct)}
+          sub="PAT / Revenue"
+        />
+      </div>
+
+      {/* ─── Footer: source + notes ─── */}
+      {(fundamentals.source || fundamentals.notes) && (
+        <div style={{
+          marginTop: 18,
+          paddingTop: 14,
+          borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+          fontSize: 11,
+          color: 'var(--text-2)',
+          lineHeight: 1.55,
+        }}>
+          {fundamentals.source && (
+            <div style={{ marginBottom: fundamentals.notes ? 6 : 0 }}>
+              <span style={{
+                fontWeight: 600,
+                color: 'var(--text-3)',
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                fontSize: 10,
+              }}>
+                Source:
+              </span>{' '}
+              {fundamentals.source}
+            </div>
+          )}
+          {fundamentals.notes && (
+            <div>
+              <span style={{
+                fontWeight: 600,
+                color: 'var(--text-3)',
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                fontSize: 10,
+              }}>
+                Notes:
+              </span>{' '}
+              {fundamentals.notes}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// v27bb: a single fundamental cell — consistent visual treatment for
+// both Income Statement and Balance Sheet rows.
+function FundamentalCell({
+  label,
+  value,
+  sub,
+  muted = false,
+}: {
+  label: string
+  value: string
+  sub:   string
+  muted?: boolean
+}) {
+  return (
+    <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
+      <div style={cellLabelStyle}>{label}</div>
+      <div style={{
+        fontFamily: '"Cormorant Garamond", Georgia, serif',
+        fontSize: 20,
+        fontWeight: 500,
+        color: muted ? 'var(--text-3)' : 'var(--text)',
+        letterSpacing: '-0.01em',
+        marginBottom: 3,
+        lineHeight: 1.1,
+      }}>
+        {value}
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
+        {sub}
+      </div>
     </div>
   )
 }
@@ -1501,8 +1745,10 @@ const tdLeft: React.CSSProperties = {
 }
 const tdRight: React.CSSProperties = { ...tdLeft, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
 
-// v27ba: shared dividend-snapshot field styles
-const dsLabelStyle: React.CSSProperties = {
+// v27bb: shared cell styles (used across MoveCell, FiCell, LiquidityCell,
+// ValuationBody, FundamentalCell, DividendSnapshotBody — DRY'd from
+// v27ba's per-component duplication).
+const cellLabelStyle: React.CSSProperties = {
   fontSize: 10,
   letterSpacing: '0.14em',
   fontWeight: 600,
@@ -1510,7 +1756,7 @@ const dsLabelStyle: React.CSSProperties = {
   textTransform: 'uppercase',
   marginBottom: 8,
 }
-const dsValueStyle: React.CSSProperties = {
+const cellValueStyle: React.CSSProperties = {
   fontFamily: '"Cormorant Garamond", Georgia, serif',
   fontSize: 22,
   fontWeight: 500,
