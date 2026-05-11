@@ -6,26 +6,35 @@ import Link from 'next/link'
 import { RefreshCw, ArrowLeft, Star } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27az-fix5)
+// app/instrument/[ticker]/page.tsx (v27ba)
 // ═══════════════════════════════════════════════════════════════
 //
-// Per-instrument detail page. Canonical landing target for any
-// ticker click-through (cockpit panels, holdings tables, etc.).
+// Per-instrument fundamentals research surface. Click-through target
+// from cockpit, watchlist, portfolio holdings, and portfolio txns.
 //
-// v27az-fix5 additions:
-//   • Movement panel — 4 windowed % moves (Today/Week/Month/Quarter)
-//     with NGN impact (firm exposure × pct) + 30-day inline SVG
-//     sparkline. Sparkline color = green if trending up, red if down.
-//   • Signals badge row — reads localStorage 'cockpit-signals-cache-v1'
-//     and renders any signals firing on this ticker as compact badges
-//     between the watchlist chip and the Movement panel. Empty when
-//     cache is missing/stale/no-matching-ticker — no special UI.
-//     Reads BOTH 'narration' and 'narrated' field names defensively
-//     (schema doc and route head differ; fallback handles either).
+// v27ba additions — Per-instrument fundamentals research surface:
+//   • KPI strip card 4 is now sleeve-aware:
+//       - Equity: Market Cap (with % of firm AUM as subtext)
+//       - FI:     Maturity / YTM (with % of firm AUM as subtext)
+//   • New panel: FI Metadata (conditional on FI sleeve)
+//       - Coupon %, frequency, maturity, YTM
+//   • New panel: Trading Liquidity
+//       - 4-cell windowed Avg Daily Value + Avg Daily Volume
+//         (1D / 1W / 1M / 1Q trading days, sourced from NGX value_ngn)
+//   • New panel: Dividend Snapshot (conditional on equity sleeve)
+//       - Current declared DPS, frequency, yield, status, dates, notes
+//   • New panel: Income History (firm-wide)
+//       - INCOME transactions aggregated by trade_date with totals
+//   • New panels render between Movement and Holders.
 //
-// v27az-fix3 visual baseline preserved.
-// v27az-fix4 holders fix preserved (uses route's holders array).
+// v27az-fix5 functionality preserved:
+//   • Movement panel (4 windowed pct moves + sparkline)
+//   • Signals badge row (from localStorage cockpit cache)
+//   • Holders + Recent Transactions panels
+//   • Loading / not-found states
 // ═══════════════════════════════════════════════════════════════
+
+// ─── Type definitions ─────────────────────────────────────────
 
 interface MoveWindow {
   pct:           number
@@ -39,23 +48,57 @@ interface SparklinePoint {
   price: number
 }
 
+// v27ba: liquidity window shape
+interface LiquidityWindow {
+  avg_value_ngn: number
+  avg_volume:    number
+  trading_days:  number
+}
+
+// v27ba: income event aggregated firm-wide by trade_date
+interface IncomeEvent {
+  trade_date:       string
+  income_category:  string | null
+  total_amount_ngn: number
+  mandate_count:    number
+  mandates:         string[]
+}
+
+// v27ba: market cap block (null for FI / unrefreshed)
+interface MarketCapBlock {
+  ngn:                  number
+  shares_outstanding:   number
+  as_of_price_date:     string | null
+  last_refreshed_at:    string | null
+}
+
+// v27ba: FI metadata block (null for equity)
+interface FiMetadataBlock {
+  coupon_pct:    number
+  coupon_freq:   number | null
+  maturity_date: string | null
+  yield_pct:     number
+}
+
 interface InstrumentResp {
   instrument?: {
-    instrument_id: string
-    name:          string
-    sleeve_id:     string | null
-    asset_class:   string | null
-    type:          string | null
-    sector:        string | null
-    ngx_symbol:    string | null
-    ngx_market:    string | null
-    approved:      boolean | null
-    currency:      string | null
-    last_div_date: string | null
-    next_div_date: string | null
-    div_per_share: number | null
-    div_yield_pct: number | null
-    div_status:    string | null
+    instrument_id:                          string
+    name:                                   string
+    sleeve_id:                              string | null
+    asset_class:                            string | null
+    type:                                   string | null
+    sector:                                 string | null
+    ngx_symbol:                             string | null
+    ngx_market:                             string | null
+    approved:                               boolean | null
+    currency:                               string | null
+    last_div_date:                          string | null
+    next_div_date:                          string | null
+    div_per_share:                          number | null
+    div_yield_pct:                          number | null
+    div_status:                             string | null
+    shares_outstanding:                     number | null
+    shares_outstanding_last_refreshed_at:   string | null
   }
   price?: {
     current_price:  number | null
@@ -97,6 +140,26 @@ interface InstrumentResp {
     quarter:   MoveWindow | null
     sparkline: SparklinePoint[]
   }
+  // v27ba additions
+  market_cap?: MarketCapBlock | null
+  liquidity?: {
+    day:     LiquidityWindow | null
+    week:    LiquidityWindow | null
+    month:   LiquidityWindow | null
+    quarter: LiquidityWindow | null
+  }
+  dividend_snapshot?: {
+    div_per_share:         number
+    div_yield_pct:         number
+    div_frequency:         string | null
+    div_status:            string | null
+    last_div_date:         string | null
+    next_div_date:         string | null
+    div_notes:             string | null
+    div_last_refreshed_at: string | null
+  }
+  income_history?: IncomeEvent[]
+  fi_metadata?: FiMetadataBlock | null
   recent_transactions?: Array<{
     trade_date:    string
     action:        string
@@ -116,9 +179,7 @@ interface InstrumentResp {
   ticker?: string
 }
 
-// v27az-fix5: defensive shape for signals from localStorage cache.
-// Reads both 'narration' (schema doc) and 'narrated' (route head)
-// field names because they appear inconsistently in the codebase.
+// v27az-fix5: signals cache shape (preserved)
 type CachedSignal = {
   id:                   string
   type:                 string
@@ -168,9 +229,24 @@ function fmtPctSigned(v: number | null | undefined, dp = 2): string {
   return (v >= 0 ? '+' : '') + (v * 100).toFixed(dp) + '%'
 }
 
+// v27ba: format raw % (already in % units, e.g. coupon_pct=8.5 means 8.5%)
+function fmtRawPct(v: number | null | undefined, dp = 2): string {
+  if (v === null || v === undefined || !isFinite(v) || v === 0) return '—'
+  return v.toFixed(dp) + '%'
+}
+
 function fmtQty(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return Math.round(v).toLocaleString('en-US')
+}
+
+// v27ba: short-form quantity for share counts (B/M/K suffix)
+function fmtShares(v: number | null | undefined): string {
+  if (v === null || v === undefined || !isFinite(v) || v === 0) return '—'
+  if (v >= 1e9) return (v / 1e9).toFixed(2) + 'B'
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return v.toFixed(0)
 }
 
 function fmtPrice(v: number | null | undefined): string {
@@ -198,6 +274,54 @@ function fmtDateShort(s: string | null | undefined): string {
   }
 }
 
+// v27ba: relative time ("3 days ago", "12 weeks ago") — used for refresh
+// timestamps on Dividend Snapshot + Market Cap so the operator can see
+// how fresh each piece of fundamental data is.
+function fmtRelativeTime(iso: string | null | undefined): string {
+  if (!iso) return 'never'
+  try {
+    const then = new Date(iso).getTime()
+    const now  = Date.now()
+    const diffMs = now - then
+    if (diffMs < 0) return 'in the future'
+    const days = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+    if (days === 0) return 'today'
+    if (days === 1) return 'yesterday'
+    if (days < 7)  return `${days} days ago`
+    const weeks = Math.floor(days / 7)
+    if (weeks < 5) return `${weeks} week${weeks === 1 ? '' : 's'} ago`
+    const months = Math.floor(days / 30)
+    if (months < 12) return `${months} month${months === 1 ? '' : 's'} ago`
+    const years = Math.floor(days / 365)
+    return `${years} year${years === 1 ? '' : 's'} ago`
+  } catch {
+    return 'unknown'
+  }
+}
+
+// v27ba: coupon frequency code → human label
+function fmtCouponFreq(freq: number | null | undefined): string {
+  if (freq === null || freq === undefined || freq === 0) return '—'
+  if (freq === 1) return 'Annual'
+  if (freq === 2) return 'Semi-annual'
+  if (freq === 4) return 'Quarterly'
+  if (freq === 12) return 'Monthly'
+  return `${freq}× / year`
+}
+
+// v27ba: days between today and a future date (positive integer or null)
+function daysUntil(s: string | null | undefined): number | null {
+  if (!s) return null
+  try {
+    const target = new Date(s + 'T00:00:00').getTime()
+    const today  = Date.now()
+    const diff   = Math.floor((target - today) / (1000 * 60 * 60 * 24))
+    return diff
+  } catch {
+    return null
+  }
+}
+
 const ACTION_COLOR: Record<string, string> = {
   BUY:          'var(--pos)',
   SELL:         'var(--neg)',
@@ -206,11 +330,19 @@ const ACTION_COLOR: Record<string, string> = {
   INCOME:       'var(--pos)',
 }
 
-// v27az-fix5: severity → tier-label + style
 const SEVERITY_TIERS: Record<string, { label: string; bg: string; border: string; fg: string }> = {
   red:   { label: 'BREACH',      bg: 'rgba(166,59,59,0.10)',   border: 'rgba(166,59,59,0.30)',   fg: 'var(--neg)'  },
   amber: { label: 'ATTENTION',   bg: 'rgba(166,124,42,0.12)',  border: 'rgba(166,124,42,0.30)',  fg: 'var(--warn)' },
   gold:  { label: 'OPPORTUNITY', bg: 'rgba(176,139,62,0.10)',  border: 'rgba(176,139,62,0.30)',  fg: 'var(--gold)' },
+}
+
+// v27ba: status pill colors for dividend status
+const DIV_STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  paying:    { bg: 'rgba(45, 110, 78, 0.12)',  fg: 'var(--pos)',  label: 'Paying'    },
+  suspended: { bg: 'rgba(166, 59, 59, 0.12)',  fg: 'var(--neg)',  label: 'Suspended' },
+  none:      { bg: 'rgba(15, 41, 71, 0.06)',   fg: 'var(--text-3)', label: 'None'    },
+  variable:  { bg: 'rgba(166, 124, 42, 0.12)', fg: 'var(--warn)', label: 'Variable'  },
+  unknown:   { bg: 'rgba(15, 41, 71, 0.06)',   fg: 'var(--text-3)', label: 'Unknown' },
 }
 
 // ─── Page ───────────────────────────────────────────────────────
@@ -240,7 +372,7 @@ export default function InstrumentPage() {
 
   useEffect(() => { load() }, [load])
 
-  // v27az-fix5: read cockpit signals cache; filter to this ticker
+  // v27az-fix5: read cockpit signals cache; filter to this ticker (preserved)
   useEffect(() => {
     if (!ticker) return
     try {
@@ -250,7 +382,6 @@ export default function InstrumentPage() {
       if (!cached) return
       const parsed = JSON.parse(cached) as { as_of_date?: string; signals?: CachedSignal[] }
       if (!parsed || !Array.isArray(parsed.signals)) return
-      // Stale-day guard: ignore cache from a previous day
       const today = new Date().toISOString().slice(0, 10)
       if (parsed.as_of_date && parsed.as_of_date !== today) return
       const filtered = parsed.signals.filter(s =>
@@ -320,6 +451,17 @@ export default function InstrumentPage() {
   }
   const movement     = data.movement
   const transactions = data.recent_transactions ?? []
+
+  // v27ba: new data blocks
+  const marketCap        = data.market_cap        ?? null
+  const liquidity        = data.liquidity         ?? null
+  const dividendSnapshot = data.dividend_snapshot ?? null
+  const incomeHistory    = data.income_history    ?? []
+  const fiMetadata       = data.fi_metadata       ?? null
+
+  const sleeveId       = inst.sleeve_id ?? ''
+  const isEquity       = sleeveId === 'eq'
+  const isFi           = sleeveId === 'ntb' || sleeveId === 'fi'
 
   const dayChangePct = price.day_change_pct
   const dayChangeNgn = price.day_change_ngn
@@ -402,7 +544,7 @@ export default function InstrumentPage() {
         </div>
       </div>
 
-      {/* ─── KPI strip ───────────────────────────────────────── */}
+      {/* ─── KPI strip (v27ba: card 4 sleeve-aware) ──────────── */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
@@ -440,11 +582,40 @@ export default function InstrumentPage() {
           </div>
         </KpiCard>
 
-        <KpiCard label="% of Firm AUM" value={fmtPct(concentration.pct_of_firm_aum)}>
-          <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
-            {fmtPct(concentration.pct_of_firm_sleeve_exposure)} of firm {concentration.sleeve_label}
-          </div>
-        </KpiCard>
+        {/* v27ba: sleeve-aware KPI4 */}
+        {isFi && fiMetadata ? (
+          <KpiCard label="Maturity / YTM" value={
+            fiMetadata.maturity_date
+              ? <span style={{ fontSize: 28 }}>{fmtDate(fiMetadata.maturity_date)}</span>
+              : '—'
+          }>
+            <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
+              YTM: <strong style={{ color: 'var(--text)' }}>{fmtRawPct(fiMetadata.yield_pct)}</strong>
+              {(() => {
+                const d = daysUntil(fiMetadata.maturity_date)
+                if (d === null) return null
+                if (d < 0) return <span style={{ color: 'var(--neg)', marginLeft: 6 }}>· matured</span>
+                return <span style={{ color: 'var(--text-3)', marginLeft: 6 }}>· {d}d to mat.</span>
+              })()}
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+              {fmtPct(concentration.pct_of_firm_aum)} of firm AUM
+            </div>
+          </KpiCard>
+        ) : (
+          <KpiCard label="Market Cap" value={marketCap ? fmtNgnM(marketCap.ngn) : '—'}>
+            <div style={{ fontSize: 11, color: 'var(--text-2)', marginTop: 4 }}>
+              {fmtPct(concentration.pct_of_firm_aum)} of firm AUM
+            </div>
+            <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+              {marketCap
+                ? <>{fmtShares(marketCap.shares_outstanding)} shares O/S · refreshed {fmtRelativeTime(marketCap.last_refreshed_at)}</>
+                : isEquity
+                  ? <span style={{ color: 'var(--warn)' }}>Shares O/S not yet refreshed</span>
+                  : <>—</>}
+            </div>
+          </KpiCard>
+        )}
       </div>
 
       {/* ─── Watchlist chip ──────────────────────────────────── */}
@@ -485,21 +656,16 @@ export default function InstrumentPage() {
         )}
       </div>
 
-      {/* ─── v27az-fix5: Signals badge row ───────────────────── */}
+      {/* ─── Signals badge row (v27az-fix5, preserved) ──────── */}
       {signals.length > 0 && (
-        <div style={{
-          display: 'flex',
-          flexWrap: 'wrap',
-          gap: 8,
-          marginBottom: 20,
-        }}>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
           {signals.map(s => (
             <SignalBadge key={s.id} signal={s} />
           ))}
         </div>
       )}
 
-      {/* ─── v27az-fix5: Movement panel ──────────────────────── */}
+      {/* ─── Movement panel (v27az-fix5, preserved) ─────────── */}
       {movement && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -522,7 +688,147 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Holders panel ───────────────────────────────────── */}
+      {/* ─── v27ba: FI Metadata panel (conditional on FI sleeve) ─ */}
+      {isFi && fiMetadata && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel title="Fixed Income Profile" meta="Bond / NTB fundamentals">
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(4, 1fr)',
+              gap: 16,
+            }}>
+              <FiCell label="Coupon" value={fmtRawPct(fiMetadata.coupon_pct)}
+                sub={fmtCouponFreq(fiMetadata.coupon_freq)} />
+              <FiCell label="Maturity" value={fmtDate(fiMetadata.maturity_date)}
+                sub={(() => {
+                  const d = daysUntil(fiMetadata.maturity_date)
+                  if (d === null) return ''
+                  if (d < 0) return 'Matured'
+                  return `${d} days`
+                })()} />
+              <FiCell label="YTM" value={fmtRawPct(fiMetadata.yield_pct)}
+                sub="Yield to maturity" />
+              <FiCell label="Frequency" value={fmtCouponFreq(fiMetadata.coupon_freq)}
+                sub={fiMetadata.coupon_freq ? `${fiMetadata.coupon_freq}× per year` : ''} />
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── v27ba: Trading Liquidity panel ──────────────────── */}
+      {liquidity && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel title="Trading Liquidity" meta="NGX-reported value & volume">
+            <div style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(4, 1fr)',
+              gap: 16,
+            }}>
+              <LiquidityCell label="Today"   window={liquidity.day}     windowSize={1} />
+              <LiquidityCell label="Week"    window={liquidity.week}    windowSize={5} />
+              <LiquidityCell label="Month"   window={liquidity.month}   windowSize={21} />
+              <LiquidityCell label="Quarter" window={liquidity.quarter} windowSize={63} />
+            </div>
+            <div style={{
+              marginTop: 16,
+              paddingTop: 12,
+              borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+              fontSize: 11,
+              color: 'var(--text-3)',
+              lineHeight: 1.5,
+            }}>
+              Average daily ₦ value traded and share volume across active trading days only. Non-trading days excluded so the mean reflects real liquidity. <em>Trading days</em> = sessions with non-zero NGX print in the window.
+            </div>
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── v27ba: Dividend Snapshot panel (conditional on equity) ─ */}
+      {isEquity && dividendSnapshot && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="Dividend Snapshot"
+            meta={
+              dividendSnapshot.div_last_refreshed_at
+                ? `Refreshed ${fmtRelativeTime(dividendSnapshot.div_last_refreshed_at)}`
+                : 'Not yet refreshed'
+            }
+          >
+            <DividendSnapshotBody snapshot={dividendSnapshot} />
+          </Panel>
+        </div>
+      )}
+
+      {/* ─── v27ba: Income History panel (firm-wide) ─────────── */}
+      <div style={{ marginBottom: 20 }}>
+        <Panel
+          title={`Income History (${incomeHistory.length})`}
+          meta="Firm-wide · last 12 events"
+        >
+          {incomeHistory.length === 0 ? (
+            <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0' }}>
+              No income received yet for {inst.instrument_id}.
+            </div>
+          ) : (
+            <table style={tableStyle}>
+              <thead>
+                <tr>
+                  <th style={thLeft}>Date</th>
+                  <th style={thLeft}>Category</th>
+                  <th style={thRight}>Total Received</th>
+                  <th style={thRight}>Mandates</th>
+                  <th style={thLeft}>Mandate List</th>
+                </tr>
+              </thead>
+              <tbody>
+                {incomeHistory.map((e, idx) => (
+                  <tr key={idx}>
+                    <td style={tdLeft}>{fmtDate(e.trade_date)}</td>
+                    <td style={tdLeft}>
+                      <span style={{
+                        fontFamily: 'var(--font-mono, ui-monospace, monospace)',
+                        fontSize: 10,
+                        fontWeight: 600,
+                        letterSpacing: '0.04em',
+                        color: 'var(--gold)',
+                        padding: '2px 6px',
+                        background: 'rgba(176,139,62,0.08)',
+                        borderRadius: 2,
+                      }}>
+                        {e.income_category ?? 'Other'}
+                      </span>
+                    </td>
+                    <td style={{
+                      ...tdRight,
+                      fontFamily: '"Cormorant Garamond", Georgia, serif',
+                      fontSize: 16,
+                      fontWeight: 500,
+                      letterSpacing: '-0.005em',
+                      color: 'var(--pos)',
+                    }}>
+                      {fmtNgnM(e.total_amount_ngn)}
+                    </td>
+                    <td style={tdRight}>{e.mandate_count}</td>
+                    <td style={{
+                      ...tdLeft,
+                      color: 'var(--text-2)',
+                      fontSize: 11,
+                      maxWidth: 320,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                    }} title={e.mandates.join(', ')}>
+                      {e.mandates.join(', ')}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </Panel>
+      </div>
+
+      {/* ─── Holders panel (preserved) ───────────────────────── */}
       <Panel
         title={`Holders (${holders.length})`}
         meta={holders.length > 0
@@ -589,7 +895,7 @@ export default function InstrumentPage() {
         )}
       </Panel>
 
-      {/* ─── Recent transactions panel ───────────────────────── */}
+      {/* ─── Recent transactions panel (preserved) ───────────── */}
       <div style={{ marginTop: 20 }}>
         <Panel
           title={`Recent Transactions (${transactions.length})`}
@@ -774,7 +1080,7 @@ function Panel({
   )
 }
 
-// v27az-fix5: MoveCell — one of 4 windowed move cards
+// v27az-fix5: MoveCell (preserved)
 function MoveCell({
   label,
   data,
@@ -845,7 +1151,7 @@ function MoveCell({
   )
 }
 
-// v27az-fix5: Sparkline — inline SVG trend line
+// v27az-fix5: Sparkline (preserved)
 function Sparkline({ points }: { points: SparklinePoint[] }) {
   if (points.length < 2) {
     return (
@@ -876,7 +1182,6 @@ function Sparkline({ points }: { points: SparklinePoint[] }) {
   const strokeColor = isUp ? 'var(--pos)' : 'var(--neg)'
   const fillColor   = isUp ? 'rgba(45,110,78,0.06)' : 'rgba(166,59,59,0.06)'
 
-  // Fill area: polyline + bottom edge
   const lastX = (PAD + (points.length - 1) / (points.length - 1) * (W - 2 * PAD)).toFixed(2)
   const fillPath = `M ${PAD},${H - PAD} L ${polylinePoints.split(' ').join(' L ')} L ${lastX},${H - PAD} Z`
 
@@ -915,10 +1220,9 @@ function Sparkline({ points }: { points: SparklinePoint[] }) {
   )
 }
 
-// v27az-fix5: SignalBadge — one signal from the cockpit cache
+// v27az-fix5: SignalBadge (preserved)
 function SignalBadge({ signal }: { signal: CachedSignal }) {
   const tier = SEVERITY_TIERS[signal.severity] ?? SEVERITY_TIERS.gold
-  // Defensive: read both 'narration' (schema doc) and 'narrated' (route head)
   const headline =
     signal.narration?.headline
     ?? signal.narrated?.headline
@@ -957,6 +1261,198 @@ function SignalBadge({ signal }: { signal: CachedSignal }) {
       }} title={headline}>
         {headline}
       </span>
+    </div>
+  )
+}
+
+// v27ba: FiCell — one cell in the FI Metadata grid
+function FiCell({ label, value, sub }: { label: string; value: string; sub: string }) {
+  return (
+    <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      <div style={{
+        fontSize: 10,
+        letterSpacing: '0.14em',
+        fontWeight: 600,
+        color: 'var(--text-3)',
+        textTransform: 'uppercase',
+        marginBottom: 8,
+      }}>
+        {label}
+      </div>
+      <div style={{
+        fontFamily: '"Cormorant Garamond", Georgia, serif',
+        fontSize: 22,
+        fontWeight: 500,
+        color: 'var(--text)',
+        letterSpacing: '-0.01em',
+        marginBottom: 3,
+      }}>
+        {value}
+      </div>
+      {sub ? (
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {sub}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+// v27ba: LiquidityCell — one cell in the Trading Liquidity grid
+function LiquidityCell({
+  label,
+  window: w,
+  windowSize,
+}: {
+  label:      string
+  window:     LiquidityWindow | null
+  windowSize: number
+}) {
+  if (!w) {
+    return (
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+        <div style={{
+          fontSize: 10,
+          letterSpacing: '0.14em',
+          fontWeight: 600,
+          color: 'var(--text-3)',
+          textTransform: 'uppercase',
+          marginBottom: 8,
+        }}>
+          {label}
+        </div>
+        <div style={{
+          fontFamily: '"Cormorant Garamond", Georgia, serif',
+          fontSize: 22,
+          fontWeight: 500,
+          color: 'var(--text-3)',
+        }}>
+          —
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          no trading
+        </div>
+      </div>
+    )
+  }
+  return (
+    <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      <div style={{
+        fontSize: 10,
+        letterSpacing: '0.14em',
+        fontWeight: 600,
+        color: 'var(--text-3)',
+        textTransform: 'uppercase',
+        marginBottom: 8,
+      }}>
+        {label}
+      </div>
+      <div style={{
+        fontFamily: '"Cormorant Garamond", Georgia, serif',
+        fontSize: 22,
+        fontWeight: 500,
+        color: 'var(--text)',
+        letterSpacing: '-0.01em',
+        marginBottom: 3,
+      }}>
+        {fmtNgnM(w.avg_value_ngn)}
+      </div>
+      <div style={{ fontSize: 11, color: 'var(--text-2)', fontVariantNumeric: 'tabular-nums' }}>
+        {fmtShares(w.avg_volume)} <span style={{ color: 'var(--text-3)' }}>shares</span>
+      </div>
+      <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
+        {w.trading_days}/{windowSize} trading day{windowSize === 1 ? '' : 's'}
+      </div>
+    </div>
+  )
+}
+
+// v27ba: DividendSnapshotBody — fields from instrument record
+function DividendSnapshotBody({
+  snapshot,
+}: {
+  snapshot: NonNullable<InstrumentResp['dividend_snapshot']>
+}) {
+  const statusKey = (snapshot.div_status ?? 'unknown').toLowerCase()
+  const statusStyle = DIV_STATUS_STYLE[statusKey] ?? DIV_STATUS_STYLE.unknown
+
+  return (
+    <div>
+      {/* Top row: status + key numbers */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(4, 1fr)',
+        gap: 16,
+        marginBottom: 18,
+      }}>
+        <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+          <div style={dsLabelStyle}>Status</div>
+          <span style={{
+            display: 'inline-block',
+            padding: '4px 10px',
+            background: statusStyle.bg,
+            color: statusStyle.fg,
+            borderRadius: 2,
+            fontSize: 10,
+            fontWeight: 700,
+            letterSpacing: '0.14em',
+            textTransform: 'uppercase',
+            marginTop: 4,
+          }}>
+            {statusStyle.label}
+          </span>
+        </div>
+        <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+          <div style={dsLabelStyle}>DPS</div>
+          <div style={dsValueStyle}>{fmtPrice(snapshot.div_per_share)}</div>
+        </div>
+        <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+          <div style={dsLabelStyle}>Yield</div>
+          <div style={dsValueStyle}>{fmtPct(snapshot.div_yield_pct)}</div>
+        </div>
+        <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+          <div style={dsLabelStyle}>Frequency</div>
+          <div style={dsValueStyle}>{snapshot.div_frequency ?? '—'}</div>
+        </div>
+      </div>
+
+      {/* Dates row */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: '1fr 1fr',
+        gap: 16,
+        paddingTop: 14,
+        borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+        marginBottom: snapshot.div_notes ? 14 : 0,
+      }}>
+        <div>
+          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.14em', textTransform: 'uppercase', marginBottom: 4 }}>
+            Last paid
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--text)' }}>{fmtDate(snapshot.last_div_date)}</div>
+        </div>
+        <div>
+          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.14em', textTransform: 'uppercase', marginBottom: 4 }}>
+            Next expected
+          </div>
+          <div style={{ fontSize: 13, color: 'var(--text)' }}>{fmtDate(snapshot.next_div_date)}</div>
+        </div>
+      </div>
+
+      {/* Notes (if present) */}
+      {snapshot.div_notes && (
+        <div style={{
+          paddingTop: 14,
+          borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+        }}>
+          <div style={{ fontSize: 10, fontWeight: 600, color: 'var(--text-3)', letterSpacing: '0.14em', textTransform: 'uppercase', marginBottom: 6 }}>
+            Notes
+          </div>
+          <div style={{ fontSize: 12, color: 'var(--text-2)', lineHeight: 1.55 }}>
+            {snapshot.div_notes}
+          </div>
+        </div>
+      )}
     </div>
   )
 }
@@ -1004,3 +1500,20 @@ const tdLeft: React.CSSProperties = {
   borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
 }
 const tdRight: React.CSSProperties = { ...tdLeft, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
+
+// v27ba: shared dividend-snapshot field styles
+const dsLabelStyle: React.CSSProperties = {
+  fontSize: 10,
+  letterSpacing: '0.14em',
+  fontWeight: 600,
+  color: 'var(--text-3)',
+  textTransform: 'uppercase',
+  marginBottom: 8,
+}
+const dsValueStyle: React.CSSProperties = {
+  fontFamily: '"Cormorant Garamond", Georgia, serif',
+  fontSize: 22,
+  fontWeight: 500,
+  color: 'var(--text)',
+  letterSpacing: '-0.01em',
+}

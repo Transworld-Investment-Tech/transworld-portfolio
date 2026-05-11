@@ -8,6 +8,7 @@ import {
   ChevronDown, ChevronUp, Sparkles,
 } from 'lucide-react'
 import { supabase } from '@/lib/supabase'
+import Link from 'next/link'
 
 // v27ax-fix5: opt out of static pre-rendering. useSearchParams (added in
 // fix4) requires either a <Suspense> wrapper or this directive, otherwise
@@ -1005,20 +1006,27 @@ export default function WatchlistPage() {
 
                       {item.ticker && (
                         <div style={{ flexShrink: 0, marginTop: 2 }}>
-                          <span
-                            style={{
-                              fontFamily: 'var(--font-mono)',
-                              fontSize: 10,
-                              fontWeight: 700,
-                              padding: '2px 6px',
-                              borderRadius: 2,
-                              background: sl.bg,
-                              color: sl.color,
-                              letterSpacing: '0.02em',
-                            }}
+                          {/* v27ba: ticker badge becomes click-through to fundamentals page */}
+                          <Link
+                            href={`/instrument/${item.ticker}`}
+                            style={{ textDecoration: 'none' }}
                           >
-                            {item.ticker}
-                          </span>
+                            <span
+                              style={{
+                                fontFamily: 'var(--font-mono)',
+                                fontSize: 10,
+                                fontWeight: 700,
+                                padding: '2px 6px',
+                                borderRadius: 2,
+                                background: sl.bg,
+                                color: sl.color,
+                                letterSpacing: '0.02em',
+                                cursor: 'pointer',
+                              }}
+                            >
+                              {item.ticker}
+                            </span>
+                          </Link>
                         </div>
                       )}
 

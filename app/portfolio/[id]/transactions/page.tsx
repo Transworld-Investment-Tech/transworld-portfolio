@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 import { useParams } from 'next/navigation'
 import * as XLSX from 'xlsx'
 import { supabase } from '@/lib/supabase'
+import Link from 'next/link'
 import { fmt } from '@/lib/portfolio'
 import { Plus, Search, Copy, Check, Info, FileSpreadsheet, Edit2 } from 'lucide-react'
 // v27v: Transaction CRUD modal
@@ -641,7 +642,18 @@ export default function TransactionsPage() {
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 11 }}>{t.trade_date}</td>
                   <td><span className={`pill ${ACTION_PILL[t.action] ?? 'pill-hold'}`}>{t.action}</span></td>
                   <td>
-                    <div style={{ fontWeight: 500 }}>{t.instrument_id || '—'}</div>
+                    {/* v27ba: when instrument_id exists, become click-through to fundamentals page.
+                        FEE rows with null instrument_id render plain em-dash. */}
+                    {t.instrument_id ? (
+                      <Link
+                        href={`/instrument/${t.instrument_id}`}
+                        style={{ textDecoration: 'none', color: 'inherit' }}
+                      >
+                        <div style={{ fontWeight: 500 }}>{t.instrument_id}</div>
+                      </Link>
+                    ) : (
+                      <div style={{ fontWeight: 500 }}>—</div>
+                    )}
                     {t.income_category && <div style={{ fontSize: 10, color: 'var(--text-3)' }}>{t.income_category}</div>}
                   </td>
                   <td style={{ fontFamily: 'var(--font-mono)', fontSize: 12 }}>

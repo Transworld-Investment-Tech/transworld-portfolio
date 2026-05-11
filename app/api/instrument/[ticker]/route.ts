@@ -1,24 +1,34 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/instrument/[ticker] (v27az-fix5)
+// /api/instrument/[ticker] (v27ba)
 // ═══════════════════════════════════════════════════════════════
 //
 // GET /api/instrument/<TICKER>
 //
-// v27az-fix5 changes (movement + sparkline):
-//   Adds `movement` block to the response:
-//     - day / week / month / quarter pct + NGN impact
-//     - 30 most-recent-trading-days sparkline points
-//   NGN impact = current firm_value_ngn × pct — "what this move
-//   means for our current position right now". For unheld tickers
-//   (firm_value_ngn = 0) the NGN impact is 0 and the page hides it.
-//   Anchors use calendar-day lookback with at-or-before resolution
-//   to handle weekends and holidays gracefully.
+// v27ba changes — Per-instrument fundamentals research surface:
+//   Adds the following new response blocks:
+//     • market_cap         — current_price × shares_outstanding (equity)
+//     • liquidity          — windowed AVG(value_ngn) + AVG(volume) for
+//                            day/week/month/quarter, sourced from NGX-
+//                            reported value_ngn on market_prices
+//     • dividend_snapshot  — latest declared div fields from instruments
+//                            (kept fresh weekly via /api/dividends/refresh)
+//     • income_history     — firm-wide INCOME transactions aggregated by
+//                            trade_date with per-date totals + mandate list
+//     • fi_metadata        — coupon_pct, coupon_freq, maturity_date,
+//                            yield_pct (conditional on FI sleeve)
 //
-//   Everything from v27az-fix4 preserved:
+//   Schema reads expand:
+//     • instruments SELECT adds shares_outstanding, div_notes,
+//       div_last_refreshed_at
+//     • market_prices SELECT adds volume, value_ngn (needed for ADTV)
+//     • market_prices LIMIT bumped from 150 to 200 (covers 12mo + buffer)
+//
+//   Everything from v27az-fix5 preserved:
 //     - holdings SELECT without latest_price (the empty-holders fix)
 //     - sleeve concentration via market_prices join
 //     - quantity > 0 client-side filter
 //     - _debug envelope with captured Supabase errors
+//     - movement block (windowed pct + NGN impact) + sparkline
 // ═══════════════════════════════════════════════════════════════
 
 import { NextResponse } from 'next/server'
@@ -34,31 +44,37 @@ export const maxDuration = 30
 // ─── Explicit row types ─────────────────────────────────────────
 
 type InstrumentRow = {
-  instrument_id: string
-  name:          string
-  sleeve_id:     string | null
-  asset_class:   string | null
-  type:          string | null
-  currency:      string | null
-  ngx_symbol:    string | null
-  ngx_market:    string | null
-  sector:        string | null
-  approved:      boolean | null
-  div_per_share: number | null
-  div_yield_pct: number | null
-  div_frequency: string | null
-  last_div_date: string | null
-  next_div_date: string | null
-  div_status:    string | null
-  coupon_pct:    number | null
-  coupon_freq:   string | null
-  maturity_date: string | null
-  yield_pct:     number | null
+  instrument_id:                        string
+  name:                                 string
+  sleeve_id:                            string | null
+  asset_class:                          string | null
+  type:                                 string | null
+  currency:                             string | null
+  ngx_symbol:                           string | null
+  ngx_market:                           string | null
+  sector:                               string | null
+  approved:                             boolean | null
+  div_per_share:                        number | null
+  div_yield_pct:                        number | null
+  div_frequency:                        string | null
+  last_div_date:                        string | null
+  next_div_date:                        string | null
+  div_status:                           string | null
+  div_notes:                            string | null
+  div_last_refreshed_at:                string | null
+  coupon_pct:                           number | null
+  coupon_freq:                          number | null
+  maturity_date:                        string | null
+  yield_pct:                            number | null
+  shares_outstanding:                   number | null
+  shares_outstanding_last_refreshed_at: string | null
 }
 
 type PriceRow = {
   price:      number | string | null
   price_date: string | null
+  volume:     number | string | null
+  value_ngn:  number | string | null
 }
 
 type WatchlistRow = {
@@ -84,6 +100,14 @@ type TxnRow = {
   narration:    string | null
 }
 
+type IncomeRow = {
+  trade_date:      string
+  portfolio_id:    string
+  amount:          number | string | null
+  income_category: string | null
+  narration:       string | null
+}
+
 type PMeta = {
   id:           string
   label?:       string
@@ -93,12 +117,28 @@ type PMeta = {
 
 type DebugEntry = { stage: string; message: string; hint?: string }
 
-// v27az-fix5: movement window shape
+// v27az-fix5: movement window shape (preserved)
 type MoveWindow = {
   pct:           number
   ngn_impact:    number
   anchor_date:   string
   anchor_price:  number
+}
+
+// v27ba: liquidity window shape — windowed averages from value_ngn + volume
+type LiquidityWindow = {
+  avg_value_ngn: number
+  avg_volume:    number
+  trading_days:  number   // count of contributing days (out of window size)
+}
+
+// v27ba: income history per-event entry (aggregated firm-wide by trade_date)
+type IncomeEvent = {
+  trade_date:       string
+  income_category:  string | null
+  total_amount_ngn: number
+  mandate_count:    number
+  mandates:         string[]  // mandate_label strings for transparency
 }
 
 // ─── Helpers ────────────────────────────────────────────────────
@@ -141,6 +181,34 @@ function captureErr(stage: string, err: unknown, debug: DebugEntry[]) {
   console.error('[instrument-route]', stage, entry.message, entry.hint ?? '')
 }
 
+// v27ba: compute liquidity window from N most-recent price rows.
+// Excludes zero-value sessions from the average so non-trading days
+// don't drag the mean down. trading_days reports the actual contributor
+// count for operator awareness (low count = thin liquidity signal).
+function computeLiquidityWindow(rows: PriceRow[], n: number): LiquidityWindow | null {
+  const slice = rows.slice(0, n)
+  let valSum = 0
+  let volSum = 0
+  let count  = 0
+  for (const r of slice) {
+    const v   = num(r.value_ngn)
+    const vol = num(r.volume)
+    // Count a day as "traded" if EITHER metric is positive. NGX sometimes
+    // reports volume without value (or vice versa) for low-print sessions.
+    if (v > 0 || vol > 0) {
+      valSum += v
+      volSum += vol
+      count  += 1
+    }
+  }
+  if (count === 0) return null
+  return {
+    avg_value_ngn: valSum / count,
+    avg_volume:    volSum / count,
+    trading_days:  count,
+  }
+}
+
 // ─── GET ────────────────────────────────────────────────────────
 
 export async function GET(
@@ -158,9 +226,11 @@ export async function GET(
   const ticker = decodeURIComponent(rawTicker).toUpperCase()
 
   // ─── 1. Instrument metadata ─────────────────────────────────
+  // v27ba: SELECT extended with shares_outstanding,
+  // shares_outstanding_last_refreshed_at, div_notes, div_last_refreshed_at.
   const { data: rawInstrument, error: instErr } = await db
     .from('instruments')
-    .select('instrument_id, name, sleeve_id, asset_class, type, currency, ngx_symbol, ngx_market, sector, approved, div_per_share, div_yield_pct, div_frequency, last_div_date, next_div_date, div_status, coupon_pct, coupon_freq, maturity_date, yield_pct')
+    .select('instrument_id, name, sleeve_id, asset_class, type, currency, ngx_symbol, ngx_market, sector, approved, div_per_share, div_yield_pct, div_frequency, last_div_date, next_div_date, div_status, div_notes, div_last_refreshed_at, coupon_pct, coupon_freq, maturity_date, yield_pct, shares_outstanding, shares_outstanding_last_refreshed_at')
     .eq('instrument_id', ticker)
     .maybeSingle()
 
@@ -176,14 +246,16 @@ export async function GET(
   }
   const instrument = rawInstrument as unknown as InstrumentRow
 
-  // ─── 2. Price history (v27az-fix5: now pulls up to 150 rows ──
-  //    to support windowed move math + 30-row sparkline)
+  // ─── 2. Price history ───────────────────────────────────────
+  // v27ba: SELECT extended with volume, value_ngn (ADTV math).
+  // Limit bumped to 200 (covers 12mo trading days ~250 with margin,
+  // and the existing movement quarter lookback at 90 calendar days).
   const { data: priceRowsRaw, error: priceErr } = await db
     .from('market_prices')
-    .select('price, price_date')
+    .select('price, price_date, volume, value_ngn')
     .eq('instrument_id', ticker)
     .order('price_date', { ascending: false })
-    .limit(150)
+    .limit(200)
   captureErr('market-prices', priceErr, debug)
   const priceHistory = (priceRowsRaw ?? []) as unknown as PriceRow[]
 
@@ -231,7 +303,7 @@ export async function GET(
     return code + '-' + lab
   }
 
-  // ─── 5. Holders ─────────────────────────────────────────────
+  // ─── 5. Holders (v27az-fix4: no latest_price in SELECT) ─────
   const { data: rawHoldings, error: holdErr } = await db
     .from('holdings')
     .select('portfolio_id, quantity, avg_cost')
@@ -332,20 +404,15 @@ export async function GET(
     sleeve_label: SLEEVE_LABELS[sleeve_id] ?? sleeve_id,
   }
 
-  // ─── 7. Movement (v27az-fix5) ───────────────────────────────
-  // Calendar-day lookback with at-or-before resolution to handle
-  // weekends / holidays. Returns null when there's no anchor in
-  // the requested window (e.g. ticker just listed).
+  // ─── 7. Movement (v27az-fix5, preserved) ────────────────────
   function findAnchorByLookback(daysBack: number): PriceRow | null {
     if (priceHistory.length === 0 || !priceHistory[0].price_date) return null
     const todayIso = priceHistory[0].price_date as string
     const target = new Date(todayIso + 'T00:00:00')
     target.setDate(target.getDate() - daysBack)
     const targetIso = target.toISOString().slice(0, 10)
-    // priceHistory is DESC: walk to find the first row at-or-before target.
     for (const r of priceHistory) {
       if (r.price_date && (r.price_date as string) <= targetIso) {
-        // Skip if it's literally today's row (lookback = 0 edge)
         if (r.price_date === todayIso && daysBack > 0) continue
         return r
       }
@@ -366,8 +433,6 @@ export async function GET(
     }
   }
 
-  // Day uses the already-computed day_change_pct; week/month/quarter
-  // use calendar lookback for stable semantics.
   const day_window: MoveWindow | null = (day_change_pct !== null && prev_price !== null)
     ? {
         pct:          day_change_pct,
@@ -382,7 +447,6 @@ export async function GET(
     week:      moveFromAnchor(findAnchorByLookback(7)),
     month:     moveFromAnchor(findAnchorByLookback(30)),
     quarter:   moveFromAnchor(findAnchorByLookback(90)),
-    // Sparkline: 30 most-recent rows, reversed to ASC for left-to-right rendering.
     sparkline: priceHistory
       .slice(0, 30)
       .reverse()
@@ -393,7 +457,104 @@ export async function GET(
       .filter(p => p.date && p.price > 0),
   }
 
-  // ─── 8. Recent transactions ─────────────────────────────────
+  // ─── 8. v27ba: Market Cap ───────────────────────────────────
+  // Only meaningful for equities. FI instruments return null; page
+  // substitutes a Maturity/YTM card from fi_metadata instead.
+  let market_cap: {
+    ngn: number
+    shares_outstanding: number
+    as_of_price_date: string | null
+    last_refreshed_at: string | null
+  } | null = null
+
+  if (sleeve_id === 'eq' && current_price !== null) {
+    const so = num(instrument.shares_outstanding)
+    if (so > 0) {
+      market_cap = {
+        ngn: current_price * so,
+        shares_outstanding: so,
+        as_of_price_date: price_date,
+        last_refreshed_at: instrument.shares_outstanding_last_refreshed_at,
+      }
+    }
+  }
+
+  // ─── 9. v27ba: Liquidity (windowed ADV/ADTV) ────────────────
+  // Trading-day windows: 1D / 5D / 21D / 63D. Computed from
+  // NGX-reported value_ngn (more accurate than volume × close).
+  const liquidity = {
+    day:     computeLiquidityWindow(priceHistory, 1),
+    week:    computeLiquidityWindow(priceHistory, 5),
+    month:   computeLiquidityWindow(priceHistory, 21),
+    quarter: computeLiquidityWindow(priceHistory, 63),
+  }
+
+  // ─── 10. v27ba: Dividend Snapshot ───────────────────────────
+  // Latest declared values from instruments table (refreshed weekly
+  // via /api/dividends/refresh cron). Pass-through with numeric coercion.
+  const dividend_snapshot = {
+    div_per_share:         num(instrument.div_per_share),
+    div_yield_pct:         num(instrument.div_yield_pct),
+    div_frequency:         instrument.div_frequency,
+    div_status:            instrument.div_status,
+    last_div_date:         instrument.last_div_date,
+    next_div_date:         instrument.next_div_date,
+    div_notes:             instrument.div_notes,
+    div_last_refreshed_at: instrument.div_last_refreshed_at,
+  }
+
+  // ─── 11. v27ba: Income History (firm-wide aggregation) ──────
+  // Query all INCOME transactions for this ticker across all portfolios.
+  // Aggregate by trade_date. Output the last 12 events sorted DESC.
+  const { data: rawIncome, error: incomeErr } = await db
+    .from('transactions')
+    .select('trade_date, portfolio_id, amount, income_category, narration')
+    .eq('instrument_id', ticker)
+    .eq('action', 'INCOME')
+    .order('trade_date', { ascending: false })
+    .limit(200)  // generous cap; we aggregate down to ~12 events
+  captureErr('income-history', incomeErr, debug)
+  const incomeRows = (rawIncome ?? []) as unknown as IncomeRow[]
+
+  const incomeByDate = new Map<string, IncomeEvent>()
+  for (const r of incomeRows) {
+    const key = r.trade_date
+    if (!incomeByDate.has(key)) {
+      incomeByDate.set(key, {
+        trade_date:       r.trade_date,
+        income_category:  r.income_category,
+        total_amount_ngn: 0,
+        mandate_count:    0,
+        mandates:         [],
+      })
+    }
+    const entry = incomeByDate.get(key)!
+    entry.total_amount_ngn += num(r.amount)
+    entry.mandate_count    += 1
+    entry.mandates.push(mandateLabel(r.portfolio_id))
+    // First non-null income_category wins (defensive — events should be consistent)
+    if (!entry.income_category && r.income_category) {
+      entry.income_category = r.income_category
+    }
+  }
+
+  const income_history = Array.from(incomeByDate.values())
+    .sort((a, b) => b.trade_date.localeCompare(a.trade_date))
+    .slice(0, 12)
+
+  // ─── 12. v27ba: FI Metadata ─────────────────────────────────
+  // Only included when the instrument is fixed-income. Page conditionally
+  // renders the FI metadata panel + swaps KPI4 (mcap → maturity/YTM).
+  const fi_metadata = (sleeve_id === 'ntb' || sleeve_id === 'fi')
+    ? {
+        coupon_pct:    num(instrument.coupon_pct),
+        coupon_freq:   instrument.coupon_freq,
+        maturity_date: instrument.maturity_date,
+        yield_pct:     num(instrument.yield_pct),
+      }
+    : null
+
+  // ─── 13. Recent transactions (v27az-fix5, preserved) ────────
   const { data: rawTxn, error: txnErr } = await db
     .from('transactions')
     .select('trade_date, action, portfolio_id, quantity, price, amount, narration')
@@ -419,6 +580,7 @@ export async function GET(
     }
   })
 
+  // ─── 14. Response assembly ──────────────────────────────────
   const response: Record<string, unknown> = {
     instrument,
     price:               { current_price, price_date, day_change_pct, day_change_ngn },
@@ -426,6 +588,11 @@ export async function GET(
     holders,
     concentration,
     movement,
+    market_cap,
+    liquidity,
+    dividend_snapshot,
+    income_history,
+    fi_metadata,
     recent_transactions,
     firm_context: { firm_aum_ngn, firm_sleeve_total_ngn },
   }

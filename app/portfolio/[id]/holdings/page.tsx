@@ -640,7 +640,13 @@ export default function HoldingsPage() {
                       <tr key={h.instrument_id}>
                         <td>
                           <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                            <span style={{ fontWeight: 500 }}>{h.instrument?.name}</span>
+                            {/* v27ba: instrument name becomes click-through to fundamentals page */}
+                            <Link
+                              href={`/instrument/${h.instrument_id}`}
+                              style={{ textDecoration: 'none', color: 'inherit' }}
+                            >
+                              <span style={{ fontWeight: 500 }}>{h.instrument?.name}</span>
+                            </Link>
                             {ngxMarket && (
                               <span
                                 style={{
@@ -656,9 +662,15 @@ export default function HoldingsPage() {
                               </span>
                             )}
                           </div>
-                          <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
-                            {h.instrument_id}
-                          </div>
+                          {/* v27ba: mono ticker line becomes click-through to fundamentals page */}
+                          <Link
+                            href={`/instrument/${h.instrument_id}`}
+                            style={{ textDecoration: 'none', color: 'inherit' }}
+                          >
+                            <div style={{ fontSize: 10, color: 'var(--text-3)', fontFamily: 'var(--font-mono)' }}>
+                              {h.instrument_id}
+                            </div>
+                          </Link>
                         </td>
                         <td><span className={`pill ${typePill}`}>{h.instrument?.type}</span></td>
                         <td style={{ fontSize: 11, color: sectorRaw ? 'var(--text-2)' : 'var(--text-4)' }}>
