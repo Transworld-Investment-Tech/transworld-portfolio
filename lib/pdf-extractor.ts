@@ -120,11 +120,19 @@ export async function extractPdfLines(buffer: Buffer): Promise<string[]> {
 //
 // Verified against ACCESSCORP FY2025 (heading_pl anchor),
 // FY2024 (pldata_before_bs anchor), Q1 2026 (heading_pl anchor).
+// v27cb-a-fix4: relaxed end-anchors. Previously each pattern required the
+// line to END with the heading phrase (\s*$), which rejected NGX-style
+// headings like "Consolidated and separate statement of comprehensive income
+// for the year ended" (note the trailing date suffix on the same logical
+// line). The trailing-text rejection caused the selector to fall back to the
+// executive-summary anchor at line 135 of the ACCESSCORP FY2024 audit,
+// which has Revenue and EPS but no BS detail and no CFO. Replacing \s*$
+// with \b allows the heading to match even when extra text follows.
 const HEADING_PATTERNS: RegExp[] = [
-  /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?(?:interim\s+)?statement of (?:profit or loss(?:\s+and other comprehensive income)?|comprehensive income|financial position)\s*$/i,
-  /^\s*(?:consolidated\s+)?income statement\s*$/i,
-  /^\s*consolidated and separate statement of comprehensive income\s*$/i,
-  /^\s*statement of (?:profit or loss|comprehensive income|financial position)\s*(?:\([^)]*\))?\s*$/i,
+  /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?(?:interim\s+)?statement of (?:profit or loss(?:\s+and other comprehensive income)?|comprehensive income|financial position)\b/i,
+  /^\s*(?:consolidated\s+)?income statement\b/i,
+  /^\s*consolidated and separate statement of comprehensive income\b/i,
+  /^\s*statement of (?:profit or loss|comprehensive income|financial position)\b/i,
 ]
 
 // PL_DATA_PATTERNS: row labels that ONLY appear in an income statement, never
