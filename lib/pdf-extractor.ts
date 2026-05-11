@@ -110,29 +110,44 @@ export async function extractPdfLines(buffer: Buffer): Promise<string[]> {
  * Falls back to returning the whole document head (first maxChars) if no
  * marker is found — better to send full text than nothing.
  */
+// v27ca-fix1: strict heading-only matching.
+// The original selector matched any sentence containing the phrase
+// "statement of profit or loss" — but in NGX audited reports those phrases
+// appear extensively in accounting-policy NOTES paragraphs that come BEFORE
+// the actual statements. To target the real statements we require:
+//   1. Match against heading-shaped regex patterns (heading, not prose)
+//   2. The line itself is short (<= 100 chars) — true headings are short,
+//      while policy-prose paragraphs are long
+// Verified against ACCESSCORP FY2025: matches line 3544
+// "Consolidated and separate statement of comprehensive income" (the real
+// heading) rather than line 4004 (an IFRS-18 policy note).
+const HEADING_PATTERNS: RegExp[] = [
+  /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?(?:interim\s+)?statement of (?:profit or loss(?:\s+and other comprehensive income)?|comprehensive income|financial position)\s*$/i,
+  /^\s*(?:consolidated\s+)?income statement\s*$/i,
+  /^\s*consolidated and separate statement of comprehensive income\s*$/i,
+  /^\s*statement of (?:profit or loss|comprehensive income|financial position)\s*(?:\([^)]*\))?\s*$/i,
+]
+
+function isLikelyHeadingLine(line: string): boolean {
+  if (line.length > 100) return false
+  for (const re of HEADING_PATTERNS) {
+    if (re.test(line)) return true
+  }
+  return false
+}
+
 export function findFinancialStatementSection(
   lines: string[],
-  maxChars = 30_000,
+  maxChars = 40_000,
 ): { section: string; matched_marker: string | null; total_lines: number } {
-  const markers = [
-    /statement of profit or loss/i,
-    /statement of comprehensive income/i,
-    /consolidated income statement/i,
-    /interim statement of comprehensive income/i,
-    /consolidated statement of comprehensive income/i,
-  ]
-
   let startIdx = -1
   let matched_marker: string | null = null
-  for (const re of markers) {
-    for (let i = 0; i < lines.length; i++) {
-      if (re.test(lines[i])) {
-        startIdx = i
-        matched_marker = lines[i]
-        break
-      }
+  for (let i = 0; i < lines.length; i++) {
+    if (isLikelyHeadingLine(lines[i])) {
+      startIdx = i
+      matched_marker = lines[i]
+      break
     }
-    if (startIdx !== -1) break
   }
 
   if (startIdx === -1) {
@@ -145,26 +160,9 @@ export function findFinancialStatementSection(
     }
   }
 
-  // Read forward until we hit a clear end marker OR run out of budget
-  const endMarkers = [
-    /notes to (the )?consolidated/i,
-    /notes to the financial statements/i,
-    /significant accounting polic/i,
-  ]
-  let endIdx = lines.length
-  for (let i = startIdx + 100; i < lines.length; i++) {
-    let matched = false
-    for (const re of endMarkers) {
-      if (re.test(lines[i])) {
-        endIdx = i
-        matched = true
-        break
-      }
-    }
-    if (matched) break
-  }
-
-  const slice = lines.slice(startIdx, endIdx).join('\n')
+  // Read forward — generous slice (1200 lines is enough for P&L + BS + EPS
+  // notes in any NGX filing; budget capped by maxChars).
+  const slice = lines.slice(startIdx, startIdx + 1200).join('\n')
   return {
     section: slice.slice(0, maxChars),
     matched_marker,
