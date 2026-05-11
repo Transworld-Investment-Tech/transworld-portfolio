@@ -5,10 +5,22 @@ import { supabase } from '@/lib/supabase'
 import {
   Users, BarChart3, FileText, Settings,
   PlusCircle, ChevronRight, Upload, LineChart, Inbox,
+  Sparkles, RefreshCw,
 } from 'lucide-react'
 
 // v20e: Hybrid rewrite of the admin dashboard.
 // v21b-3b: Added "Broker files" card linking to /admin/broker.
+// v27bc: Added "AI Financial Summaries" coverage card between Stats
+//        and Quick Actions. New pattern — establishes the operator UI
+//        for AI summary refresh (parallel to curl-only dividends and
+//        shares-outstanding refresh routes today; future cleanup pass
+//        to add equivalent cards for those).
+//
+//        Card shows: total eligible, summarized count, never-summarized
+//        count, last refresh relative time, "Refresh next 30" button.
+//        After click: POSTs to /api/ai-summaries/refresh and renders
+//        inline success/error message below the button. Coverage stats
+//        re-fetch on success.
 
 type QuickAction = {
   href: string
@@ -18,10 +30,28 @@ type QuickAction = {
   accent: string   // CSS var for accent bar / icon tint
 }
 
+type AICoverage = {
+  totalEligible:    number    // equities with profit_after_tax_ngn_m populated
+  summarized:       number    // also have ai_summary_refreshed_at set
+  neverSummarized:  number
+  lastRefresh:      string | null  // most recent ai_summary_refreshed_at across all
+}
+
+type RefreshOutcome =
+  | { kind: 'idle' }
+  | { kind: 'running' }
+  | { kind: 'success'; message: string }
+  | { kind: 'error';   message: string }
+
 export default function AdminPage() {
   const [stats, setStats] = useState({ clients: 0, portfolios: 0, reports: 0 })
   const [recentReports, setRecentReports] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
+
+  // v27bc: AI summary coverage state
+  const [aiCoverage, setAiCoverage] = useState<AICoverage | null>(null)
+  const [aiCoverageLoading, setAiCoverageLoading] = useState(true)
+  const [refreshOutcome, setRefreshOutcome] = useState<RefreshOutcome>({ kind: 'idle' })
 
   useEffect(() => {
     async function load() {
@@ -36,6 +66,110 @@ export default function AdminPage() {
     }
     load()
   }, [])
+
+  // v27bc: AI summary coverage fetch (client-side Supabase pattern
+  // matching the existing direct query pattern above)
+  async function loadAICoverage() {
+    setAiCoverageLoading(true)
+    try {
+      const [total, summarized, lastRefresh] = await Promise.all([
+        supabase.from('instruments')
+          .select('*', { count: 'exact', head: true })
+          .eq('type', 'Stock')
+          .eq('approved', true)
+          .not('profit_after_tax_ngn_m', 'is', null),
+        supabase.from('instruments')
+          .select('*', { count: 'exact', head: true })
+          .eq('type', 'Stock')
+          .eq('approved', true)
+          .not('profit_after_tax_ngn_m', 'is', null)
+          .not('ai_summary_refreshed_at', 'is', null),
+        supabase.from('instruments')
+          .select('ai_summary_refreshed_at')
+          .eq('type', 'Stock')
+          .eq('approved', true)
+          .not('ai_summary_refreshed_at', 'is', null)
+          .order('ai_summary_refreshed_at', { ascending: false })
+          .limit(1)
+          .maybeSingle(),
+      ])
+
+      const totalCount  = total.count ?? 0
+      const summCount   = summarized.count ?? 0
+      const neverCount  = totalCount - summCount
+      const lastIso     = (lastRefresh.data as { ai_summary_refreshed_at: string } | null)?.ai_summary_refreshed_at ?? null
+
+      setAiCoverage({
+        totalEligible:   totalCount,
+        summarized:      summCount,
+        neverSummarized: neverCount,
+        lastRefresh:     lastIso,
+      })
+    } catch (err) {
+      console.error('[admin AI coverage]', err)
+      setAiCoverage(null)
+    }
+    setAiCoverageLoading(false)
+  }
+
+  useEffect(() => { loadAICoverage() }, [])
+
+  // v27bc: refresh button handler — POSTs to /api/ai-summaries/refresh,
+  // re-fetches coverage on success, displays inline status message.
+  async function handleAiRefresh() {
+    setRefreshOutcome({ kind: 'running' })
+    try {
+      const res = await fetch('/api/ai-summaries/refresh', { method: 'POST' })
+      const data = await res.json()
+      if (!res.ok || !data.ok) {
+        setRefreshOutcome({ kind: 'error', message: data.error ?? data.message ?? 'Refresh failed' })
+        return
+      }
+      const updatedCount   = Array.isArray(data.updated) ? data.updated.length : 0
+      const skippedCount   = Array.isArray(data.skipped) ? data.skipped.length : 0
+      const batchErrCount  = Array.isArray(data.batchErrors)  ? data.batchErrors.length  : 0
+      const updateErrCount = Array.isArray(data.updateErrors) ? data.updateErrors.length : 0
+      const parts: string[] = []
+      parts.push(`Summarized ${updatedCount} ticker${updatedCount === 1 ? '' : 's'}`)
+      if (skippedCount > 0)   parts.push(`${skippedCount} skipped`)
+      if (batchErrCount > 0)  parts.push(`${batchErrCount} batch error${batchErrCount === 1 ? '' : 's'}`)
+      if (updateErrCount > 0) parts.push(`${updateErrCount} write error${updateErrCount === 1 ? '' : 's'}`)
+      if (typeof data.neverSummarized === 'number' && data.neverSummarized > 0) {
+        parts.push(`${data.neverSummarized} still never-summarized`)
+      } else if (typeof data.neverSummarized === 'number' && data.neverSummarized === 0) {
+        parts.push('full coverage reached')
+      }
+      setRefreshOutcome({ kind: 'success', message: parts.join(' · ') })
+      // Re-fetch coverage to reflect new counts
+      await loadAICoverage()
+    } catch (err) {
+      setRefreshOutcome({ kind: 'error', message: (err as Error).message ?? 'Network error' })
+    }
+  }
+
+  function fmtRelative(iso: string | null): string {
+    if (!iso) return 'never'
+    try {
+      const then = new Date(iso).getTime()
+      const now = Date.now()
+      const diffMs = now - then
+      if (diffMs < 0) return 'in the future'
+      const days = Math.floor(diffMs / (1000 * 60 * 60 * 24))
+      if (days === 0) {
+        const hours = Math.floor(diffMs / (1000 * 60 * 60))
+        if (hours === 0) return 'just now'
+        return `${hours}h ago`
+      }
+      if (days === 1) return 'yesterday'
+      if (days < 7)  return `${days}d ago`
+      const weeks = Math.floor(days / 7)
+      if (weeks < 5) return `${weeks}w ago`
+      const months = Math.floor(days / 30)
+      return `${months}mo ago`
+    } catch {
+      return 'unknown'
+    }
+  }
 
   const quickLinks: QuickAction[] = [
     { href: '/admin/clients/new',    icon: <PlusCircle size={14} />, label: 'Add client',           sub: 'Onboard a new discretionary mandate',          accent: 'var(--gold)' },
@@ -68,7 +202,7 @@ export default function AdminPage() {
 
       <div style={{ maxWidth: 960 }}>
         {/* Stats row */}
-        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 32 }}>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 14, marginBottom: 24 }}>
           {statCards.map((s, i) => (
             <Link key={i} href={s.link} style={{ textDecoration: 'none' }}>
               <div
@@ -121,6 +255,147 @@ export default function AdminPage() {
               </div>
             </Link>
           ))}
+        </div>
+
+        {/* v27bc: AI Financial Summaries coverage card */}
+        <div
+          className="panel"
+          style={{
+            padding: '18px 22px',
+            marginBottom: 32,
+            borderLeft: '3px solid var(--gold)',
+          }}
+        >
+          <div style={{
+            display: 'flex',
+            alignItems: 'flex-start',
+            justifyContent: 'space-between',
+            gap: 16,
+            flexWrap: 'wrap',
+          }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div style={{
+                display: 'flex',
+                alignItems: 'center',
+                gap: 8,
+                marginBottom: 8,
+              }}>
+                <Sparkles size={14} style={{ color: 'var(--gold)' }} />
+                <div style={{
+                  fontSize: 10,
+                  fontWeight: 600,
+                  letterSpacing: '0.18em',
+                  color: 'var(--text-3)',
+                  textTransform: 'uppercase' as const,
+                }}>
+                  AI Financial Summaries
+                </div>
+              </div>
+
+              {aiCoverageLoading ? (
+                <div style={{ fontSize: 13, color: 'var(--text-3)' }}>Loading coverage…</div>
+              ) : aiCoverage ? (
+                <>
+                  <div className="hybrid-serif" style={{
+                    fontSize: 24,
+                    fontWeight: 500,
+                    letterSpacing: '-0.01em',
+                    color: 'var(--text)',
+                    lineHeight: 1.1,
+                    marginBottom: 6,
+                  }}>
+                    {aiCoverage.summarized} <span style={{ color: 'var(--text-3)', fontSize: 18 }}>of</span> {aiCoverage.totalEligible} <span style={{ color: 'var(--text-3)', fontSize: 16 }}>equities summarized</span>
+                  </div>
+                  <div style={{ fontSize: 11, color: 'var(--text-2)', fontVariantNumeric: 'tabular-nums' as const }}>
+                    Last refresh: <strong style={{ color: 'var(--text)' }}>{fmtRelative(aiCoverage.lastRefresh)}</strong>
+                    {aiCoverage.neverSummarized > 0 ? (
+                      <>
+                        {' · '}
+                        <span style={{ color: 'var(--warn)' }}>
+                          {aiCoverage.neverSummarized} never summarized
+                        </span>
+                      </>
+                    ) : aiCoverage.totalEligible > 0 ? (
+                      <>
+                        {' · '}
+                        <span style={{ color: 'var(--pos)' }}>
+                          full coverage
+                        </span>
+                      </>
+                    ) : null}
+                  </div>
+                </>
+              ) : (
+                <div style={{ fontSize: 13, color: 'var(--neg)' }}>Coverage stats unavailable</div>
+              )}
+            </div>
+
+            <button
+              onClick={handleAiRefresh}
+              disabled={refreshOutcome.kind === 'running'}
+              style={{
+                padding: '10px 16px',
+                fontSize: 12,
+                fontWeight: 500,
+                background: 'var(--gold)',
+                color: '#fff',
+                border: 'none',
+                borderRadius: 3,
+                cursor: refreshOutcome.kind === 'running' ? 'wait' : 'pointer',
+                display: 'inline-flex',
+                alignItems: 'center',
+                gap: 8,
+                fontFamily: '"DM Sans", system-ui, sans-serif',
+                flexShrink: 0,
+                opacity: refreshOutcome.kind === 'running' ? 0.7 : 1,
+                whiteSpace: 'nowrap',
+              }}
+            >
+              <RefreshCw
+                size={12}
+                style={refreshOutcome.kind === 'running' ? { animation: 'admin-ai-spin 1s linear infinite' } : undefined}
+              />
+              {refreshOutcome.kind === 'running' ? 'Refreshing…' : 'Refresh next 30'}
+            </button>
+          </div>
+
+          {/* Inline status message after refresh */}
+          {refreshOutcome.kind === 'success' && (
+            <div style={{
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+              fontSize: 11,
+              color: 'var(--pos)',
+              fontWeight: 500,
+            }}>
+              ✓ {refreshOutcome.message}
+            </div>
+          )}
+          {refreshOutcome.kind === 'error' && (
+            <div style={{
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+              fontSize: 11,
+              color: 'var(--neg)',
+              fontWeight: 500,
+            }}>
+              ✗ {refreshOutcome.message}
+            </div>
+          )}
+          {refreshOutcome.kind === 'running' && (
+            <div style={{
+              marginTop: 14,
+              paddingTop: 12,
+              borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+              fontSize: 11,
+              color: 'var(--text-3)',
+              fontStyle: 'italic',
+            }}>
+              Calling Claude for up to 30 tickers in batches of 5. This typically takes 2-4 minutes — leave this tab open.
+            </div>
+          )}
         </div>
 
         {/* Quick actions */}
@@ -223,6 +498,13 @@ export default function AdminPage() {
           </div>
         </div>
       </div>
+
+      <style jsx>{`
+        @keyframes admin-ai-spin {
+          from { transform: rotate(0deg); }
+          to { transform: rotate(360deg); }
+        }
+      `}</style>
     </main>
   )
 }

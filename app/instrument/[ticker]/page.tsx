@@ -3,31 +3,33 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
-import { RefreshCw, ArrowLeft, Star } from 'lucide-react'
+import { RefreshCw, ArrowLeft, Star, Sparkles } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27bb)
+// app/instrument/[ticker]/page.tsx (v27bc)
 // ═══════════════════════════════════════════════════════════════
 //
-// v27bb additions vs v27ba:
-//   • REMOVED: Income History panel. Operator workflow doesn't record
-//     dividend receipts as INCOME transactions (paid direct to client
-//     bank accounts; firm has no visibility). The panel was always
-//     empty; replacing with fundamentals surface that operator actually
-//     wants for buy/hold/sell decisions.
-//   • FIXED: Recent Transactions field name 'narration' → 'notes'.
-//     The transactions table column is 'notes'; v27ba's route SELECT
-//     of 'narration' silently failed (pitfall #152). Same correction
-//     in route + page for end-to-end honesty.
-//   • NEW: Valuation Snapshot panel — equity only, between Trading
-//     Liquidity and Fundamentals. 5 cards: P/E, P/B, Graham Number
-//     (with intrinsic value gap colored), Graham 22.5 test pill, EPS.
-//   • NEW: Fundamentals panel — equity only, between Valuation Snapshot
-//     and Dividend Snapshot. Two rows under one panel:
-//       Row 1: Income Statement — Revenue, Gross Profit, Operating
-//              Profit, PBT, PAT (5 cards)
-//       Row 2: Balance Sheet & Returns — Total Assets, Total Equity,
-//              Total Debt, ROE%, ROA%, Net Margin% (6 cards)
+// v27bc additions vs v27bb:
+//   • NEW: AI Financial Summary panel — equity only, between
+//     Fundamentals and Dividend Snapshot. Renders:
+//       - Tilt pill (Bullish green / Neutral neutral / Bearish red)
+//       - tilt_reason as italic single sentence
+//       - 3 sections: Strength (green accent) / Concern (red accent)
+//         / Watch For (gold accent), each 3-4 sentences ~80-120 words
+//       - Confidence footer (high/medium/low) + AI-generated disclaimer
+//     Empty state when summary not yet generated: gentle prompt.
+//
+// All v27bb panels preserved:
+//   • KPI strip with sleeve-aware card 4
+//   • Watchlist chip
+//   • Signals badge row (localStorage cache)
+//   • Movement panel + sparkline
+//   • FI Metadata (FI only)
+//   • Trading Liquidity
+//   • Valuation Snapshot (equity only)
+//   • Fundamentals (equity only, 2-row layout)
+//   • Dividend Snapshot (equity only)
+//   • Holders + Recent Transactions
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Type definitions ─────────────────────────────────────────
@@ -64,13 +66,12 @@ interface FiMetadataBlock {
   yield_pct:     number
 }
 
-// v27bb: fundamentals block (all 18 fields from instruments, AI-populated)
 interface FundamentalsBlock {
   eps_basic:               number | null
   eps_diluted:             number | null
   book_value_per_share:    number | null
   revenue_ngn_m:           number | null
-  gross_profit_ngn_m:      number | null    // null for banks (no COGS)
+  gross_profit_ngn_m:      number | null
   operating_profit_ngn_m:  number | null
   profit_before_tax_ngn_m: number | null
   profit_after_tax_ngn_m:  number | null
@@ -81,14 +82,13 @@ interface FundamentalsBlock {
   roa_pct:                 number | null
   net_margin_pct:          number | null
   period_end:              string | null
-  period_type:             string | null    // 'FY2024' | 'H1-2025' | 'Q1-2026'
+  period_type:             string | null
   currency:                string | null
   source:                  string | null
   notes:                   string | null
   last_refreshed_at:       string | null
 }
 
-// v27bb: valuation block (server-computed from fundamentals + price)
 interface ValuationBlock {
   pe_ratio:                number | null
   pb_ratio:                number | null
@@ -99,6 +99,18 @@ interface ValuationBlock {
   eps_used:                number | null
   eps_used_kind:           'diluted' | 'basic' | null
   eps_meaningful:          boolean
+}
+
+// v27bc: AI summary shape
+interface AISummaryBlock {
+  tilt:               'bullish' | 'neutral' | 'bearish' | null
+  tilt_reason:        string | null
+  strength:           string | null
+  concern:            string | null
+  watch_for:          string | null
+  confidence:         'high' | 'medium' | 'low' | null
+  generated_at:       string | null
+  last_refreshed_at:  string | null
 }
 
 interface InstrumentResp {
@@ -178,11 +190,10 @@ interface InstrumentResp {
     div_notes:             string | null
     div_last_refreshed_at: string | null
   }
-  // v27bb: fundamentals + valuation
   fundamentals?:           FundamentalsBlock | null
   valuation?:              ValuationBlock | null
+  ai_summary?:             AISummaryBlock | null
   fi_metadata?:            FiMetadataBlock | null
-  // v27bb FIX: rename narration → notes on recent_transactions[]
   recent_transactions?: Array<{
     trade_date:    string
     action:        string
@@ -225,18 +236,13 @@ function fmtNgnM(v: number | null | undefined): string {
   return sign + '\u20a6' + abs.toFixed(0)
 }
 
-// v27bb: format a value that's already in millions of NGN (the unit used
-// for revenue/gross/operating/PBT/PAT/assets/equity/debt columns). Converts
-// up to T (trillions) since major banks have multi-trillion totals.
 function fmtNgnFromMillions(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   const sign = v < 0 ? '−' : ''
   const abs = Math.abs(v)
-  // v is already in millions
   if (abs >= 1e6) return sign + '\u20a6' + (abs / 1e6).toFixed(2) + 'T'
   if (abs >= 1e3) return sign + '\u20a6' + (abs / 1e3).toFixed(2) + 'B'
   if (abs >= 1)   return sign + '\u20a6' + abs.toFixed(0) + 'M'
-  // sub-1M (very rare; e.g. a small-cap with reporting in thousands)
   return sign + '\u20a6' + (abs * 1e3).toFixed(0) + 'K'
 }
 
@@ -289,7 +295,6 @@ function fmtPrice(v: number | null | undefined): string {
   return '\u20a6' + v.toLocaleString('en-US', { maximumFractionDigits: 2 })
 }
 
-// v27bb: format a P/E or P/B ratio — a unitless multiple, typically 5-50
 function fmtRatio(v: number | null | undefined, dp = 1): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return v.toFixed(dp) + '×'
@@ -380,6 +385,13 @@ const DIV_STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }
   unknown:   { bg: 'rgba(15, 41, 71, 0.06)',   fg: 'var(--text-3)', label: 'Unknown' },
 }
 
+// v27bc: tilt pill style by lean
+const TILT_STYLE: Record<string, { bg: string; fg: string; border: string; label: string }> = {
+  bullish: { bg: 'rgba(45, 110, 78, 0.14)',   fg: 'var(--pos)',  border: 'rgba(45, 110, 78, 0.32)',   label: 'Bullish' },
+  neutral: { bg: 'rgba(15, 41, 71, 0.06)',    fg: 'var(--text-2)', border: 'rgba(15, 41, 71, 0.18)',  label: 'Neutral' },
+  bearish: { bg: 'rgba(166, 59, 59, 0.12)',   fg: 'var(--neg)',  border: 'rgba(166, 59, 59, 0.30)',   label: 'Bearish' },
+}
+
 // ─── Page ───────────────────────────────────────────────────────
 
 export default function InstrumentPage() {
@@ -429,7 +441,6 @@ export default function InstrumentPage() {
     }
   }, [ticker])
 
-  // ─── Loading state ────────────────────────────────────────────
   if (loading) {
     return (
       <main style={mainStyle}>
@@ -438,7 +449,6 @@ export default function InstrumentPage() {
     )
   }
 
-  // ─── Not-found state ──────────────────────────────────────────
   if (data?.error === 'not_found' || !data?.instrument) {
     return (
       <main style={mainStyle}>
@@ -474,7 +484,6 @@ export default function InstrumentPage() {
     )
   }
 
-  // ─── Main render ──────────────────────────────────────────────
   const inst         = data.instrument
   const price        = data.price ?? {} as NonNullable<InstrumentResp['price']>
   const wl           = data.watchlist ?? { is_watchlisted: false, section: null, sub_type: null }
@@ -490,9 +499,10 @@ export default function InstrumentPage() {
   const liquidity        = data.liquidity         ?? null
   const dividendSnapshot = data.dividend_snapshot ?? null
   const fiMetadata       = data.fi_metadata       ?? null
-  // v27bb: fundamentals + valuation
   const fundamentals     = data.fundamentals      ?? null
   const valuation        = data.valuation         ?? null
+  // v27bc: AI summary
+  const aiSummary        = data.ai_summary        ?? null
 
   const sleeveId       = inst.sleeve_id ?? ''
   const isEquity       = sleeveId === 'eq'
@@ -511,7 +521,7 @@ export default function InstrumentPage() {
   return (
     <main style={mainStyle}>
 
-      {/* ─── Page header ─────────────────────────────────────── */}
+      {/* Header */}
       <div style={{
         display: 'flex',
         justifyContent: 'space-between',
@@ -579,7 +589,7 @@ export default function InstrumentPage() {
         </div>
       </div>
 
-      {/* ─── KPI strip (sleeve-aware card 4) ─────────────────── */}
+      {/* KPI strip */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(4, 1fr)',
@@ -652,7 +662,7 @@ export default function InstrumentPage() {
         )}
       </div>
 
-      {/* ─── Watchlist chip ──────────────────────────────────── */}
+      {/* Watchlist chip */}
       <div style={{ marginBottom: 16 }}>
         {wl.is_watchlisted ? (
           <span style={{
@@ -690,7 +700,7 @@ export default function InstrumentPage() {
         )}
       </div>
 
-      {/* ─── Signals badge row ───────────────────────────────── */}
+      {/* Signals badge row */}
       {signals.length > 0 && (
         <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 20 }}>
           {signals.map(s => (
@@ -699,7 +709,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Movement panel ──────────────────────────────────── */}
+      {/* Movement panel */}
       {movement && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -722,7 +732,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── FI Metadata panel (FI only) ─────────────────────── */}
+      {/* FI Metadata panel (FI only) */}
       {isFi && fiMetadata && (
         <div style={{ marginBottom: 20 }}>
           <Panel title="Fixed Income Profile" meta="Bond / NTB fundamentals">
@@ -749,7 +759,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Trading Liquidity panel ─────────────────────────── */}
+      {/* Trading Liquidity panel */}
       {liquidity && (
         <div style={{ marginBottom: 20 }}>
           <Panel title="Trading Liquidity" meta="NGX-reported value & volume">
@@ -777,7 +787,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27bb: Valuation Snapshot panel (equity only) ──── */}
+      {/* Valuation Snapshot panel (equity only) */}
       {isEquity && valuation && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -793,7 +803,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── v27bb: Fundamentals panel (equity only) ─────────── */}
+      {/* Fundamentals panel (equity only) */}
       {isEquity && fundamentals && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -809,7 +819,23 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Dividend Snapshot panel (equity only) ───────────── */}
+      {/* v27bc: AI Financial Summary panel (equity only) */}
+      {isEquity && aiSummary && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="AI Financial Summary"
+            meta={
+              aiSummary.last_refreshed_at
+                ? `Refreshed ${fmtRelativeTime(aiSummary.last_refreshed_at)}`
+                : 'Not yet generated'
+            }
+          >
+            <AISummaryBody summary={aiSummary} />
+          </Panel>
+        </div>
+      )}
+
+      {/* Dividend Snapshot panel (equity only) */}
       {isEquity && dividendSnapshot && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -825,7 +851,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* ─── Holders panel ───────────────────────────────────── */}
+      {/* Holders panel */}
       <Panel
         title={`Holders (${holders.length})`}
         meta={holders.length > 0
@@ -892,7 +918,7 @@ export default function InstrumentPage() {
         )}
       </Panel>
 
-      {/* ─── Recent transactions panel (v27bb FIX: t.notes) ─── */}
+      {/* Recent transactions panel */}
       <div style={{ marginTop: 20 }}>
         <Panel
           title={`Recent Transactions (${transactions.length})`}
@@ -1400,8 +1426,6 @@ function DividendSnapshotBody({
   )
 }
 
-// v27bb: Valuation panel body — 5 cards (P/E, P/B, Graham Number with
-// gap, Graham 22.5 test pill, EPS).
 function ValuationBody({
   valuation,
   currentPrice,
@@ -1410,7 +1434,6 @@ function ValuationBody({
   currentPrice: number | null
 }) {
   const peColor = valuation.eps_meaningful ? 'var(--text)' : 'var(--warn)'
-  // Graham gap: positive (graham > price) = undervalued = green
   const gapColor = valuation.intrinsic_value_gap_pct === null
     ? 'var(--text-3)'
     : valuation.intrinsic_value_gap_pct > 0 ? 'var(--pos)' : 'var(--neg)'
@@ -1423,13 +1446,9 @@ function ValuationBody({
       gridTemplateColumns: 'repeat(5, 1fr)',
       gap: 16,
     }}>
-      {/* P/E */}
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
         <div style={cellLabelStyle}>P / E</div>
-        <div style={{
-          ...cellValueStyle,
-          color: peColor,
-        }}>
+        <div style={{ ...cellValueStyle, color: peColor }}>
           {valuation.eps_meaningful ? fmtRatio(valuation.pe_ratio) : 'N/M'}
         </div>
         <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
@@ -1439,7 +1458,6 @@ function ValuationBody({
         </div>
       </div>
 
-      {/* P/B */}
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
         <div style={cellLabelStyle}>P / B</div>
         <div style={cellValueStyle}>{fmtRatio(valuation.pb_ratio)}</div>
@@ -1450,7 +1468,6 @@ function ValuationBody({
         </div>
       </div>
 
-      {/* Graham Number */}
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
         <div style={cellLabelStyle}>Graham Number</div>
         <div style={cellValueStyle}>{fmtPrice(valuation.graham_number)}</div>
@@ -1463,15 +1480,11 @@ function ValuationBody({
         </div>
       </div>
 
-      {/* Graham 22.5 test */}
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
         <div style={cellLabelStyle}>Graham 22.5 Test</div>
         <div style={{ marginTop: 4 }}>
           {valuation.graham_test_passes === null ? (
-            <span style={{
-              ...cellValueStyle,
-              color: 'var(--text-3)',
-            }}>—</span>
+            <span style={{ ...cellValueStyle, color: 'var(--text-3)' }}>—</span>
           ) : (
             <span style={{
               display: 'inline-block',
@@ -1495,7 +1508,6 @@ function ValuationBody({
         </div>
       </div>
 
-      {/* EPS used */}
       <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
         <div style={cellLabelStyle}>EPS</div>
         <div style={cellValueStyle}>{fmtPrice(valuation.eps_used)}</div>
@@ -1510,8 +1522,6 @@ function ValuationBody({
   )
 }
 
-// v27bb: Fundamentals panel body — two rows under one panel.
-// Row 1: Income Statement (5 cards). Row 2: Balance Sheet & Returns (6 cards).
 function FundamentalsBody({
   fundamentals,
   sector,
@@ -1519,7 +1529,6 @@ function FundamentalsBody({
   fundamentals: FundamentalsBlock
   sector:       string
 }) {
-  // Detect bank-like sectors for the gross-profit-N/A footnote
   const sectorLower = sector.toLowerCase()
   const isBankLike = sectorLower.includes('bank')
                   || sectorLower.includes('financial')
@@ -1527,7 +1536,6 @@ function FundamentalsBody({
 
   return (
     <div>
-      {/* ─── Row 1: Income Statement ─── */}
       <div style={{
         fontSize: 10,
         fontWeight: 600,
@@ -1575,7 +1583,6 @@ function FundamentalsBody({
         />
       </div>
 
-      {/* ─── Row 2: Balance Sheet & Returns ─── */}
       <div style={{
         fontSize: 10,
         fontWeight: 600,
@@ -1623,7 +1630,6 @@ function FundamentalsBody({
         />
       </div>
 
-      {/* ─── Footer: source + notes ─── */}
       {(fundamentals.source || fundamentals.notes) && (
         <div style={{
           marginTop: 18,
@@ -1667,8 +1673,6 @@ function FundamentalsBody({
   )
 }
 
-// v27bb: a single fundamental cell — consistent visual treatment for
-// both Income Statement and Balance Sheet rows.
 function FundamentalCell({
   label,
   value,
@@ -1697,6 +1701,190 @@ function FundamentalCell({
       <div style={{ fontSize: 10, color: 'var(--text-3)' }}>
         {sub}
       </div>
+    </div>
+  )
+}
+
+// v27bc: AI Summary panel body — tilt pill + tilt_reason + 3 sections.
+// Empty state when summary not yet generated for this ticker.
+function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
+  // Empty state — column exists but no summary written yet
+  if (!summary.tilt || !summary.strength || !summary.concern || !summary.watch_for) {
+    return (
+      <div style={{
+        padding: '24px 8px',
+        textAlign: 'center',
+        color: 'var(--text-3)',
+        fontSize: 12,
+        lineHeight: 1.55,
+      }}>
+        <Sparkles size={20} style={{
+          color: 'var(--gold)',
+          opacity: 0.4,
+          marginBottom: 10,
+        }} />
+        <div style={{ marginBottom: 4 }}>
+          AI summary not yet generated for this instrument.
+        </div>
+        <div style={{ fontSize: 11 }}>
+          Run a refresh from the Admin panel to populate.
+        </div>
+      </div>
+    )
+  }
+
+  const tilt = TILT_STYLE[summary.tilt]
+
+  return (
+    <div>
+      {/* Top: tilt pill + tilt_reason */}
+      <div style={{
+        display: 'flex',
+        alignItems: 'flex-start',
+        gap: 14,
+        marginBottom: 22,
+      }}>
+        <span style={{
+          display: 'inline-flex',
+          alignItems: 'center',
+          padding: '6px 14px',
+          background: tilt.bg,
+          border: `1px solid ${tilt.border}`,
+          color: tilt.fg,
+          borderRadius: 3,
+          fontSize: 11,
+          fontWeight: 700,
+          letterSpacing: '0.18em',
+          textTransform: 'uppercase',
+          flexShrink: 0,
+          whiteSpace: 'nowrap',
+        }}>
+          {tilt.label}
+        </span>
+        <p style={{
+          fontFamily: '"Cormorant Garamond", Georgia, serif',
+          fontStyle: 'italic',
+          fontSize: 16,
+          fontWeight: 400,
+          color: 'var(--text)',
+          lineHeight: 1.45,
+          margin: 0,
+          paddingTop: 4,
+        }}>
+          {summary.tilt_reason ?? ''}
+        </p>
+      </div>
+
+      {/* 3-section grid */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: 'repeat(3, 1fr)',
+        gap: 18,
+        marginBottom: 16,
+      }}>
+        <AISection
+          label="Strength"
+          body={summary.strength}
+          accentColor="var(--pos)"
+          accentBg="rgba(45, 110, 78, 0.04)"
+        />
+        <AISection
+          label="Concern"
+          body={summary.concern}
+          accentColor="var(--neg)"
+          accentBg="rgba(166, 59, 59, 0.04)"
+        />
+        <AISection
+          label="Watch For"
+          body={summary.watch_for}
+          accentColor="var(--gold)"
+          accentBg="rgba(176, 139, 62, 0.05)"
+        />
+      </div>
+
+      {/* Footer: confidence + disclaimer */}
+      <div style={{
+        paddingTop: 14,
+        borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+        display: 'flex',
+        justifyContent: 'space-between',
+        alignItems: 'center',
+        fontSize: 11,
+        color: 'var(--text-3)',
+      }}>
+        <span>
+          <span style={{
+            fontWeight: 600,
+            color: 'var(--text-3)',
+            letterSpacing: '0.04em',
+            textTransform: 'uppercase',
+            fontSize: 10,
+          }}>
+            AI Confidence:
+          </span>{' '}
+          <span style={{
+            color: summary.confidence === 'high'   ? 'var(--pos)'
+                 : summary.confidence === 'medium' ? 'var(--warn)'
+                 : 'var(--neg)',
+            fontWeight: 600,
+            textTransform: 'capitalize',
+          }}>
+            {summary.confidence ?? 'Unknown'}
+          </span>
+        </span>
+        <span style={{
+          fontSize: 10,
+          fontStyle: 'italic',
+          color: 'var(--text-3)',
+        }}>
+          AI-generated · review against primary sources before acting
+        </span>
+      </div>
+    </div>
+  )
+}
+
+function AISection({
+  label,
+  body,
+  accentColor,
+  accentBg,
+}: {
+  label:       string
+  body:        string
+  accentColor: string
+  accentBg:    string
+}) {
+  return (
+    <div style={{
+      paddingLeft: 14,
+      paddingTop: 4,
+      paddingBottom: 4,
+      borderLeft: `3px solid ${accentColor}`,
+      background: accentBg,
+      borderRadius: '0 4px 4px 0',
+      paddingRight: 12,
+    }}>
+      <div style={{
+        fontSize: 10,
+        fontWeight: 700,
+        letterSpacing: '0.18em',
+        color: accentColor,
+        textTransform: 'uppercase',
+        marginBottom: 8,
+        paddingTop: 8,
+      }}>
+        {label}
+      </div>
+      <p style={{
+        fontSize: 12.5,
+        color: 'var(--text)',
+        lineHeight: 1.6,
+        margin: 0,
+        marginBottom: 8,
+      }}>
+        {body}
+      </p>
     </div>
   )
 }
@@ -1745,9 +1933,6 @@ const tdLeft: React.CSSProperties = {
 }
 const tdRight: React.CSSProperties = { ...tdLeft, textAlign: 'right', fontVariantNumeric: 'tabular-nums' }
 
-// v27bb: shared cell styles (used across MoveCell, FiCell, LiquidityCell,
-// ValuationBody, FundamentalCell, DividendSnapshotBody — DRY'd from
-// v27ba's per-component duplication).
 const cellLabelStyle: React.CSSProperties = {
   fontSize: 10,
   letterSpacing: '0.14em',
