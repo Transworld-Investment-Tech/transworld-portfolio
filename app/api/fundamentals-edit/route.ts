@@ -290,10 +290,21 @@ Filing: ${pdfFilename}
 Period end: ${periodEnd} (${periodType})
 
 CRITICAL RULES:
-1. All ngn_m fields are in MILLIONS OF NAIRA. Convert if the statement uses thousands or billions.
+1. **UNIT CONVERSION** (v27cb-a-fix7d — read FIRST, before extracting ANY number): Statements declare their reporting unit at column-header level. Convert raw numbers to MILLIONS OF NAIRA (ngn_m):
+   • "In thousands of Naira" / "N'000" / "₦'000"  →  raw ÷ 1,000
+   • "In millions of Naira" / "N'million" / "₦'M"  →  raw (as-is)
+   • "In billions of Naira" / "N'B"               →  raw × 1,000
+   ALWAYS locate the unit declaration BEFORE extracting numbers.
+
+   **SANITY CHECK**: Largest Nigerian listed companies (MTN, Dangote, GTCO, ACCESSCORP, Zenith) have annual profit_after_tax_ngn_m between 100,000 and 2,000,000. If your extracted PAT is >10,000,000, you almost certainly have a unit conversion error — re-check the unit declaration before reporting any number.
 2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If a line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion).
 3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
 4. book_value_per_share is in actual naira per share.
+4b. **total_debt_ngn_m** (v27cb-a-fix7d): INTEREST-BEARING DEBT ONLY. Sector-specific labels:
+   • BANKS: sum "Debt securities issued" + "Subordinated liabilities/debt" + "Borrowings" (when reported separately from deposits). DO NOT include "Deposits from customers" / "Deposits from banks" / current accounts — those are funding, not debt.
+   • INSURERS: "Borrowings" + "Subordinated debt" (if any). DO NOT include insurance contract liabilities.
+   • TELECOM / INDUSTRIAL / CONSUMER / OIL & GAS / CEMENT: sum "Borrowings - current" + "Borrowings - non-current" + lease liabilities (current + non-current, under IFRS 16). DO NOT include trade payables, accrued expenses, or other operating liabilities.
+   Alternate label variants: "Interest-bearing borrowings", "Loans and borrowings", "Long-term debt", "Short-term debt", "Lease liabilities", "Debt issued", "Bonds payable". Use Group/consolidated column.
 5. cash_and_equivalents_ngn_m: BALANCE SHEET line item. Common labels: "Cash and cash equivalents", "Cash and balances with banks" (banks), "Cash and short-term funds", "Cash and bank balances", "Cash at bank and in hand". Use the top-of-balance-sheet asset line, NOT the cash-flow-statement reconciliation total at year-end. Millions of naira.
 6. cash_from_operations_ngn_m: subtotal from the STATEMENT OF CASH FLOWS in the operating activities section. Common labels: "Net cash from operating activities", "Net cash generated from operating activities", "Net cash provided by operating activities", "Net cash (used in) operating activities", "Cash generated from/used in operations" — whichever variant the filing uses. It is the LAST line of the operating-activities section before the "Cash flows from investing activities" heading begins. Millions of naira. Negative numbers (in parentheses) allowed.
 6b. Both cash fields: do NOT confuse "Cash and cash equivalents at end of year" (a reconciliation total at the bottom of the cash flow statement) with "Cash and cash equivalents" on the balance sheet. The balance sheet line is what we want for cash_and_equivalents_ngn_m.

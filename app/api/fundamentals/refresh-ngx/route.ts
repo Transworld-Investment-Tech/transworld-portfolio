@@ -80,6 +80,7 @@ interface PerFilingResult {
   claude_input_chars?: number
   total_pdf_lines?: number
   matched_marker?: string | null
+  skipped_verified?: boolean // v27cb-a-fix7d
 }
 
 interface PerTickerResult {
@@ -89,6 +90,7 @@ interface PerTickerResult {
   filings_processed: number
   filings_succeeded: number
   rows_written: number
+  rows_skipped_verified: number // v27cb-a-fix7d
   per_filing: PerFilingResult[]
   errors: string[]
 }
@@ -112,10 +114,21 @@ Filing: ${pdfFilename}
 Period end: ${periodEnd} (${periodType})
 
 CRITICAL RULES:
-1. All ngn_m fields are in MILLIONS OF NAIRA. Convert if the statement uses thousands or billions.
+1. **UNIT CONVERSION** (v27cb-a-fix7d — read FIRST, before extracting ANY number): Statements declare their reporting unit at column-header level. Convert raw numbers to MILLIONS OF NAIRA (ngn_m):
+   • "In thousands of Naira" / "N'000" / "₦'000"  →  raw ÷ 1,000
+   • "In millions of Naira" / "N'million" / "₦'M"  →  raw (as-is)
+   • "In billions of Naira" / "N'B"               →  raw × 1,000
+   ALWAYS locate the unit declaration BEFORE extracting numbers.
+
+   **SANITY CHECK**: Largest Nigerian listed companies (MTN, Dangote, GTCO, ACCESSCORP, Zenith) have annual profit_after_tax_ngn_m between 100,000 and 2,000,000. If your extracted PAT is >10,000,000, you almost certainly have a unit conversion error — re-check the unit declaration before reporting any number.
 2. **Commas in numbers are ALWAYS thousands separators**. Nigerian financial reports never use European decimal notation. The number "4,878,176" means four million eight hundred seventy-eight thousand one hundred seventy-six (i.e. 4878176), NEVER 4878.176. If a line item says "4,878,176" in a column labeled "In millions of Naira", the value is 4878176 (i.e. ₦4.878 trillion).
 3. EPS fields (eps_basic, eps_diluted) are in ACTUAL NAIRA per share. Nigerian banks/insurers typically report EPS in KOBO — if the statement says "Earnings per share (kobo)" or "(k)" or "kobo", DIVIDE BY 100 before reporting.
 4. book_value_per_share is in actual naira per share.
+4b. **total_debt_ngn_m** (v27cb-a-fix7d): INTEREST-BEARING DEBT ONLY. Sector-specific labels:
+   • BANKS: sum "Debt securities issued" + "Subordinated liabilities/debt" + "Borrowings" (when reported separately from deposits). DO NOT include "Deposits from customers" / "Deposits from banks" / current accounts — those are funding, not debt.
+   • INSURERS: "Borrowings" + "Subordinated debt" (if any). DO NOT include insurance contract liabilities.
+   • TELECOM / INDUSTRIAL / CONSUMER / OIL & GAS / CEMENT: sum "Borrowings - current" + "Borrowings - non-current" + lease liabilities (current + non-current, under IFRS 16). DO NOT include trade payables, accrued expenses, or other operating liabilities.
+   Alternate label variants: "Interest-bearing borrowings", "Loans and borrowings", "Long-term debt", "Short-term debt", "Lease liabilities", "Debt issued", "Bonds payable". Use Group/consolidated column.
 5. cash_and_equivalents_ngn_m: BALANCE SHEET line item. Common labels: "Cash and cash equivalents", "Cash and balances with banks" (banks), "Cash and short-term funds", "Cash and bank balances", "Cash at bank and in hand". Use the top-of-balance-sheet asset line, NOT the cash-flow-statement reconciliation total at year-end. Millions of naira.
 6. cash_from_operations_ngn_m: subtotal from the STATEMENT OF CASH FLOWS in the operating activities section. Common labels: "Net cash from operating activities", "Net cash generated from operating activities", "Net cash provided by operating activities", "Net cash (used in) operating activities", "Cash generated from/used in operations" — whichever variant the filing uses. It is the LAST line of the operating-activities section before the "Cash flows from investing activities" heading begins. Millions of naira. Negative numbers (in parentheses) allowed.
 6b. Both cash fields: do NOT confuse "Cash and cash equivalents at end of year" (a reconciliation total at the bottom of the cash flow statement) with "Cash and cash equivalents" on the balance sheet. The balance sheet line is what we want for cash_and_equivalents_ngn_m.
@@ -330,6 +343,7 @@ async function processTicker(
     filings_processed: 0,
     filings_succeeded: 0,
     rows_written: 0,
+    rows_skipped_verified: 0, // v27cb-a-fix7d
     per_filing: [],
     errors: [],
   }
@@ -351,9 +365,33 @@ async function processTicker(
     result.per_filing = perFilingResults
     result.filings_succeeded = perFilingResults.filter((p) => p.ok).length
 
-    // Persist successful extractions
+    // v27cb-a-fix7d: pre-fetch verified statuses to protect operator-verified
+    // rows. Canonical invariant: once a row is marked verified, no cron or
+    // automated process ever overwrites it.
+    const { data: existingRows, error: vfErr } = await db
+      .from('fundamentals_history')
+      .select('period_end, period_type, verified_status')
+      .eq('instrument_id', ticker)
+    if (vfErr) {
+      // Defensive: cannot determine verified state — refuse the run to protect data.
+      result.errors.push(`verified-status SELECT failed: ${vfErr.message}; refusing to upsert (protects any verified rows)`)
+      return result
+    }
+    const verifiedSet = new Set<string>(
+      (existingRows ?? [])
+        .filter((r) => r.verified_status === 'verified')
+        .map((r) => `${r.period_end}|${r.period_type}`),
+    )
+
+    // Persist successful extractions — but NEVER overwrite verified rows
     for (const pfr of perFilingResults) {
       if (!pfr.ok || !pfr.extraction) continue
+      const vkey = `${pfr.period_end}|${pfr.period_type}`
+      if (verifiedSet.has(vkey)) {
+        pfr.skipped_verified = true
+        result.rows_skipped_verified++
+        continue
+      }
       const row = {
         instrument_id: ticker,
         period_end: pfr.period_end,
@@ -393,38 +431,53 @@ async function processTicker(
       }
     }
 
-    // From the most-recent ANNUAL: backward-compat update of instruments columns
-    const annuals = perFilingResults
-      .filter((p) => p.ok && p.period_type === 'annual' && p.extraction)
-      .sort((a, b) => b.period_end.localeCompare(a.period_end))
-    if (annuals.length > 0) {
-      const latest = annuals[0]
-      const ex = latest.extraction!
+    // v27cb-a-fix7d: instruments columns now reflect the latest annual from
+    // fundamentals_history (post-upsert DB state). This automatically respects
+    // verified rows — whatever the DB currently holds for the latest annual is
+    // what `instruments` mirrors. If the latest annual was skipped-verified,
+    // its pre-existing values (operator-corrected) drive `instruments`.
+    const { data: latestAnnualRow } = await db
+      .from('fundamentals_history')
+      .select('*')
+      .eq('instrument_id', ticker)
+      .eq('period_type', 'annual')
+      .order('period_end', { ascending: false })
+      .limit(1)
+      .maybeSingle()
+    if (latestAnnualRow) {
+      const fyYear = parseInt((latestAnnualRow.period_end as string).slice(0, 4), 10)
+      const sharesUpdate =
+        latestAnnualRow.shares_outstanding !== null && (latestAnnualRow.shares_outstanding as number) > 0
+          ? {
+              shares_outstanding: latestAnnualRow.shares_outstanding as number,
+              shares_outstanding_last_refreshed_at: new Date().toISOString(),
+            }
+          : {}
       const { error: instUpErr } = await db
         .from('instruments')
         .update({
-          revenue_ngn_m: ex.revenue_ngn_m,
-          gross_profit_ngn_m: ex.gross_profit_ngn_m,
-          operating_profit_ngn_m: ex.operating_profit_ngn_m,
-          profit_before_tax_ngn_m: ex.profit_before_tax_ngn_m,
-          profit_after_tax_ngn_m: ex.profit_after_tax_ngn_m,
-          eps_basic: ex.eps_basic,
-          eps_diluted: ex.eps_diluted,
-          book_value_per_share: ex.book_value_per_share,
-          total_assets_ngn_m: ex.total_assets_ngn_m,
-          total_equity_ngn_m: ex.total_equity_ngn_m,
-          total_debt_ngn_m: ex.total_debt_ngn_m,
-          cash_and_equivalents_ngn_m: ex.cash_and_equivalents_ngn_m,
-          cash_from_operations_ngn_m: ex.cash_from_operations_ngn_m,
-          ...(ex.shares_outstanding !== null ? { shares_outstanding: ex.shares_outstanding, shares_outstanding_last_refreshed_at: new Date().toISOString() } : {}),
-          roe_pct: ex.roe_pct,
-          roa_pct: ex.roa_pct,
-          net_margin_pct: ex.net_margin_pct,
-          fundamentals_period_end: latest.period_end,
-          fundamentals_period_type: `FY${latest.fiscal_year} Annual`,
-          fundamentals_currency: ex.currency,
-          fundamentals_source: 'ngx_odata',
-          fundamentals_notes: ex.extraction_notes,
+          revenue_ngn_m: latestAnnualRow.revenue_ngn_m,
+          gross_profit_ngn_m: latestAnnualRow.gross_profit_ngn_m,
+          operating_profit_ngn_m: latestAnnualRow.operating_profit_ngn_m,
+          profit_before_tax_ngn_m: latestAnnualRow.profit_before_tax_ngn_m,
+          profit_after_tax_ngn_m: latestAnnualRow.profit_after_tax_ngn_m,
+          eps_basic: latestAnnualRow.eps_basic,
+          eps_diluted: latestAnnualRow.eps_diluted,
+          book_value_per_share: latestAnnualRow.book_value_per_share,
+          total_assets_ngn_m: latestAnnualRow.total_assets_ngn_m,
+          total_equity_ngn_m: latestAnnualRow.total_equity_ngn_m,
+          total_debt_ngn_m: latestAnnualRow.total_debt_ngn_m,
+          cash_and_equivalents_ngn_m: latestAnnualRow.cash_and_equivalents_ngn_m,
+          cash_from_operations_ngn_m: latestAnnualRow.cash_from_operations_ngn_m,
+          ...sharesUpdate,
+          roe_pct: latestAnnualRow.roe_pct,
+          roa_pct: latestAnnualRow.roa_pct,
+          net_margin_pct: latestAnnualRow.net_margin_pct,
+          fundamentals_period_end: latestAnnualRow.period_end,
+          fundamentals_period_type: `FY${fyYear} Annual`,
+          fundamentals_currency: latestAnnualRow.currency,
+          fundamentals_source: latestAnnualRow.source ?? 'ngx_odata',
+          fundamentals_notes: latestAnnualRow.extraction_notes,
           fundamentals_last_refreshed_at: new Date().toISOString(),
           last_ngx_refresh_at: new Date().toISOString(),
         })
