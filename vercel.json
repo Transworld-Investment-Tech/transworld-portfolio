@@ -26,6 +26,15 @@
     },
     "app/api/admin/build-isin-registry/route.ts": {
       "maxDuration": 60
+    },
+    "app/api/disclosures/extract-content/route.ts": {
+      "maxDuration": 800
+    },
+    "app/api/instrument/[ticker]/print/route.ts": {
+      "maxDuration": 60
+    },
+    "app/api/cockpit/print/route.ts": {
+      "maxDuration": 60
     }
   },
   "crons": [
@@ -48,6 +57,10 @@
     {
       "path": "/api/fundamentals/refresh-ngx",
       "schedule": "0 10 * * 6"
+    },
+    {
+      "path": "/api/disclosures/extract-content",
+      "schedule": "30 6 * * *"
     }
   ]
 }

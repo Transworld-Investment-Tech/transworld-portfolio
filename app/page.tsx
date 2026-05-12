@@ -1,7 +1,7 @@
 'use client'
 import { useEffect, useState, useCallback } from 'react'
 import dynamic from 'next/dynamic'
-import { RefreshCw } from 'lucide-react'
+import { RefreshCw, FileText } from 'lucide-react'
 import Sidebar from '@/components/shared/Sidebar'
 import CockpitKPIStrip from '@/components/cockpit/CockpitKPIStrip'
 import MandateHealthGrid from '@/components/cockpit/MandateHealthGrid'
@@ -26,7 +26,7 @@ import type {
   WatchlistPulseData,
 } from '@/lib/cockpit-aggregations'
 
-// v27 — FIRM COCKPIT
+// v27 — FIRM COCKPIT (v27cb-a-fix7h: Download report button)
 // v27c — Added Sector Exposure Grid, Top Movers, FI book overlay on yield curve.
 // v27d — Added House Views (tickers held by ≥2 mandates) and Watchlist Pulse
 //        (unheld watchlist tickers moving today). The Mandate Health Grid's
@@ -264,6 +264,17 @@ export default function CockpitPage() {
               <span className="btn-h" style={{ pointerEvents: 'none', opacity: 0.85 }}>
                 {today}
               </span>
+              {/* v27cb-a-fix7h: Download report */}
+              <a
+                href="/api/cockpit/print"
+                download
+                className="btn-h"
+                style={{ textDecoration: 'none', display: 'inline-flex', alignItems: 'center', gap: 6 }}
+                title="Download a standalone HTML cockpit report you can print to PDF locally"
+              >
+                <FileText size={12} />
+                Download report
+              </a>
               <button className="btn-h" onClick={() => loadAll(true)} disabled={refreshing}>
                 <RefreshCw size={12} className={refreshing ? 'animate-spin' : ''} />
                 {refreshing ? 'Refreshing…' : 'Refresh'}

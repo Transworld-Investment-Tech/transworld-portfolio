@@ -1,38 +1,22 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/instrument/[ticker] (v27cb-a-fix7g)
+// /api/instrument/[ticker] (v27cb-a-fix7h)
 // ═══════════════════════════════════════════════════════════════
 //
 // GET /api/instrument/<TICKER>
 //
-// v27cb-a-fix7g — data flow rewire from instruments columns to
-// the three normalized tables built across v27ca → v27cb-a-fix7f:
+// v27cb-a-fix7h additions vs v27cb-a-fix7g:
+//   • Disclosures block extended with extracted facts:
+//       subcategory, material_event, facts (jsonb), currency, extraction_status
+//       — sourced from disclosure_extractions table (LEFT JOIN by separate
+//         SELECT + merge in code; PostgREST doesn't expose true LEFT JOIN
+//         via the JS client, so we fetch both and join in-process)
+//   • Dealings block extended with extracted fields from the now-augmented
+//     instrument_director_dealings columns (insider_name, insider_position,
+//     transaction_type, share_count, price_per_share, total_value, currency,
+//     transaction_date, notification_type, extraction_status)
+//   • New helper deriveStrOrNull / deriveNumOrNull for the joined columns
 //
-//   • fundamentals → fundamentals_history (most recent row,
-//     verified > unverified, derived ratios computed live)
-//   • valuation    → computed from fundamentals_history (EPS, BVPS)
-//                    + PEG 3yr/5yr from annual EPS CAGR
-//   • market_cap   → fundamentals_history.shares_outstanding
-//                    × current_price (fallback: instruments.shares_outstanding)
-//   • disclosures  → NEW block from instrument_disclosures (top 25)
-//   • dealings     → NEW block from instrument_director_dealings (top 25)
-//
-// All other blocks unchanged from v27bc:
-//   • Movement panel + sparkline
-//   • Trading Liquidity
-//   • Dividend Snapshot (still from instruments columns; fix7h
-//     scope will pull from disclosures)
-//   • FI Metadata
-//   • AI Summary pass-through (engine rewritten in fix7g
-//     ai-summaries/refresh/route.ts; UI schema unchanged)
-//   • Holders + Recent Transactions
-//
-// PEG architecture:
-//   • 3yr CAGR: requires annualRows.length ≥ 4 (latest + 3yr ago)
-//   • 5yr CAGR: requires annualRows.length ≥ 6
-//   • CAGR null if either endpoint EPS ≤ 0
-//   • peg_warning fires when 5yr period straddles NGN unification
-//     (2023-06-01) — FX distortion explanation
-// ═══════════════════════════════════════════════════════════════
+// All v27cb-a-fix7g blocks preserved unchanged. ═══════════════════════
 
 import { NextResponse } from 'next/server'
 import { createClient } from '@supabase/supabase-js'
@@ -85,7 +69,6 @@ type AISummaryShape = {
   generated_at: string
 }
 
-// v27cb-a-fix7g: fundamentals_history row shape (subset we read)
 type FundamentalsHistoryRow = {
   id:                           string
   instrument_id:                string
@@ -114,7 +97,6 @@ type FundamentalsHistoryRow = {
   imported_at:                  string
 }
 
-// v27cb-a-fix7g: disclosure / dealings row shapes
 type DisclosureRow = {
   id:                     string
   ngx_item_id:            string
@@ -126,13 +108,36 @@ type DisclosureRow = {
   modified_at:            string
 }
 
+// v27cb-a-fix7h: disclosure_extractions row shape
+type DisclosureExtractionRow = {
+  disclosure_id:     string
+  subcategory:       string
+  extraction_status: string
+  facts:             unknown | null
+  material_event:    boolean | null
+  currency:          string | null
+  extracted_at:      string
+}
+
+// v27cb-a-fix7h: extended dealing row shape (includes new columns)
 type DealingRow = {
-  id:             string
-  ngx_item_id:    string
-  title:          string | null
-  pdf_source_url: string | null
-  pdf_filename:   string | null
-  modified_at:    string
+  id:                 string
+  ngx_item_id:        string
+  title:              string | null
+  pdf_source_url:     string | null
+  pdf_filename:       string | null
+  modified_at:        string
+  insider_name:       string | null
+  insider_position:   string | null
+  transaction_type:   string | null
+  share_count:        number | string | null
+  price_per_share:    number | string | null
+  total_value:        number | string | null
+  currency:           string | null
+  transaction_date:   string | null
+  notification_type:  string | null
+  extraction_status:  string | null
+  extracted_at:       string | null
 }
 
 type PriceRow = {
@@ -225,7 +230,6 @@ const SLEEVE_LABELS: Record<string, string> = {
   fi:  'Fixed Income',
 }
 
-// v27cb-a-fix7g: NGN unification cutoff for FX-distortion PEG warning
 const NGN_UNIFICATION_CUTOFF = '2023-06-01'
 
 function captureErr(stage: string, err: unknown, debug: DebugEntry[]) {
@@ -283,21 +287,18 @@ function validateAISummary(raw: unknown): AISummaryShape | null {
   }
 }
 
-// v27cb-a-fix7g: pick EPS for a fundamentals_history row (prefer diluted)
 function pickEpsFromRow(row: FundamentalsHistoryRow): number | null {
   const d = numOrNull(row.eps_diluted)
   if (d !== null) return d
   return numOrNull(row.eps_basic)
 }
 
-// v27cb-a-fix7g: derive BVPS from total_equity + shares
 function deriveBvps(equityNgnM: number | null, shares: number | null): number | null {
   if (equityNgnM === null || equityNgnM <= 0) return null
   if (shares === null || shares <= 0) return null
   return (equityNgnM * 1_000_000) / shares
 }
 
-// v27cb-a-fix7g: derived ratios (ROE, ROA, Net Margin) from raw row
 function deriveRatios(row: FundamentalsHistoryRow): {
   roe_pct:        number | null
   roa_pct:        number | null
@@ -314,10 +315,6 @@ function deriveRatios(row: FundamentalsHistoryRow): {
   }
 }
 
-// v27cb-a-fix7g: CAGR helper. Returns null when:
-//   - either endpoint EPS is null
-//   - either endpoint EPS ≤ 0 (loss-period; CAGR undefined)
-//   - years ≤ 0
 function computeCagr(
   epsLatest: number | null,
   epsStart:  number | null,
@@ -329,15 +326,12 @@ function computeCagr(
   return Math.pow(epsLatest / epsStart, 1 / years) - 1
 }
 
-// v27cb-a-fix7g: PEG helper. cagr_pct is the CAGR expressed as a
-// percentage (e.g. 0.15 → 15 → PEG = PE / 15). Standard Lynch PEG.
 function computePeg(pe: number | null, cagrPct: number | null): number | null {
   if (pe === null || pe <= 0) return null
   if (cagrPct === null || cagrPct <= 0) return null
   return pe / cagrPct
 }
 
-// v27cb-a-fix7g: FX-distortion warning for 5yr PEG
 function buildPegWarning(periodEndLatest: string | null, periodEnd5yrAgo: string | null): string | null {
   if (!periodEndLatest || !periodEnd5yrAgo) return null
   if (periodEnd5yrAgo < NGN_UNIFICATION_CUTOFF && periodEndLatest >= NGN_UNIFICATION_CUTOFF) {
@@ -403,11 +397,7 @@ export async function GET(
     day_change_ngn = current_price - prev_price
   }
 
-  // ─── 3. v27cb-a-fix7g: Fundamentals history (equity only) ───
-  // Pull ALL rows for this ticker, sorted DESC by period_end. We use:
-  //   • histRows[0]                    — for "most recent" panel display
-  //   • histRows.filter(annual)        — for CAGR / PEG (annual only)
-  //   • first row with shares_outstanding — for market cap
+  // ─── 3. Fundamentals history (equity only) ─────────────────
   let histRows: FundamentalsHistoryRow[] = []
   if (sleeve_id === 'eq') {
     const { data: rawHist, error: histErr } = await db
@@ -425,8 +415,9 @@ export async function GET(
     return s !== null && s > 0
   }) ?? null
 
-  // ─── 4. v27cb-a-fix7g: Disclosures + Director Dealings ──────
+  // ─── 4. v27cb-a-fix7h: Disclosures + extractions (equity only) ─
   let disclosureRows: DisclosureRow[] = []
+  let extractionRows: DisclosureExtractionRow[] = []
   let dealingRows:    DealingRow[]    = []
   if (sleeve_id === 'eq') {
     const { data: rawDisc, error: discErr } = await db
@@ -438,9 +429,20 @@ export async function GET(
     captureErr('disclosures', discErr, debug)
     disclosureRows = (rawDisc ?? []) as unknown as DisclosureRow[]
 
+    // v27cb-a-fix7h: pull extractions for these disclosure ids
+    if (disclosureRows.length > 0) {
+      const discIds = disclosureRows.map(d => d.id)
+      const { data: rawExtr, error: extrErr } = await db
+        .from('disclosure_extractions')
+        .select('disclosure_id, subcategory, extraction_status, facts, material_event, currency, extracted_at')
+        .in('disclosure_id', discIds)
+      captureErr('disclosure-extractions', extrErr, debug)
+      extractionRows = (rawExtr ?? []) as unknown as DisclosureExtractionRow[]
+    }
+
     const { data: rawDeal, error: dealErr } = await db
       .from('instrument_director_dealings')
-      .select('id, ngx_item_id, title, pdf_source_url, pdf_filename, modified_at')
+      .select('id, ngx_item_id, title, pdf_source_url, pdf_filename, modified_at, insider_name, insider_position, transaction_type, share_count, price_per_share, total_value, currency, transaction_date, notification_type, extraction_status, extracted_at')
       .eq('instrument_id', ticker)
       .order('modified_at', { ascending: false })
       .limit(25)
@@ -634,9 +636,7 @@ export async function GET(
       .filter(p => p.date && p.price > 0),
   }
 
-  // ─── 10. v27cb-a-fix7g: Market Cap from fundamentals_history ─
-  // Priority: fundamentals_history.shares_outstanding (most recent
-  // period with non-null shares) > instruments.shares_outstanding
+  // ─── 10. Market Cap from fundamentals_history ──────────────
   let market_cap: {
     ngn:                  number
     shares_outstanding:   number
@@ -672,7 +672,7 @@ export async function GET(
     quarter: computeLiquidityWindow(priceHistory, 63),
   }
 
-  // ─── 12. Dividend Snapshot (still from instruments columns) ─
+  // ─── 12. Dividend Snapshot ──────────────────────────────────
   const dividend_snapshot = {
     div_per_share:         num(instrument.div_per_share),
     div_yield_pct:         num(instrument.div_yield_pct),
@@ -684,10 +684,7 @@ export async function GET(
     div_last_refreshed_at: instrument.div_last_refreshed_at,
   }
 
-  // ─── 13. v27cb-a-fix7g: Fundamentals from fundamentals_history ─
-  // Most recent row (any period_type) drives the display. Derived
-  // ratios computed live from raw values, NOT from deprecated
-  // pre-computed roe_pct / roa_pct / net_margin_pct columns.
+  // ─── 13. Fundamentals from fundamentals_history ─────────────
   let fundamentals: {
     eps_basic:                  number | null
     eps_diluted:                number | null
@@ -718,7 +715,6 @@ export async function GET(
   if (sleeve_id === 'eq' && mostRecentFundamentalRow) {
     const row    = mostRecentFundamentalRow
     const ratios = deriveRatios(row)
-    // BVPS: prefer per-period shares, fallback to instruments.shares_outstanding
     const sharesForBvps = numOrNull(row.shares_outstanding)
                        ?? numOrNull(instrument.shares_outstanding)
     const bvps = deriveBvps(numOrNull(row.total_equity_ngn_m), sharesForBvps)
@@ -750,7 +746,7 @@ export async function GET(
     }
   }
 
-  // ─── 14. v27cb-a-fix7g: Valuation (with PEG 3yr + 5yr) ──────
+  // ─── 14. Valuation (with PEG 3yr + 5yr) ────────────────────
   let valuation: {
     pe_ratio:                number | null
     pb_ratio:                number | null
@@ -799,9 +795,6 @@ export async function GET(
       grahamTest = (pe * pb) <= 22.5
     }
 
-    // v27cb-a-fix7g: PEG 3yr + 5yr from ANNUAL EPS CAGR
-    // 3yr: requires annualRows index 0 + index 3 (latest + 3yr ago)
-    // 5yr: requires annualRows index 0 + index 5 (latest + 5yr ago)
     const epsLatest        = annualRows.length > 0 ? pickEpsFromRow(annualRows[0]) : null
     const periodEndLatest  = annualRows[0]?.period_end ?? null
     const eps3yrAgo        = annualRows.length > 3 ? pickEpsFromRow(annualRows[3]) : null
@@ -834,7 +827,7 @@ export async function GET(
     }
   }
 
-  // ─── 15. AI Summary (pass-through) ──────────────────────────
+  // ─── 15. AI Summary ────────────────────────────────────────
   const ai_summary_data = sleeve_id === 'eq'
     ? validateAISummary(instrument.ai_summary_json)
     : null
@@ -867,22 +860,50 @@ export async function GET(
       }
     : null
 
-  // ─── 17. v27cb-a-fix7g: Disclosures + Director Dealings ─────
-  const disclosures = disclosureRows.map(r => ({
-    id:             r.id,
-    title:          r.title ?? r.pdf_filename ?? '(untitled)',
-    category:       r.category,
-    pdf_source_url: r.pdf_source_url,
-    pdf_filename:   r.pdf_filename,
-    modified_at:    r.modified_at,
-  }))
+  // ─── 17. v27cb-a-fix7h: Disclosures + Dealings (with extractions) ─
+  // Build a map from disclosure_id -> extraction row for fast join
+  const extractionByDisclosureId = new Map<string, DisclosureExtractionRow>()
+  for (const e of extractionRows) {
+    extractionByDisclosureId.set(e.disclosure_id, e)
+  }
+
+  const disclosures = disclosureRows.map(r => {
+    const ext = extractionByDisclosureId.get(r.id) ?? null
+    return {
+      id:                 r.id,
+      title:              r.title ?? r.pdf_filename ?? '(untitled)',
+      category:           r.category,
+      pdf_source_url:     r.pdf_source_url,
+      pdf_filename:       r.pdf_filename,
+      modified_at:        r.modified_at,
+      // v27cb-a-fix7h: extraction fields (nullable when not yet extracted)
+      extraction_status:  ext ? ext.extraction_status : null,
+      subcategory:        ext ? ext.subcategory : null,
+      material_event:     ext ? (ext.material_event === true) : false,
+      facts:              ext ? ext.facts : null,
+      currency:           ext ? ext.currency : null,
+      extracted_at:       ext ? ext.extracted_at : null,
+    }
+  })
 
   const director_dealings = dealingRows.map(r => ({
-    id:             r.id,
-    title:          r.title ?? r.pdf_filename ?? '(untitled)',
-    pdf_source_url: r.pdf_source_url,
-    pdf_filename:   r.pdf_filename,
-    modified_at:    r.modified_at,
+    id:                 r.id,
+    title:              r.title ?? r.pdf_filename ?? '(untitled)',
+    pdf_source_url:     r.pdf_source_url,
+    pdf_filename:       r.pdf_filename,
+    modified_at:        r.modified_at,
+    // v27cb-a-fix7h: extracted fields from the now-augmented row
+    insider_name:       r.insider_name,
+    insider_position:   r.insider_position,
+    transaction_type:   r.transaction_type,
+    share_count:        numOrNull(r.share_count),
+    price_per_share:    numOrNull(r.price_per_share),
+    total_value:        numOrNull(r.total_value),
+    currency:           r.currency,
+    transaction_date:   r.transaction_date,
+    notification_type:  r.notification_type,
+    extraction_status:  r.extraction_status,
+    extracted_at:       r.extracted_at,
   }))
 
   // ─── 18. Recent transactions ────────────────────────────────
@@ -926,8 +947,8 @@ export async function GET(
     valuation,
     ai_summary,
     fi_metadata,
-    disclosures,            // v27cb-a-fix7g NEW
-    director_dealings,      // v27cb-a-fix7g NEW
+    disclosures,
+    director_dealings,
     recent_transactions,
     firm_context: { firm_aum_ngn, firm_sleeve_total_ngn },
   }

@@ -1,13 +1,21 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import React, { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { RefreshCw, ArrowLeft, Star, Sparkles, FileText } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27cb-a-fix7g)
+// app/instrument/[ticker]/page.tsx (v27cb-a-fix7h)
 // ═══════════════════════════════════════════════════════════════
+//
+// v27cb-a-fix7h additions vs v27cb-a-fix7g:
+//   * Disclosures panel: per-row sub-line with extracted facts when
+//     extraction_status='extracted'; material_event gets gold accent.
+//   * Director Dealings panel: per-row sub-line with structured
+//     insider name + position + transaction details.
+//   * 'Extract' button on both panels via Panel.action prop.
+//   * 'Download report' button in page header (HTML download).
 //
 // v27cb-a-fix7g additions vs v27bc:
 //   • Valuation Snapshot: NEW PEG cell (6 cells now)
@@ -121,20 +129,39 @@ interface AISummaryBlock {
 
 // v27cb-a-fix7g: disclosures + dealings shapes
 interface DisclosureItem {
-  id:             string
-  title:          string
-  category:       string
-  pdf_source_url: string | null
-  pdf_filename:   string | null
-  modified_at:    string
+  id:                 string
+  title:              string
+  category:           string
+  pdf_source_url:     string | null
+  pdf_filename:       string | null
+  modified_at:        string
+  // v27cb-a-fix7h: extraction fields from disclosure_extractions
+  extraction_status:  string | null
+  subcategory:        string | null
+  material_event:     boolean
+  facts:              Record<string, unknown> | null
+  currency:           string | null
+  extracted_at:       string | null
 }
 
 interface DealingItem {
-  id:             string
-  title:          string
-  pdf_source_url: string | null
-  pdf_filename:   string | null
-  modified_at:    string
+  id:                 string
+  title:              string
+  pdf_source_url:     string | null
+  pdf_filename:       string | null
+  modified_at:        string
+  // v27cb-a-fix7h: extracted fields from instrument_director_dealings
+  insider_name:       string | null
+  insider_position:   string | null
+  transaction_type:   string | null
+  share_count:        number | null
+  price_per_share:    number | null
+  total_value:        number | null
+  currency:           string | null
+  transaction_date:   string | null
+  notification_type:  string | null
+  extraction_status:  string | null
+  extracted_at:       string | null
 }
 
 interface InstrumentResp {
@@ -453,6 +480,8 @@ export default function InstrumentPage() {
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [regenerating, setRegenerating] = useState(false)
+  // v27cb-a-fix7h: per-panel extraction state
+  const [extracting, setExtracting] = useState(false)
   const [signals, setSignals] = useState<CachedSignal[]>([])
 
   const load = useCallback(async () => {
@@ -468,6 +497,19 @@ export default function InstrumentPage() {
     setLoading(false)
     setRefreshing(false)
   }, [ticker])
+
+  // v27cb-a-fix7h: per-ticker disclosure + dealing extraction
+  const triggerExtract = useCallback(async () => {
+    if (!ticker || extracting) return
+    setExtracting(true)
+    try {
+      await fetch(`/api/disclosures/extract-content?ticker=${encodeURIComponent(ticker)}`, { method: 'POST' })
+      await load()
+    } catch (e) {
+      console.error('disclosure extraction failed', e)
+    }
+    setExtracting(false)
+  }, [ticker, extracting, load])
 
   // v27cb-a-fix7g: per-ticker AI summary regeneration
   const regenerateAISummary = useCallback(async () => {
@@ -629,6 +671,30 @@ export default function InstrumentPage() {
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {/* v27cb-a-fix7h: Download report button */}
+          <a
+            href={`/api/instrument/${encodeURIComponent(ticker)}/print`}
+            download
+            style={{
+              padding: '8px 14px',
+              fontSize: 12,
+              fontWeight: 500,
+              background: 'transparent',
+              border: '1px solid var(--border-strong, rgba(15,41,71,0.22))',
+              color: 'var(--text)',
+              borderRadius: 3,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              alignItems: 'center',
+              gap: 6,
+              fontFamily: '"DM Sans", system-ui, sans-serif',
+              textDecoration: 'none',
+            }}
+            title="Download a standalone HTML report you can print to PDF locally"
+          >
+            <FileText size={12} />
+            Download report
+          </a>
           <button
             onClick={() => load()}
             disabled={refreshing}
@@ -965,19 +1031,42 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* v27cb-a-fix7g: Disclosures Feed panel (equity only) */}
+      {/* v27cb-a-fix7h: Disclosures Feed panel with Extract button */}
       {isEquity && (
         <div style={{ marginBottom: 20 }}>
           <Panel
             title="Corporate Disclosures"
             meta={disclosures.length > 0 ? `Latest ${disclosures.length}` : null}
+            action={
+              <button
+                onClick={triggerExtract}
+                disabled={extracting}
+                style={{
+                  padding: '4px 10px',
+                  fontSize: 10,
+                  fontWeight: 600,
+                  letterSpacing: '0.12em',
+                  textTransform: 'uppercase',
+                  background: 'transparent',
+                  border: '1px solid var(--border-strong, rgba(15,41,71,0.22))',
+                  color: extracting ? 'var(--text-3)' : 'var(--gold)',
+                  borderRadius: 3,
+                  cursor: extracting ? 'wait' : 'pointer',
+                  fontFamily: '"DM Sans", system-ui, sans-serif',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Extract structured facts from each disclosure PDF using Claude"
+              >
+                {extracting ? '↻ Extracting…' : '↻ Extract'}
+              </button>
+            }
           >
             <DisclosuresFeedBody items={disclosures} />
           </Panel>
         </div>
       )}
 
-      {/* v27cb-a-fix7g: Director Dealings panel (equity only) */}
+      {/* v27cb-a-fix7h: Director Dealings panel with shared Extract trigger */}
       {isEquity && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -1153,7 +1242,202 @@ export default function InstrumentPage() {
   )
 }
 
-// ─── Sub-components ─────────────────────────────────────────────
+
+// ─── v27cb-a-fix7h: Per-row facts renderers ──────────────────────
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  NGN: '\u20a6',
+  GBP: '£',
+  GBp: '',
+  USD: '$',
+}
+
+function currencySymbol(c: string | null | undefined): string {
+  if (!c) return '\u20a6'
+  return CURRENCY_SYMBOLS[c] ?? ''
+}
+
+function currencySuffix(c: string | null | undefined): string {
+  return c === 'GBp' ? 'p' : ''
+}
+
+function fmtCurrency(v: number | null, currency: string | null): string {
+  if (v === null || !isFinite(v)) return '—'
+  const sym = currencySymbol(currency)
+  const sfx = currencySuffix(currency)
+  return sym + v.toFixed(2) + sfx
+}
+
+function renderDisclosureFactsLine(d: DisclosureItem): React.ReactNode {
+  if (d.extraction_status === 'scanned_pdf') {
+    return <span style={{ color: 'var(--warn)' }}>Scanned PDF · structured extraction not possible</span>
+  }
+  if (!d.extraction_status || d.extraction_status !== 'extracted') return null
+  if (!d.subcategory || d.subcategory === 'other' || !d.facts) return null
+  const facts = d.facts as Record<string, unknown>
+  const cur = d.currency
+
+  function pickNum(k: string): number | null {
+    const v = facts[k]
+    if (typeof v === 'number' && isFinite(v)) return v
+    if (typeof v === 'string') {
+      const n = Number(v)
+      if (isFinite(n)) return n
+    }
+    return null
+  }
+  function pickStr(k: string): string | null {
+    const v = facts[k]
+    return typeof v === 'string' ? v : null
+  }
+  function pickArrLen(k: string): number {
+    const v = facts[k]
+    return Array.isArray(v) ? v.length : 0
+  }
+
+  const parts: string[] = []
+
+  switch (d.subcategory) {
+    case 'dividend': {
+      const dps = pickNum('dps')
+      const dt = pickStr('dividend_type')
+      const qd = pickStr('qualification_date')
+      const pd = pickStr('payment_date')
+      const ad = pickStr('agm_date')
+      if (dps !== null) parts.push('DPS ' + fmtCurrency(dps, cur))
+      if (dt) parts.push(dt)
+      if (qd) parts.push('Qual ' + fmtDate(qd))
+      if (pd) parts.push('Pay ' + fmtDate(pd))
+      if (ad) parts.push('AGM ' + fmtDate(ad))
+      break
+    }
+    case 'agm_resolution': {
+      const ddps = pickNum('dividend_declared_dps')
+      const dtotal = pickNum('dividend_declared_total_pool')
+      const re = pickArrLen('board_re_elected')
+      const apt = pickArrLen('board_appointed')
+      const res = pickArrLen('board_resigned')
+      const major = pickArrLen('major_resolutions')
+      if (ddps !== null) parts.push('Dividend ' + fmtCurrency(ddps, cur) + '/share')
+      if (dtotal !== null) parts.push('Total ' + currencySymbol(cur) + (dtotal / 1e9).toFixed(2) + 'B')
+      if (re) parts.push(re + ' re-elected')
+      if (apt) parts.push(apt + ' appointed')
+      if (res) parts.push(res + ' resigned')
+      if (major) parts.push(major + ' major resolution' + (major === 1 ? '' : 's'))
+      break
+    }
+    case 'board_change': {
+      const name = pickStr('director_name')
+      const pos = pickStr('position')
+      const action = pickStr('action')
+      const ed = pickStr('effective_date')
+      if (action) parts.push(action)
+      if (name) parts.push(name)
+      if (pos) parts.push(pos)
+      if (ed) parts.push('effective ' + fmtDate(ed))
+      break
+    }
+    case 'rights_issue': {
+      const sc = pickNum('share_count')
+      const ip = pickNum('issue_price')
+      const rn = pickNum('ratio_new')
+      const re2 = pickNum('ratio_existing')
+      const status = pickStr('status')
+      if (sc !== null) parts.push(sc.toLocaleString('en-US') + ' shares')
+      if (ip !== null) parts.push('@ ' + fmtCurrency(ip, cur))
+      if (rn !== null && re2 !== null) parts.push(rn + '-for-' + re2)
+      if (status) parts.push(status)
+      break
+    }
+    case 'share_transaction': {
+      const tt = pickStr('transaction_type')
+      const st = pickNum('shares_transacted')
+      const vwap = pickNum('vwap_per_share')
+      const sr = pickNum('shares_remaining_in_issue')
+      if (st !== null) parts.push(st.toLocaleString('en-US') + ' shares')
+      if (vwap !== null) parts.push('@ ' + vwap.toFixed(2) + ' ' + (cur ?? 'NGN') + currencySuffix(cur))
+      if (tt) parts.push(tt)
+      if (sr !== null) parts.push((sr / 1e9).toFixed(2) + 'B in issue')
+      break
+    }
+    case 'voting_rights': {
+      const total = pickNum('total_shares_in_issue')
+      const voting = pickNum('voting_rights_total')
+      const asof = pickStr('as_of_date')
+      if (total !== null) parts.push((total / 1e9).toFixed(2) + 'B shares')
+      if (voting !== null) parts.push((voting / 1e9).toFixed(2) + 'B voting')
+      if (asof) parts.push('as of ' + fmtDate(asof))
+      break
+    }
+    case 'mna': {
+      const tt = pickStr('transaction_type')
+      const cp = pickStr('counterparty')
+      const tgt = pickStr('target_or_subject')
+      const v = pickNum('value')
+      const status = pickStr('status')
+      if (tt) parts.push(tt)
+      if (cp) parts.push(cp)
+      if (tgt) parts.push(tgt)
+      if (v !== null) parts.push(currencySymbol(cur) + (v / 1e9).toFixed(2) + 'B')
+      if (status) parts.push(status)
+      break
+    }
+    case 'earnings_release': {
+      const pt = pickStr('period_type')
+      const pe = pickStr('period_end')
+      const rev = pickNum('revenue')
+      const pat = pickNum('pat')
+      const eps = pickNum('eps')
+      if (pt) parts.push(pt)
+      if (pe) parts.push(fmtDate(pe))
+      if (rev !== null) parts.push('Revenue ' + currencySymbol(cur) + (rev / 1e9).toFixed(2) + 'B')
+      if (pat !== null) parts.push('PAT ' + currencySymbol(cur) + (pat / 1e9).toFixed(2) + 'B')
+      if (eps !== null) parts.push('EPS ' + fmtCurrency(eps, cur))
+      break
+    }
+    case 'closed_period': {
+      const s = pickStr('closed_period_start')
+      const e = pickStr('closed_period_end')
+      if (!s && !e) return null
+      return (s ? fmtDate(s) : '?') + ' — ' + (e ? fmtDate(e) : '?')
+    }
+    default:
+      return null
+  }
+
+  if (parts.length === 0) return null
+  return parts.join(' · ')
+}
+
+function renderDealingFactsLine(d: DealingItem): React.ReactNode {
+  if (d.extraction_status === 'scanned_pdf') {
+    return <span style={{ color: 'var(--warn)' }}>Scanned PDF · structured extraction not possible</span>
+  }
+  if (!d.insider_name && !d.transaction_type && d.share_count === null) return null
+
+  const parts: React.ReactNode[] = []
+  if (d.transaction_type) {
+    parts.push(<strong key="tt">{d.transaction_type}</strong>)
+  }
+  if (d.insider_name) parts.push(d.insider_name)
+  if (d.insider_position) {
+    parts.push(<span key="pos" style={{ color: 'var(--text-3)' }}>({d.insider_position})</span>)
+  }
+  if (d.share_count !== null) parts.push(d.share_count.toLocaleString('en-US') + ' shares')
+  if (d.price_per_share !== null) parts.push('@ ' + fmtCurrency(d.price_per_share, d.currency))
+  if (d.total_value !== null) parts.push(currencySymbol(d.currency) + (d.total_value / 1e6).toFixed(2) + 'M')
+  if (d.transaction_date) parts.push(fmtDate(d.transaction_date))
+
+  // Interleave with bullet separators
+  const out: React.ReactNode[] = []
+  for (let i = 0; i < parts.length; i++) {
+    if (i > 0) out.push(<span key={'sep' + i}> · </span>)
+    out.push(<span key={'p' + i}>{parts[i]}</span>)
+  }
+  return <>{out}</>
+}
+
+// ─── Sub-components ────────────────────────────────────
 
 function KpiCard({
   label,
@@ -2104,7 +2388,7 @@ function AISection({
   )
 }
 
-// v27cb-a-fix7g: NEW Disclosures Feed body
+// v27cb-a-fix7h: Disclosures Feed body with extraction facts sub-rows
 function DisclosuresFeedBody({ items }: { items: DisclosureItem[] }) {
   if (items.length === 0) {
     return (
@@ -2119,65 +2403,87 @@ function DisclosuresFeedBody({ items }: { items: DisclosureItem[] }) {
       <thead>
         <tr>
           <th style={{ ...thLeft, width: 90 }}>Date</th>
-          <th style={{ ...thLeft, width: 70 }}>Type</th>
+          <th style={{ ...thLeft, width: 110 }}>Type</th>
           <th style={thLeft}>Title</th>
           <th style={{ ...thRight, width: 70 }}>PDF</th>
         </tr>
       </thead>
       <tbody>
         {items.map(d => {
-          const cat = CATEGORY_STYLE[d.category] ?? CATEGORY_STYLE.corporate_actions
+          // v27cb-a-fix7h: prefer extracted subcategory chip; fallback to raw category
+          const chipLabel = (d.subcategory ?? d.category ?? 'OTHER').toUpperCase().replace(/_/g, ' ')
+          const factsLine = renderDisclosureFactsLine(d)
+          const isMaterial = d.material_event === true
           return (
-            <tr key={d.id}>
-              <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
-              <td style={tdLeft}>
-                <span style={{
-                  display: 'inline-block',
-                  padding: '2px 8px',
-                  background: cat.bg,
-                  color: cat.fg,
-                  borderRadius: 2,
-                  fontSize: 9,
-                  fontWeight: 700,
-                  letterSpacing: '0.14em',
-                  textTransform: 'uppercase',
-                }}>
-                  {cat.label}
-                </span>
-              </td>
-              <td style={{
-                ...tdLeft,
-                fontStyle: 'italic',
-                color: 'var(--text-2)',
-                maxWidth: 600,
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-                whiteSpace: 'nowrap',
-              }} title={d.title}>
-                {d.title}
-              </td>
-              <td style={tdRight}>
-                {d.pdf_source_url ? (
-                  <a
-                    href={d.pdf_source_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style={{
-                      color: 'var(--gold)',
-                      textDecoration: 'none',
-                      fontSize: 11,
-                      fontWeight: 500,
-                      display: 'inline-flex',
-                      alignItems: 'center',
-                      gap: 4,
-                    }}
-                  >
-                    <FileText size={11} />
-                    PDF
-                  </a>
-                ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
-              </td>
-            </tr>
+            <React.Fragment key={d.id}>
+              <tr>
+                <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
+                <td style={tdLeft}>
+                  <span style={{
+                    display: 'inline-block',
+                    padding: '2px 8px',
+                    background: isMaterial ? 'rgba(176, 139, 62, 0.18)' : 'rgba(15, 41, 71, 0.08)',
+                    color: isMaterial ? 'var(--gold)' : 'var(--text-2)',
+                    borderRadius: 2,
+                    fontSize: 9,
+                    fontWeight: 700,
+                    letterSpacing: '0.10em',
+                    textTransform: 'uppercase',
+                    whiteSpace: 'nowrap',
+                  }}>
+                    {chipLabel}
+                  </span>
+                </td>
+                <td style={{
+                  ...tdLeft,
+                  fontStyle: 'italic',
+                  color: 'var(--text-2)',
+                  maxWidth: 600,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }} title={d.title}>
+                  {d.title}
+                </td>
+                <td style={tdRight}>
+                  {d.pdf_source_url ? (
+                    <a
+                      href={d.pdf_source_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        color: 'var(--gold)',
+                        textDecoration: 'none',
+                        fontSize: 11,
+                        fontWeight: 500,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
+                      <FileText size={11} />
+                      PDF
+                    </a>
+                  ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                </td>
+              </tr>
+              {factsLine && (
+                <tr>
+                  <td colSpan={4} style={{
+                    padding: '4px 12px 10px',
+                    fontSize: 11,
+                    fontStyle: 'italic',
+                    color: 'var(--text-2)',
+                    borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+                    background: isMaterial ? 'rgba(176, 139, 62, 0.04)' : undefined,
+                    borderLeft: isMaterial ? '2px solid var(--gold)' : undefined,
+                    paddingLeft: isMaterial ? 14 : 12,
+                  }}>
+                    {factsLine}
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>
           )
         })}
       </tbody>
@@ -2185,7 +2491,7 @@ function DisclosuresFeedBody({ items }: { items: DisclosureItem[] }) {
   )
 }
 
-// v27cb-a-fix7g: NEW Director Dealings body
+// v27cb-a-fix7h: Director Dealings body with extracted-fields sub-rows
 function DirectorDealingsBody({ items }: { items: DealingItem[] }) {
   if (items.length === 0) {
     return (
@@ -2205,43 +2511,61 @@ function DirectorDealingsBody({ items }: { items: DealingItem[] }) {
         </tr>
       </thead>
       <tbody>
-        {items.map(d => (
-          <tr key={d.id}>
-            <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
-            <td style={{
-              ...tdLeft,
-              fontStyle: 'italic',
-              color: 'var(--text-2)',
-              maxWidth: 700,
-              overflow: 'hidden',
-              textOverflow: 'ellipsis',
-              whiteSpace: 'nowrap',
-            }} title={d.title}>
-              {d.title}
-            </td>
-            <td style={tdRight}>
-              {d.pdf_source_url ? (
-                <a
-                  href={d.pdf_source_url}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  style={{
-                    color: 'var(--gold)',
-                    textDecoration: 'none',
+        {items.map(d => {
+          const factsLine = renderDealingFactsLine(d)
+          return (
+            <React.Fragment key={d.id}>
+              <tr>
+                <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
+                <td style={{
+                  ...tdLeft,
+                  fontStyle: 'italic',
+                  color: 'var(--text-2)',
+                  maxWidth: 700,
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                  whiteSpace: 'nowrap',
+                }} title={d.title}>
+                  {d.title}
+                </td>
+                <td style={tdRight}>
+                  {d.pdf_source_url ? (
+                    <a
+                      href={d.pdf_source_url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      style={{
+                        color: 'var(--gold)',
+                        textDecoration: 'none',
+                        fontSize: 11,
+                        fontWeight: 500,
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 4,
+                      }}
+                    >
+                      <FileText size={11} />
+                      PDF
+                    </a>
+                  ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
+                </td>
+              </tr>
+              {factsLine && (
+                <tr>
+                  <td colSpan={3} style={{
+                    padding: '4px 12px 10px',
                     fontSize: 11,
-                    fontWeight: 500,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 4,
-                  }}
-                >
-                  <FileText size={11} />
-                  PDF
-                </a>
-              ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
-            </td>
-          </tr>
-        ))}
+                    fontStyle: 'italic',
+                    color: 'var(--text-2)',
+                    borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
+                  }}>
+                    {factsLine}
+                  </td>
+                </tr>
+              )}
+            </React.Fragment>
+          )
+        })}
       </tbody>
     </table>
   )
