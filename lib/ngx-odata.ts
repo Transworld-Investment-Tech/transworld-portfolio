@@ -127,7 +127,8 @@ export async function fetchFinancialFilings(isin: string): Promise<XFinancialNew
  */
 export function categorizeFiling(item: XFinancialNewsItem): 'annual' | 'quarterly' {
   const desc = (item.URL?.Description ?? '').toUpperCase()
-  if (/QUARTER\s*5|AUDITED|FULL\s*YEAR|ANNUAL/.test(desc)) return 'annual'
+  // v27cb-a-fix7b: YEAR\s*END added — ARADEL filed FY2025 as "YEAR END - FINANCIAL STATEMENT FOR 2025"
+  if (/QUARTER\s*5|AUDITED|FULL\s*YEAR|ANNUAL|YEAR\s*END/.test(desc)) return 'annual'
   return 'quarterly'
 }
 
@@ -207,10 +208,14 @@ export function pickCanonicalRefreshSet(items: XFinancialNewsItem[]): Array<{
   const annuals = Array.from(byKey.values())
     .filter((x) => x.period_type === 'annual')
     .sort((a, b) => b.period_end.localeCompare(a.period_end))
-    .slice(0, 4)
+    .slice(0, 5)
+  // v27cb-a-fix7b: quarters now include ALL with period_end strictly after the
+  // latest annual (was: 1 latest quarter regardless of position). Capped at 5
+  // as a safety bound for tickers with no annual on file.
+  const latestAnnualEnd = annuals.length > 0 ? annuals[0].period_end : '0000-00-00'
   const quarterlies = Array.from(byKey.values())
-    .filter((x) => x.period_type === 'quarterly')
+    .filter((x) => x.period_type === 'quarterly' && x.period_end > latestAnnualEnd)
     .sort((a, b) => b.period_end.localeCompare(a.period_end))
-    .slice(0, 1)
+    .slice(0, 5)
   return [...annuals, ...quarterlies]
 }
