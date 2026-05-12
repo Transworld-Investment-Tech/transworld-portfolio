@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/ai-summaries/refresh (v27cb-a-fix7g-fix2)
+// /api/ai-summaries/refresh (v27cb-a-fix7g-fix3)
 // ═══════════════════════════════════════════════════════════════
 //
 // Full rewrite of the AI Financial Summary engine. Replaces the
@@ -353,6 +353,45 @@ CRITICAL RULES:
     structured data and call out the discrepancy.
 
 ═══════════════════════════════════════════════════════════════
+DISCLOSURE SYNTHESIS GUIDANCE
+═══════════════════════════════════════════════════════════════
+
+The disclosure list above contains TITLES ONLY — the underlying
+filings hold material details that often shift the investment
+view. For each of these high-priority disclosure types, USE the
+web_search tool to find the substantive content:
+
+  • "INTERIM DIVIDEND" or "FINAL DIVIDEND" or any title mentioning
+    dividend payment → web_search for the SPECIFIC DPS amount
+    declared, ex-dividend date, payment date. Reference these
+    numbers in dividend_narration AND strength/concern as
+    relevant. Do not say "recent dividend filing" — say "the
+    [date] interim dividend declared ₦X per share".
+  • "EARNINGS RELEASE" / "Q1/Q2/Q3/H1/H2/FY UNAUDITED FINANCIAL
+    STATEMENTS" → web_search for the headline figures (revenue,
+    PAT, EPS) and how they compared to analyst consensus or prior
+    period. Synthesize into strength/concern.
+  • "AGM RESOLUTIONS" / "EGM" → web_search for resolutions passed
+    (especially dividend declarations, share splits, board
+    elections, rights issues).
+  • "BOARD MEETING NOTICE (BM)" → web_search for the agenda and
+    expected outcomes. Recent BM notices often precede earnings
+    or dividend announcements.
+  • Any M&A, rights issue, share buyback, or spin-off filing →
+    web_search for deal terms, valuation, and strategic
+    rationale.
+
+DIRECTOR DEALINGS are signal-rich. Insider buys in size suggest
+internal optimism; clustered insider sells suggest the opposite.
+Web_search director name + ticker to determine whether the dealing
+was a buy, sell, or grant, and at what scale. Reference material
+dealings in your narration.
+
+When citing a disclosure or dealing in your narration, anchor it
+by date and type (e.g. "the 30 Oct 2025 interim dividend filing",
+"the 22 Dec 2025 director dealing"). Avoid vague references like
+"recent disclosure".
+═══════════════════════════════════════════════════════════════
 NIGERIAN CONTEXT (UNCHANGING)
 ═══════════════════════════════════════════════════════════════
 
@@ -511,6 +550,18 @@ function extractJson(raw: string): unknown | null {
   }
 }
 
+// v27cb-a-fix7g-fix3: Strip Anthropic web_search citation tags
+// (e.g. <cite index="9-3,12-1">text</cite>) from model output
+// before persisting. Tags otherwise leak into UI as raw XML.
+function stripCiteTags(text: string): string {
+  if (!text) return text
+  return text
+    .replace(/<cite\s+[^>]*>/gi, '')
+    .replace(/<\/cite>/gi, '')
+    .replace(/ {2,}/g, ' ')
+    .trim()
+}
+
 function validateSummary(raw: unknown): SummaryShape | null {
   if (!raw || typeof raw !== 'object') return null
   const r = raw as Record<string, unknown>
@@ -524,14 +575,14 @@ function validateSummary(raw: unknown): SummaryShape | null {
   let divNarration: string | null = null
   if (r.dividend_narration !== undefined && r.dividend_narration !== null) {
     if (typeof r.dividend_narration !== 'string') return null
-    divNarration = r.dividend_narration.length >= 10 ? r.dividend_narration : null
+    divNarration = r.dividend_narration.length >= 10 ? stripCiteTags(r.dividend_narration) : null
   }
   return {
     tilt:                r.tilt as 'bullish' | 'neutral' | 'bearish',
-    tilt_reason:         r.tilt_reason,
-    strength:            r.strength,
-    concern:             r.concern,
-    watch_for:           r.watch_for,
+    tilt_reason:         stripCiteTags(r.tilt_reason),
+    strength:            stripCiteTags(r.strength),
+    concern:             stripCiteTags(r.concern),
+    watch_for:           stripCiteTags(r.watch_for),
     confidence:          r.confidence as 'high' | 'medium' | 'low',
     dividend_narration:  divNarration,
   }
