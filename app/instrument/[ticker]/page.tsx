@@ -3,33 +3,28 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
-import { RefreshCw, ArrowLeft, Star, Sparkles } from 'lucide-react'
+import { RefreshCw, ArrowLeft, Star, Sparkles, FileText } from 'lucide-react'
 
 // ═══════════════════════════════════════════════════════════════
-// app/instrument/[ticker]/page.tsx (v27bc)
+// app/instrument/[ticker]/page.tsx (v27cb-a-fix7g)
 // ═══════════════════════════════════════════════════════════════
 //
-// v27bc additions vs v27bb:
-//   • NEW: AI Financial Summary panel — equity only, between
-//     Fundamentals and Dividend Snapshot. Renders:
-//       - Tilt pill (Bullish green / Neutral neutral / Bearish red)
-//       - tilt_reason as italic single sentence
-//       - 3 sections: Strength (green accent) / Concern (red accent)
-//         / Watch For (gold accent), each 3-4 sentences ~80-120 words
-//       - Confidence footer (high/medium/low) + AI-generated disclaimer
-//     Empty state when summary not yet generated: gentle prompt.
+// v27cb-a-fix7g additions vs v27bc:
+//   • Valuation Snapshot: NEW PEG cell (6 cells now)
+//       - 3yr CAGR primary, 5yr CAGR sub-text
+//       - FX-distortion warning when 5yr straddles 2023-06-01
+//   • Fundamentals: data source rewired to fundamentals_history
+//     (display unchanged; route does the heavy lifting). Cash &
+//     CFO added to balance-sheet row. verified_status badge.
+//   • Market Cap KPI: now from fundamentals_history shares_outstanding
+//   • NEW: Disclosures Feed panel (top 25, category badges)
+//   • NEW: Director Dealings Feed panel (top 25)
+//   • AI Summary: "↻ Regenerate" button in panel header
+//     — calls /api/ai-summaries/refresh?ticker=X then refetches
+//   • Panel component: accepts optional `action` prop for header
 //
-// All v27bb panels preserved:
-//   • KPI strip with sleeve-aware card 4
-//   • Watchlist chip
-//   • Signals badge row (localStorage cache)
-//   • Movement panel + sparkline
-//   • FI Metadata (FI only)
-//   • Trading Liquidity
-//   • Valuation Snapshot (equity only)
-//   • Fundamentals (equity only, 2-row layout)
-//   • Dividend Snapshot (equity only)
-//   • Holders + Recent Transactions
+// All v27bb/v27bc panels preserved in same order, with the two
+// new feeds inserted between AI Summary and Dividend Snapshot.
 // ═══════════════════════════════════════════════════════════════
 
 // ─── Type definitions ─────────────────────────────────────────
@@ -55,6 +50,8 @@ interface LiquidityWindow {
 interface MarketCapBlock {
   ngn:                  number
   shares_outstanding:   number
+  shares_basis:         'per_period' | 'instruments_fallback'
+  as_of_period_end:     string | null
   as_of_price_date:     string | null
   last_refreshed_at:    string | null
 }
@@ -67,26 +64,30 @@ interface FiMetadataBlock {
 }
 
 interface FundamentalsBlock {
-  eps_basic:               number | null
-  eps_diluted:             number | null
-  book_value_per_share:    number | null
-  revenue_ngn_m:           number | null
-  gross_profit_ngn_m:      number | null
-  operating_profit_ngn_m:  number | null
-  profit_before_tax_ngn_m: number | null
-  profit_after_tax_ngn_m:  number | null
-  total_assets_ngn_m:      number | null
-  total_equity_ngn_m:      number | null
-  total_debt_ngn_m:        number | null
-  roe_pct:                 number | null
-  roa_pct:                 number | null
-  net_margin_pct:          number | null
-  period_end:              string | null
-  period_type:             string | null
-  currency:                string | null
-  source:                  string | null
-  notes:                   string | null
-  last_refreshed_at:       string | null
+  eps_basic:                  number | null
+  eps_diluted:                number | null
+  book_value_per_share:       number | null
+  revenue_ngn_m:              number | null
+  gross_profit_ngn_m:         number | null
+  operating_profit_ngn_m:     number | null
+  profit_before_tax_ngn_m:    number | null
+  profit_after_tax_ngn_m:     number | null
+  total_assets_ngn_m:         number | null
+  total_equity_ngn_m:         number | null
+  total_debt_ngn_m:           number | null
+  cash_and_equivalents_ngn_m: number | null
+  cash_from_operations_ngn_m: number | null
+  roe_pct:                    number | null
+  roa_pct:                    number | null
+  net_margin_pct:             number | null
+  period_end:                 string | null
+  period_type:                string | null
+  verified_status:            string | null
+  currency:                   string | null
+  source:                     string | null
+  notes:                      string | null
+  operator_notes:             string | null
+  last_refreshed_at:          string | null
 }
 
 interface ValuationBlock {
@@ -99,9 +100,14 @@ interface ValuationBlock {
   eps_used:                number | null
   eps_used_kind:           'diluted' | 'basic' | null
   eps_meaningful:          boolean
+  // v27cb-a-fix7g: PEG
+  peg_3yr:                 number | null
+  peg_5yr:                 number | null
+  eps_cagr_3yr_pct:        number | null
+  eps_cagr_5yr_pct:        number | null
+  peg_warning:             string | null
 }
 
-// v27bc: AI summary shape
 interface AISummaryBlock {
   tilt:               'bullish' | 'neutral' | 'bearish' | null
   tilt_reason:        string | null
@@ -111,6 +117,24 @@ interface AISummaryBlock {
   confidence:         'high' | 'medium' | 'low' | null
   generated_at:       string | null
   last_refreshed_at:  string | null
+}
+
+// v27cb-a-fix7g: disclosures + dealings shapes
+interface DisclosureItem {
+  id:             string
+  title:          string
+  category:       string
+  pdf_source_url: string | null
+  pdf_filename:   string | null
+  modified_at:    string
+}
+
+interface DealingItem {
+  id:             string
+  title:          string
+  pdf_source_url: string | null
+  pdf_filename:   string | null
+  modified_at:    string
 }
 
 interface InstrumentResp {
@@ -194,6 +218,9 @@ interface InstrumentResp {
   valuation?:              ValuationBlock | null
   ai_summary?:             AISummaryBlock | null
   fi_metadata?:            FiMetadataBlock | null
+  // v27cb-a-fix7g: NEW
+  disclosures?:            DisclosureItem[]
+  director_dealings?:      DealingItem[]
   recent_transactions?: Array<{
     trade_date:    string
     action:        string
@@ -277,6 +304,12 @@ function fmtRawPct(v: number | null | undefined, dp = 2): string {
   return v.toFixed(dp) + '%'
 }
 
+// v27cb-a-fix7g: raw pct signed (for CAGR display)
+function fmtRawPctSigned(v: number | null | undefined, dp = 1): string {
+  if (v === null || v === undefined || !isFinite(v)) return '—'
+  return (v >= 0 ? '+' : '') + v.toFixed(dp) + '%'
+}
+
 function fmtQty(v: number | null | undefined): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return Math.round(v).toLocaleString('en-US')
@@ -298,6 +331,12 @@ function fmtPrice(v: number | null | undefined): string {
 function fmtRatio(v: number | null | undefined, dp = 1): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return v.toFixed(dp) + '×'
+}
+
+// v27cb-a-fix7g: PEG ratio with sensible decimal precision
+function fmtPeg(v: number | null | undefined): string {
+  if (v === null || v === undefined || !isFinite(v)) return '—'
+  return v.toFixed(2) + '×'
 }
 
 function fmtDate(s: string | null | undefined): string {
@@ -385,11 +424,23 @@ const DIV_STATUS_STYLE: Record<string, { bg: string; fg: string; label: string }
   unknown:   { bg: 'rgba(15, 41, 71, 0.06)',   fg: 'var(--text-3)', label: 'Unknown' },
 }
 
-// v27bc: tilt pill style by lean
 const TILT_STYLE: Record<string, { bg: string; fg: string; border: string; label: string }> = {
   bullish: { bg: 'rgba(45, 110, 78, 0.14)',   fg: 'var(--pos)',  border: 'rgba(45, 110, 78, 0.32)',   label: 'Bullish' },
   neutral: { bg: 'rgba(15, 41, 71, 0.06)',    fg: 'var(--text-2)', border: 'rgba(15, 41, 71, 0.18)',  label: 'Neutral' },
   bearish: { bg: 'rgba(166, 59, 59, 0.12)',   fg: 'var(--neg)',  border: 'rgba(166, 59, 59, 0.30)',   label: 'Bearish' },
+}
+
+// v27cb-a-fix7g: verified status badge style
+const VERIFIED_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  verified:   { bg: 'rgba(45, 110, 78, 0.12)',  fg: 'var(--pos)',   label: 'Verified'   },
+  unverified: { bg: 'rgba(15, 41, 71, 0.04)',   fg: 'var(--text-3)', label: 'Unverified' },
+  flagged:    { bg: 'rgba(166, 59, 59, 0.12)',  fg: 'var(--neg)',   label: 'Flagged'    },
+}
+
+// v27cb-a-fix7g: disclosure category badge
+const CATEGORY_STYLE: Record<string, { bg: string; fg: string; label: string }> = {
+  corporate_actions: { bg: 'rgba(176, 139, 62, 0.12)', fg: 'var(--gold)',   label: 'CA' },
+  board_meeting:     { bg: 'rgba(15, 41, 71, 0.08)',   fg: 'var(--text-2)', label: 'BM' },
 }
 
 // ─── Page ───────────────────────────────────────────────────────
@@ -401,6 +452,7 @@ export default function InstrumentPage() {
   const [data, setData] = useState<InstrumentResp | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
+  const [regenerating, setRegenerating] = useState(false)
   const [signals, setSignals] = useState<CachedSignal[]>([])
 
   const load = useCallback(async () => {
@@ -416,6 +468,19 @@ export default function InstrumentPage() {
     setLoading(false)
     setRefreshing(false)
   }, [ticker])
+
+  // v27cb-a-fix7g: per-ticker AI summary regeneration
+  const regenerateAISummary = useCallback(async () => {
+    if (!ticker || regenerating) return
+    setRegenerating(true)
+    try {
+      await fetch(`/api/ai-summaries/refresh?ticker=${encodeURIComponent(ticker)}`, { method: 'POST' })
+      await load()
+    } catch (e) {
+      console.error('AI summary regeneration failed', e)
+    }
+    setRegenerating(false)
+  }, [ticker, regenerating, load])
 
   useEffect(() => { load() }, [load])
 
@@ -501,8 +566,10 @@ export default function InstrumentPage() {
   const fiMetadata       = data.fi_metadata       ?? null
   const fundamentals     = data.fundamentals      ?? null
   const valuation        = data.valuation         ?? null
-  // v27bc: AI summary
   const aiSummary        = data.ai_summary        ?? null
+  // v27cb-a-fix7g: NEW data blocks
+  const disclosures      = data.disclosures       ?? []
+  const directorDealings = data.director_dealings ?? []
 
   const sleeveId       = inst.sleeve_id ?? ''
   const isEquity       = sleeveId === 'eq'
@@ -653,7 +720,14 @@ export default function InstrumentPage() {
             </div>
             <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 2 }}>
               {marketCap
-                ? <>{fmtShares(marketCap.shares_outstanding)} shares O/S · refreshed {fmtRelativeTime(marketCap.last_refreshed_at)}</>
+                ? <>
+                    {fmtShares(marketCap.shares_outstanding)} shares O/S
+                    {marketCap.shares_basis === 'per_period' && marketCap.as_of_period_end ? (
+                      <> · per {fmtDate(marketCap.as_of_period_end)}</>
+                    ) : marketCap.shares_basis === 'instruments_fallback' ? (
+                      <span style={{ color: 'var(--warn)' }}> · fallback</span>
+                    ) : null}
+                  </>
                 : isEquity
                   ? <span style={{ color: 'var(--warn)' }}>Shares O/S not yet refreshed</span>
                   : <>—</>}
@@ -804,7 +878,6 @@ export default function InstrumentPage() {
       )}
 
       {/* Fundamentals panel (equity only) */}
-      {/* v27cb-a-fix6: added "Edit historical fundamentals →" link for discoverability */}
       {isEquity && fundamentals && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -815,7 +888,7 @@ export default function InstrumentPage() {
                 : 'No period reported'
             }
           >
-            <div style={{ marginBottom: 14, paddingBottom: 12, borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))' }}>
+            <div style={{ marginBottom: 14, paddingBottom: 12, borderBottom: '1px solid var(--border-soft, rgba(15,41,71,0.06))', display: 'flex', alignItems: 'center', gap: 14, flexWrap: 'wrap' }}>
               <a
                 href={`/instrument/${inst.instrument_id}/fundamentals`}
                 style={{
@@ -829,7 +902,22 @@ export default function InstrumentPage() {
               >
                 Edit historical fundamentals →
               </a>
-              <span style={{ marginLeft: 10, fontSize: 11, color: 'var(--text-3, #8a8f9a)', fontStyle: 'italic' }}>
+              {fundamentals.verified_status && VERIFIED_STYLE[fundamentals.verified_status] && (
+                <span style={{
+                  display: 'inline-block',
+                  padding: '3px 9px',
+                  background: VERIFIED_STYLE[fundamentals.verified_status].bg,
+                  color: VERIFIED_STYLE[fundamentals.verified_status].fg,
+                  borderRadius: 2,
+                  fontSize: 9,
+                  fontWeight: 700,
+                  letterSpacing: '0.14em',
+                  textTransform: 'uppercase',
+                }}>
+                  {VERIFIED_STYLE[fundamentals.verified_status].label}
+                </span>
+              )}
+              <span style={{ fontSize: 11, color: 'var(--text-3, #8a8f9a)', fontStyle: 'italic' }}>
                 Open the per-period editor to verify, correct, or fill missing values.
               </span>
             </div>
@@ -838,7 +926,7 @@ export default function InstrumentPage() {
         </div>
       )}
 
-      {/* v27bc: AI Financial Summary panel (equity only) */}
+      {/* AI Financial Summary panel (equity only) — with regenerate button */}
       {isEquity && aiSummary && (
         <div style={{ marginBottom: 20 }}>
           <Panel
@@ -848,8 +936,55 @@ export default function InstrumentPage() {
                 ? `Refreshed ${fmtRelativeTime(aiSummary.last_refreshed_at)}`
                 : 'Not yet generated'
             }
+            action={
+              <button
+                onClick={regenerateAISummary}
+                disabled={regenerating}
+                style={{
+                  padding: '4px 10px',
+                  fontSize: 10,
+                  fontWeight: 600,
+                  letterSpacing: '0.12em',
+                  textTransform: 'uppercase',
+                  background: 'transparent',
+                  border: '1px solid var(--border-strong, rgba(15,41,71,0.22))',
+                  color: regenerating ? 'var(--text-3)' : 'var(--gold)',
+                  borderRadius: 3,
+                  cursor: regenerating ? 'wait' : 'pointer',
+                  fontFamily: '"DM Sans", system-ui, sans-serif',
+                  whiteSpace: 'nowrap',
+                }}
+                title="Regenerate the AI financial summary for this instrument using the latest fundamentals + disclosures"
+              >
+                {regenerating ? '↻ Regenerating…' : '↻ Regenerate'}
+              </button>
+            }
           >
             <AISummaryBody summary={aiSummary} />
+          </Panel>
+        </div>
+      )}
+
+      {/* v27cb-a-fix7g: Disclosures Feed panel (equity only) */}
+      {isEquity && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="Corporate Disclosures"
+            meta={disclosures.length > 0 ? `Latest ${disclosures.length}` : null}
+          >
+            <DisclosuresFeedBody items={disclosures} />
+          </Panel>
+        </div>
+      )}
+
+      {/* v27cb-a-fix7g: Director Dealings panel (equity only) */}
+      {isEquity && (
+        <div style={{ marginBottom: 20 }}>
+          <Panel
+            title="Director Dealings"
+            meta={directorDealings.length > 0 ? `Latest ${directorDealings.length}` : null}
+          >
+            <DirectorDealingsBody items={directorDealings} />
           </Panel>
         </div>
       )}
@@ -1072,13 +1207,16 @@ function KpiCard({
   )
 }
 
+// v27cb-a-fix7g: Panel now accepts optional `action` for header buttons
 function Panel({
   title,
   meta,
+  action,
   children,
 }: {
-  title:    string
-  meta?:    string | null
+  title:     string
+  meta?:     string | null
+  action?:   React.ReactNode
   children?: React.ReactNode
 }) {
   return (
@@ -1105,17 +1243,20 @@ function Panel({
         }}>
           {title}
         </div>
-        {meta ? (
-          <div style={{
-            fontSize: 10,
-            letterSpacing: '0.12em',
-            color: 'var(--text-3)',
-            textTransform: 'uppercase',
-            fontWeight: 600,
-          }}>
-            {meta}
-          </div>
-        ) : null}
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 12 }}>
+          {meta ? (
+            <div style={{
+              fontSize: 10,
+              letterSpacing: '0.12em',
+              color: 'var(--text-3)',
+              textTransform: 'uppercase',
+              fontWeight: 600,
+            }}>
+              {meta}
+            </div>
+          ) : null}
+          {action}
+        </div>
       </div>
       {children}
     </div>
@@ -1445,6 +1586,7 @@ function DividendSnapshotBody({
   )
 }
 
+// v27cb-a-fix7g: ValuationBody updated to 6 cells with PEG
 function ValuationBody({
   valuation,
   currentPrice,
@@ -1459,13 +1601,21 @@ function ValuationBody({
   const gapLabel = valuation.intrinsic_value_gap_pct === null ? '' :
                    valuation.intrinsic_value_gap_pct > 0 ? 'undervalued' : 'overvalued'
 
+  // PEG cell color: green if ≤ 1 (undervalued by growth), gold if ≤ 1.5, amber otherwise
+  const pegColor = (peg: number | null): string => {
+    if (peg === null) return 'var(--text-3)'
+    if (peg <= 1.0) return 'var(--pos)'
+    if (peg <= 1.5) return 'var(--gold)'
+    return 'var(--warn)'
+  }
+
   return (
     <div style={{
       display: 'grid',
-      gridTemplateColumns: 'repeat(5, 1fr)',
-      gap: 16,
+      gridTemplateColumns: 'repeat(6, 1fr)',
+      gap: 14,
     }}>
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
         <div style={cellLabelStyle}>P / E</div>
         <div style={{ ...cellValueStyle, color: peColor }}>
           {valuation.eps_meaningful ? fmtRatio(valuation.pe_ratio) : 'N/M'}
@@ -1473,11 +1623,11 @@ function ValuationBody({
         <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
           {valuation.eps_meaningful
             ? (valuation.eps_used_kind === 'diluted' ? 'diluted EPS' : 'basic EPS')
-            : <span style={{ color: 'var(--warn)' }}>EPS ≤ 0 — not meaningful</span>}
+            : <span style={{ color: 'var(--warn)' }}>EPS ≤ 0 — N/M</span>}
         </div>
       </div>
 
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
         <div style={cellLabelStyle}>P / B</div>
         <div style={cellValueStyle}>{fmtRatio(valuation.pb_ratio)}</div>
         <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
@@ -1487,7 +1637,40 @@ function ValuationBody({
         </div>
       </div>
 
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      {/* v27cb-a-fix7g: NEW PEG cell — 3yr primary, 5yr sub */}
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
+        <div style={cellLabelStyle}>PEG (3yr)</div>
+        <div style={{ ...cellValueStyle, color: pegColor(valuation.peg_3yr) }}>
+          {fmtPeg(valuation.peg_3yr)}
+        </div>
+        <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
+          {valuation.eps_cagr_3yr_pct !== null
+            ? <>3yr CAGR {fmtRawPctSigned(valuation.eps_cagr_3yr_pct)}</>
+            : 'insufficient annuals'}
+        </div>
+        {valuation.peg_5yr !== null || valuation.eps_cagr_5yr_pct !== null ? (
+          <div style={{
+            fontSize: 10,
+            color: 'var(--text-3)',
+            marginTop: 4,
+            paddingTop: 4,
+            borderTop: '1px dotted var(--border-soft, rgba(15,41,71,0.06))',
+            lineHeight: 1.3,
+          }}>
+            5yr: <span style={{ color: pegColor(valuation.peg_5yr), fontWeight: 500 }}>{fmtPeg(valuation.peg_5yr)}</span>
+            {valuation.eps_cagr_5yr_pct !== null && (
+              <span> · {fmtRawPctSigned(valuation.eps_cagr_5yr_pct)}</span>
+            )}
+            {valuation.peg_warning && (
+              <div style={{ color: 'var(--warn)', fontSize: 9, marginTop: 2, fontStyle: 'italic' }}>
+                FX-distorted
+              </div>
+            )}
+          </div>
+        ) : null}
+      </div>
+
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
         <div style={cellLabelStyle}>Graham Number</div>
         <div style={cellValueStyle}>{fmtPrice(valuation.graham_number)}</div>
         <div style={{ fontSize: 11, color: gapColor, fontVariantNumeric: 'tabular-nums', marginTop: 2 }}>
@@ -1499,35 +1682,35 @@ function ValuationBody({
         </div>
       </div>
 
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
-        <div style={cellLabelStyle}>Graham 22.5 Test</div>
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
+        <div style={cellLabelStyle}>Graham 22.5</div>
         <div style={{ marginTop: 4 }}>
           {valuation.graham_test_passes === null ? (
             <span style={{ ...cellValueStyle, color: 'var(--text-3)' }}>—</span>
           ) : (
             <span style={{
               display: 'inline-block',
-              padding: '6px 14px',
+              padding: '6px 12px',
               background: valuation.graham_test_passes
                 ? 'rgba(176, 139, 62, 0.14)'
                 : 'rgba(166, 59, 59, 0.12)',
               color: valuation.graham_test_passes ? 'var(--gold)' : 'var(--neg)',
               borderRadius: 3,
-              fontSize: 12,
+              fontSize: 11,
               fontWeight: 700,
               letterSpacing: '0.14em',
               textTransform: 'uppercase',
             }}>
-              {valuation.graham_test_passes ? 'Passes' : 'Fails'}
+              {valuation.graham_test_passes ? 'Pass' : 'Fail'}
             </span>
           )}
         </div>
-        <div style={{ fontSize: 11, color: 'var(--text-3)', marginTop: 6 }}>
+        <div style={{ fontSize: 10, color: 'var(--text-3)', marginTop: 6 }}>
           P/E × P/B {valuation.graham_test_passes === false ? '> 22.5' : '≤ 22.5'}
         </div>
       </div>
 
-      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 14 }}>
+      <div style={{ borderLeft: '2px solid var(--border-soft, rgba(15,41,71,0.06))', paddingLeft: 12 }}>
         <div style={cellLabelStyle}>EPS</div>
         <div style={cellValueStyle}>{fmtPrice(valuation.eps_used)}</div>
         <div style={{ fontSize: 11, color: 'var(--text-3)' }}>
@@ -1614,8 +1797,8 @@ function FundamentalsBody({
       </div>
       <div style={{
         display: 'grid',
-        gridTemplateColumns: 'repeat(6, 1fr)',
-        gap: 14,
+        gridTemplateColumns: 'repeat(7, 1fr)',
+        gap: 12,
       }}>
         <FundamentalCell
           label="Total Assets"
@@ -1633,14 +1816,19 @@ function FundamentalsBody({
           sub="Interest-bearing"
         />
         <FundamentalCell
+          label="Cash"
+          value={fmtNgnFromMillions(fundamentals.cash_and_equivalents_ngn_m)}
+          sub="& equivalents"
+        />
+        <FundamentalCell
+          label="CFO"
+          value={fmtNgnFromMillions(fundamentals.cash_from_operations_ngn_m)}
+          sub="From operations"
+        />
+        <FundamentalCell
           label="ROE"
           value={fmtRawPct(fundamentals.roe_pct)}
           sub="Return on equity"
-        />
-        <FundamentalCell
-          label="ROA"
-          value={fmtRawPct(fundamentals.roa_pct)}
-          sub="Return on assets"
         />
         <FundamentalCell
           label="Net Margin"
@@ -1649,7 +1837,7 @@ function FundamentalsBody({
         />
       </div>
 
-      {(fundamentals.source || fundamentals.notes) && (
+      {(fundamentals.source || fundamentals.notes || fundamentals.operator_notes) && (
         <div style={{
           marginTop: 18,
           paddingTop: 14,
@@ -1659,7 +1847,7 @@ function FundamentalsBody({
           lineHeight: 1.55,
         }}>
           {fundamentals.source && (
-            <div style={{ marginBottom: fundamentals.notes ? 6 : 0 }}>
+            <div style={{ marginBottom: (fundamentals.notes || fundamentals.operator_notes) ? 6 : 0 }}>
               <span style={{
                 fontWeight: 600,
                 color: 'var(--text-3)',
@@ -1673,6 +1861,20 @@ function FundamentalsBody({
             </div>
           )}
           {fundamentals.notes && (
+            <div style={{ marginBottom: fundamentals.operator_notes ? 6 : 0 }}>
+              <span style={{
+                fontWeight: 600,
+                color: 'var(--text-3)',
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase',
+                fontSize: 10,
+              }}>
+                Extraction notes:
+              </span>{' '}
+              {fundamentals.notes}
+            </div>
+          )}
+          {fundamentals.operator_notes && (
             <div>
               <span style={{
                 fontWeight: 600,
@@ -1681,9 +1883,9 @@ function FundamentalsBody({
                 textTransform: 'uppercase',
                 fontSize: 10,
               }}>
-                Notes:
+                Operator notes:
               </span>{' '}
-              {fundamentals.notes}
+              {fundamentals.operator_notes}
             </div>
           )}
         </div>
@@ -1724,10 +1926,7 @@ function FundamentalCell({
   )
 }
 
-// v27bc: AI Summary panel body — tilt pill + tilt_reason + 3 sections.
-// Empty state when summary not yet generated for this ticker.
 function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
-  // Empty state — column exists but no summary written yet
   if (!summary.tilt || !summary.strength || !summary.concern || !summary.watch_for) {
     return (
       <div style={{
@@ -1746,7 +1945,7 @@ function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
           AI summary not yet generated for this instrument.
         </div>
         <div style={{ fontSize: 11 }}>
-          Run a refresh from the Admin panel to populate.
+          Click ↻ Regenerate above to generate one now.
         </div>
       </div>
     )
@@ -1756,7 +1955,6 @@ function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
 
   return (
     <div>
-      {/* Top: tilt pill + tilt_reason */}
       <div style={{
         display: 'flex',
         alignItems: 'flex-start',
@@ -1794,7 +1992,6 @@ function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
         </p>
       </div>
 
-      {/* 3-section grid */}
       <div style={{
         display: 'grid',
         gridTemplateColumns: 'repeat(3, 1fr)',
@@ -1821,7 +2018,6 @@ function AISummaryBody({ summary }: { summary: AISummaryBlock }) {
         />
       </div>
 
-      {/* Footer: confidence + disclaimer */}
       <div style={{
         paddingTop: 14,
         borderTop: '1px solid var(--border-soft, rgba(15,41,71,0.06))',
@@ -1905,6 +2101,149 @@ function AISection({
         {body}
       </p>
     </div>
+  )
+}
+
+// v27cb-a-fix7g: NEW Disclosures Feed body
+function DisclosuresFeedBody({ items }: { items: DisclosureItem[] }) {
+  if (items.length === 0) {
+    return (
+      <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0', textAlign: 'center' }}>
+        No corporate disclosures on file. Run the disclosures pipeline to refresh from NGX.
+      </div>
+    )
+  }
+
+  return (
+    <table style={tableStyle}>
+      <thead>
+        <tr>
+          <th style={{ ...thLeft, width: 90 }}>Date</th>
+          <th style={{ ...thLeft, width: 70 }}>Type</th>
+          <th style={thLeft}>Title</th>
+          <th style={{ ...thRight, width: 70 }}>PDF</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map(d => {
+          const cat = CATEGORY_STYLE[d.category] ?? CATEGORY_STYLE.corporate_actions
+          return (
+            <tr key={d.id}>
+              <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
+              <td style={tdLeft}>
+                <span style={{
+                  display: 'inline-block',
+                  padding: '2px 8px',
+                  background: cat.bg,
+                  color: cat.fg,
+                  borderRadius: 2,
+                  fontSize: 9,
+                  fontWeight: 700,
+                  letterSpacing: '0.14em',
+                  textTransform: 'uppercase',
+                }}>
+                  {cat.label}
+                </span>
+              </td>
+              <td style={{
+                ...tdLeft,
+                fontStyle: 'italic',
+                color: 'var(--text-2)',
+                maxWidth: 600,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }} title={d.title}>
+                {d.title}
+              </td>
+              <td style={tdRight}>
+                {d.pdf_source_url ? (
+                  <a
+                    href={d.pdf_source_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    style={{
+                      color: 'var(--gold)',
+                      textDecoration: 'none',
+                      fontSize: 11,
+                      fontWeight: 500,
+                      display: 'inline-flex',
+                      alignItems: 'center',
+                      gap: 4,
+                    }}
+                  >
+                    <FileText size={11} />
+                    PDF
+                  </a>
+                ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
+              </td>
+            </tr>
+          )
+        })}
+      </tbody>
+    </table>
+  )
+}
+
+// v27cb-a-fix7g: NEW Director Dealings body
+function DirectorDealingsBody({ items }: { items: DealingItem[] }) {
+  if (items.length === 0) {
+    return (
+      <div style={{ color: 'var(--text-3)', fontSize: 12, padding: '4px 0', textAlign: 'center' }}>
+        No director dealings on file. Either insiders have not transacted recently, or the disclosures pipeline has not run for this ticker.
+      </div>
+    )
+  }
+
+  return (
+    <table style={tableStyle}>
+      <thead>
+        <tr>
+          <th style={{ ...thLeft, width: 90 }}>Date</th>
+          <th style={thLeft}>Title</th>
+          <th style={{ ...thRight, width: 70 }}>PDF</th>
+        </tr>
+      </thead>
+      <tbody>
+        {items.map(d => (
+          <tr key={d.id}>
+            <td style={tdLeft}>{fmtDate(d.modified_at.slice(0, 10))}</td>
+            <td style={{
+              ...tdLeft,
+              fontStyle: 'italic',
+              color: 'var(--text-2)',
+              maxWidth: 700,
+              overflow: 'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace: 'nowrap',
+            }} title={d.title}>
+              {d.title}
+            </td>
+            <td style={tdRight}>
+              {d.pdf_source_url ? (
+                <a
+                  href={d.pdf_source_url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{
+                    color: 'var(--gold)',
+                    textDecoration: 'none',
+                    fontSize: 11,
+                    fontWeight: 500,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                  }}
+                >
+                  <FileText size={11} />
+                  PDF
+                </a>
+              ) : <span style={{ color: 'var(--text-3)' }}>—</span>}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   )
 }
 
