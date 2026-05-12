@@ -121,6 +121,15 @@ function fmtCurrency(v: number | null, decimals = 2): string {
   return v.toLocaleString('en-NG', { minimumFractionDigits: decimals, maximumFractionDigits: decimals })
 }
 
+// v27cb-a-fix7e: format numeric values for editable input display with thousands-
+// separator commas. parseFieldInput already strips commas on blur via String.replace(/,/g, ''),
+// and safeEvalExpression already strips commas before evaluating formulas, so this
+// is purely a display-side change. Mid-edit values (drafts) bypass this and are shown raw.
+function fmtForInput(v: number | null): string {
+  if (v === null || v === undefined || !isFinite(v)) return ''
+  return v.toLocaleString('en-US', { maximumFractionDigits: 10 })
+}
+
 function fmtInt(v: number | null): string {
   if (v === null || v === undefined || !isFinite(v)) return '—'
   return Math.round(v).toLocaleString('en-NG')
@@ -433,8 +442,9 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
     return { verified, unverified, flagged, total: periods.length }
   }, [periods])
 
+  // v27cb-a-fix7e: thousands-separator commas on the committed value
   const currentSharesDisplay =
-    currentSharesDraft !== '' ? currentSharesDraft : currentShares !== null ? String(currentShares) : ''
+    currentSharesDraft !== '' ? currentSharesDraft : fmtForInput(currentShares)
   const currentSharesIsFormula = currentSharesDisplay.trim().startsWith('=')
 
   return (
@@ -853,12 +863,12 @@ export default function InstrumentFundamentalsClient({ ticker, instrument, initi
                     const v = row[f.key]
                     const dk = draftKey(key, f.key as string)
                     const draftVal = drafts[dk]
+                    // v27cb-a-fix7e: thousands-separator commas on the committed value;
+                    // drafts (mid-edit) bypass this and are shown raw so cursor/typing flow stays natural.
                     const display =
                       draftVal !== undefined
                         ? draftVal
-                        : v === null || v === undefined
-                          ? ''
-                          : String(v)
+                        : fmtForInput(typeof v === 'number' ? v : null)
                     const isFormula = display.trim().startsWith('=')
                     return (
                       <div
