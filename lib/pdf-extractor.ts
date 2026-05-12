@@ -149,6 +149,84 @@ const PL_DATA_PATTERNS: RegExp[] = [
 
 const BS_HEADING_RE = /statement of financial position/i
 
+// v27cb-a-fix7c — strong anchors are high-confidence markers that we're INSIDE
+// the financial statements section. Five phrases that appear ONLY in real
+// statements (not policy notes, not risk discussions, not exec summaries):
+//   • "Total liabilities and equity 12,345"  — BS closing line, digits required
+//   • "Statement of changes in equity"        — discrete section heading
+//   • "Statement of cash flows"               — section heading
+//   • "Net cash from operating activities …"  — CFO subtotal, digits required
+//   • "Cash flows from operating activities"  — CFO section header
+//
+// TOC entries like "Statement of cash flows 67-68" or "...Company 69-70" are
+// filtered via isTocEntry — they end with a 1-3 digit page number (optionally
+// a range), which is a reliable structural marker of table-of-contents
+// entries vs real headings.
+//
+// From the first surviving strong anchor, buildAnchoredSlice walks char-by-
+// char outward with equal budget on each side (maxChars/2). This keeps the
+// anchor near the middle of the slice — critical for long bank/telecom
+// audits where the anchor lives deep in the document (line 7500+ on GTCO
+// FY2025) and a "first N lines after anchor" approach would push past the
+// 80K char cap and truncate away the BS + CFO content we just located.
+//
+// Falls back to fix4 + fix7a heading-or-PL-data anchor logic when no strong
+// anchor is found — zero regression on ACCESSCORP/ARADEL/MTNN-historical/
+// GTCO-historical cases (all empirically confirmed via local test against
+// real PDFs to have at least one strong anchor in their statements section).
+const STRONG_ANCHORS: RegExp[] = [
+  /^\s*total (?:liabilities and equity|equity and liabilities)\b[^a-z]*[\d,]{4,}/i,
+  /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?statement of changes in equity\b/i,
+  /^\s*(?:consolidated(?:\s+and\s+separate)?\s+)?(?:interim\s+)?statement of cash flows?\b/i,
+  /^\s*net cash (?:from|generated from|provided by|used in) operating activities\b.*[\d,]{4,}/i,
+  /^\s*cash flows? from operating activities\b/i,
+]
+
+// TOC entries end with 1-3 digit page numbers (optionally a range). Real
+// statement headings either don't end in digits, or end in 4-digit years
+// (e.g. "...for the year ended 31 December 2025") which TOC_END_RE rejects.
+const TOC_END_RE = /\s\d{1,3}(?:\s*-\s*\d{1,3})?\s*$/
+
+function isTocEntry(line: string): boolean {
+  return TOC_END_RE.test(line)
+}
+
+function findStrongAnchor(lines: string[]): { idx: number; marker: string } | null {
+  for (let i = 0; i < lines.length; i++) {
+    const l = lines[i]
+    if (l.length > 200) continue
+    if (isTocEntry(l)) continue
+    for (const re of STRONG_ANCHORS) {
+      if (re.test(l)) return { idx: i, marker: l }
+    }
+  }
+  return null
+}
+
+// Build a slice centered on anchorIdx by walking outward char-by-char with
+// equal budget each side. Returns the slice as a joined string. The anchor
+// itself is always included (the forward walk starts at anchorIdx).
+function buildAnchoredSlice(lines: string[], anchorIdx: number, maxChars: number): string {
+  const halfBudget = Math.floor(maxChars / 2)
+  let backIdx = anchorIdx
+  let backChars = 0
+  while (backIdx > 0) {
+    const lineChars = lines[backIdx - 1].length + 1 // +1 for newline join
+    if (backChars + lineChars > halfBudget) break
+    backIdx--
+    backChars += lineChars
+  }
+  let fwdIdx = anchorIdx
+  let fwdChars = 0
+  while (fwdIdx < lines.length) {
+    const lineChars = lines[fwdIdx].length + 1
+    if (fwdChars + lineChars > halfBudget) break
+    fwdChars += lineChars
+    fwdIdx++
+  }
+  return lines.slice(backIdx, fwdIdx).join('\n')
+}
+
 function isHeadingLine(line: string): boolean {
   if (line.length > 100) return false
   for (const re of HEADING_PATTERNS) {
@@ -169,6 +247,18 @@ export function findFinancialStatementSection(
   lines: string[],
   maxChars = 80_000,
 ): { section: string; matched_marker: string | null; total_lines: number } {
+  // v27cb-a-fix7c — try strong anchor first
+  const strong = findStrongAnchor(lines)
+  if (strong) {
+    const section = buildAnchoredSlice(lines, strong.idx, maxChars)
+    return {
+      section,
+      matched_marker: `strong: ${strong.marker.slice(0, 120)}`,
+      total_lines: lines.length,
+    }
+  }
+
+  // Fallback: fix4 + fix7a heading-or-PL-data anchor logic
   // Scan for first heading match AND first P&L-data match in parallel
   let firstHeading = -1
   let firstHeadingText: string | null = null
