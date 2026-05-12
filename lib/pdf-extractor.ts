@@ -167,7 +167,7 @@ function isPlDataLine(line: string): boolean {
 
 export function findFinancialStatementSection(
   lines: string[],
-  maxChars = 40_000,
+  maxChars = 80_000,
 ): { section: string; matched_marker: string | null; total_lines: number } {
   // Scan for first heading match AND first P&L-data match in parallel
   let firstHeading = -1
@@ -220,9 +220,11 @@ export function findFinancialStatementSection(
     matched_marker = firstPlText
   }
 
-  // Read forward — generous slice (1200 lines is enough for P&L + BS + EPS
-  // notes in any NGX filing; budget capped by maxChars).
-  const slice = lines.slice(startIdx, startIdx + 1200).join('\n')
+  // Read forward — generous slice. v27cb-a-fix7a bumped from 1200 → 2400 lines
+  // and maxChars 40K → 80K to handle long bank/telecom audited statements where
+  // P&L → BS → CFO span more than 1200 lines (GTCO + MTNN historical annuals).
+  // Budget capped by maxChars at the outer truncation step below.
+  const slice = lines.slice(startIdx, startIdx + 2400).join('\n')
   return {
     section: slice.slice(0, maxChars),
     matched_marker,
