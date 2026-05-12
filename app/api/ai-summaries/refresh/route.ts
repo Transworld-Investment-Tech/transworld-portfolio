@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-// /api/ai-summaries/refresh (v27cb-a-fix7g)
+// /api/ai-summaries/refresh (v27cb-a-fix7g-fix2)
 // ═══════════════════════════════════════════════════════════════
 //
 // Full rewrite of the AI Financial Summary engine. Replaces the
@@ -548,7 +548,7 @@ function estimateCost(inTokens: number, outTokens: number, searchCount: number):
 // ─── Per-ticker processor ──────────────────────────────────────
 
 async function processTicker(
-  db:     ReturnType<typeof createClient>,
+  db:     NonNullable<ReturnType<typeof client>>,
   ticker: string,
 ): Promise<ProcessResult> {
 
@@ -657,7 +657,7 @@ async function processTicker(
 
   const { error: updErr } = await db
     .from('instruments')
-    .update(updatePayload)
+    .update(updatePayload as never)
     .eq('instrument_id', ticker)
 
   if (updErr) {
@@ -675,7 +675,7 @@ async function processTicker(
 // ─── Stalest rotation for cron mode ─────────────────────────────
 
 async function pickStalestTickers(
-  db:    ReturnType<typeof createClient>,
+  db:    NonNullable<ReturnType<typeof client>>,
   limit: number,
 ): Promise<string[]> {
   // Pull all approved equity tickers ordered by ai_summary_refreshed_at
