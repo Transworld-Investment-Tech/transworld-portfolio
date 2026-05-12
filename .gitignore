@@ -39,3 +39,4 @@ Thumbs.db
 tsconfig.tsbuildinfo
 .backups/
 tsconfig.tsbuildinfo
+.v*-backup/
